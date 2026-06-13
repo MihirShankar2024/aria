@@ -1,5 +1,8 @@
+/// <reference types="node" />
 import Anthropic from '@anthropic-ai/sdk'
-import type { ClaudeRequest } from '../src/types/api'
+
+interface ChatMessage { role: 'user' | 'assistant'; content: string }
+interface ClaudeRequest { systemPrompt: string; userMessage: string; history: ChatMessage[] }
 
 export const config = { runtime: 'edge' }
 

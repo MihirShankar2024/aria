@@ -6,10 +6,10 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const VARIANT_CLASSES: Record<NonNullable<ButtonProps['variant']>, string> = {
-  primary: 'bg-teal-600 hover:bg-teal-500 text-white',
-  secondary: 'bg-gray-700 hover:bg-gray-600 text-white',
-  ghost: 'bg-transparent hover:bg-gray-800 text-gray-300',
-  danger: 'bg-red-700 hover:bg-red-600 text-white',
+  primary: 'bg-primary text-primary-foreground hover:opacity-90',
+  secondary: 'bg-secondary text-secondary-foreground hover:opacity-90',
+  ghost: 'bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground',
+  danger: 'bg-destructive text-destructive-foreground hover:opacity-90',
 }
 
 const SIZE_CLASSES: Record<NonNullable<ButtonProps['size']>, string> = {
@@ -20,7 +20,7 @@ const SIZE_CLASSES: Record<NonNullable<ButtonProps['size']>, string> = {
 export function Button({ variant = 'primary', size = 'md', className = '', children, ...props }: ButtonProps) {
   return (
     <button
-      className={`rounded-lg font-medium transition-colors disabled:opacity-50 ${VARIANT_CLASSES[variant]} ${SIZE_CLASSES[size]} ${className}`}
+      className={`rounded-md font-medium transition-opacity disabled:opacity-50 ${VARIANT_CLASSES[variant]} ${SIZE_CLASSES[size]} ${className}`}
       {...props}
     >
       {children}

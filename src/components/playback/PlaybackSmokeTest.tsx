@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Button } from '@/components/ui/button'
 
 export function PlaybackSmokeTest() {
   const [status, setStatus] = useState<'idle' | 'loading' | 'playing' | 'error'>('idle')
@@ -27,15 +28,11 @@ export function PlaybackSmokeTest() {
 
   return (
     <div className="space-y-3">
-      <button
-        onClick={handlePlay}
-        disabled={status === 'loading' || status === 'playing'}
-        className="px-4 py-2 bg-primary text-primary-foreground rounded-md text-sm font-medium hover:opacity-90 disabled:opacity-50 transition-opacity"
-      >
+      <Button onClick={handlePlay} disabled={status === 'loading' || status === 'playing'}>
         {status === 'idle' ? 'Play C4 note' : status === 'loading' ? 'Loading...' : status === 'playing' ? 'Playing...' : 'Error'}
-      </button>
+      </Button>
       {log.length > 0 && (
-        <ul className="font-mono text-xs text-muted-foreground space-y-1 bg-muted rounded-md p-3">
+        <ul className="font-mono text-xs text-muted-foreground space-y-1 bg-muted/20 rounded-md p-3">
           {log.map((l, i) => <li key={i}>→ {l}</li>)}
         </ul>
       )}

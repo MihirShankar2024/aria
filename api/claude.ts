@@ -4,8 +4,6 @@ import Anthropic from '@anthropic-ai/sdk'
 interface ChatMessage { role: 'user' | 'assistant'; content: string }
 interface ClaudeRequest { systemPrompt: string; userMessage: string; history: ChatMessage[] }
 
-export const config = { runtime: 'edge' }
-
 export default async function handler(req: Request): Promise<Response> {
   if (req.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 })

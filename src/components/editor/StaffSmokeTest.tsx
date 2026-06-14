@@ -24,7 +24,6 @@ export function StaffSmokeTest() {
         measures: [DEMO_MEASURE],
         timeSig: { beats: 4, beatType: 4 },
         keySig: { fifths: 0, mode: 'major' },
-        width: 400,
       })
     } catch (err) {
       console.error('VexFlow render error:', err)

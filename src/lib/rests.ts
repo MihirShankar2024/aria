@@ -203,6 +203,50 @@ export function normalizeMeasureRests(notes: NoteEvent[], timeSig: TimeSig): Not
 }
 
 /**
+ * Replace a set of marked events (notes and/or rests) with beat-correct rests
+ * IN PLACE, preserving every other note's position. Marked notes become rests of
+ * identical duration, then the whole measure's rest runs are re-grouped per the
+ * notation rules. Returns the rewritten event list plus the ids of the resulting
+ * rests that occupy the marked region (used to highlight them red for an undo-able
+ * "confirm collapse" step). Marked rests are folded into that region by overlap.
+ */
+export function applyRestErase(
+  notes: NoteEvent[],
+  markedIds: Set<string>,
+  timeSig: TimeSig,
+): { notes: NoteEvent[]; redRestIds: string[] } {
+  // Marked span union, in sixteenth units.
+  const spans: Array<[number, number]> = []
+  let off = 0
+  for (const ev of notes) {
+    const dur = Math.round(noteBeatDuration(ev) * U)
+    if (markedIds.has(ev.id)) spans.push([off, off + dur])
+    off += dur
+  }
+
+  // Replace marked notes with placeholder rests of equal duration; keep the rest.
+  const intermediate: NoteEvent[] = notes.map(ev =>
+    markedIds.has(ev.id) && ev.type === 'note'
+      ? makeRest(ev.duration, ev.dots)
+      : ev,
+  )
+
+  const result = normalizeMeasureRests(intermediate, timeSig)
+
+  // Collect rests whose span intersects the marked union.
+  const intersects = (s: number, e: number) => spans.some(([a, b]) => s < b && a < e)
+  const redRestIds: string[] = []
+  let o = 0
+  for (const ev of result) {
+    const dur = Math.round(noteBeatDuration(ev) * U)
+    if (ev.type === 'rest' && intersects(o, o + dur)) redRestIds.push(ev.id)
+    o += dur
+  }
+
+  return { notes: result, redRestIds }
+}
+
+/**
  * Pad a measure's remaining capacity with rests, then canonicalise.
  *
  * Computes the trailing gap (capacity − occupied), appends plain rests that sum

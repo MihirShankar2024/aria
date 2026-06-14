@@ -1,30 +1,73 @@
 import * as Tone from 'tone'
-import type { Score, Note } from '../../types/score'
+import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig } from '../../types/score'
 import { loadSoundFont } from './soundfonts'
 
 const NOTE_MIDI: Record<string, number> = {
   C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11,
 }
 
-function noteToFreq(note: Note): string {
-  const base = NOTE_MIDI[note.pitch.step]
-  const accidentalOffset =
-    note.pitch.accidental === 'sharp' || note.pitch.accidental === 'double_sharp'
-      ? note.pitch.accidental === 'double_sharp' ? 2 : 1
-      : note.pitch.accidental === 'flat' || note.pitch.accidental === 'double_flat'
-        ? note.pitch.accidental === 'double_flat' ? -2 : -1
-        : 0
-  const midi = (note.pitch.octave + 1) * 12 + base + accidentalOffset
-  return Tone.Frequency(midi, 'midi').toNote()
+// Standard order accidentals are added by a key signature.
+const SHARP_ORDER: NoteName[] = ['F', 'C', 'G', 'D', 'A', 'E', 'B']
+const FLAT_ORDER: NoteName[]  = ['B', 'E', 'A', 'D', 'G', 'C', 'F']
+
+// fifths → per-letter semitone offset implied by the key signature.
+// e.g. D major (fifths 2) → { F: +1, C: +1 }.
+function keySigOffsets(fifths: number): Partial<Record<NoteName, number>> {
+  const map: Partial<Record<NoteName, number>> = {}
+  if (fifths > 0) for (let i = 0; i < fifths; i++) map[SHARP_ORDER[i]] = 1
+  else for (let i = 0; i < -fifths; i++) map[FLAT_ORDER[i]] = -1
+  return map
 }
 
-function durationToTone(dur: Note['duration'], dots: number): Tone.Unit.Time {
-  const base: Record<string, string> = {
-    whole: '1n', half: '2n', quarter: '4n', eighth: '8n', sixteenth: '16n',
+// Semitone offset of a written accidental. Natural cancels to 0.
+function explicitOffset(acc: Pitch['accidental']): number {
+  switch (acc) {
+    case 'double_sharp': return 2
+    case 'sharp': return 1
+    case 'natural': return 0
+    case 'flat': return -1
+    case 'double_flat': return -2
+    default: return 0
   }
-  if (dots === 0) return base[dur] as Tone.Unit.Time
-  // Tone.js dotted notation is a trailing period (e.g. "4n."), not "d".
-  return `${base[dur]}.` as Tone.Unit.Time
+}
+
+// Most recent keySig override at/before idx, else global. Mirrors the renderer's
+// effectiveKeySigAt so playback matches what's drawn.
+function effectiveKeySig(measures: Measure[], idx: number, global: KeySig): KeySig {
+  for (let i = idx; i >= 0; i--) {
+    if (measures[i]?.keySig) return measures[i].keySig!
+  }
+  return global
+}
+
+function eventDurationSeconds(event: NoteEvent, tempo: number): number {
+  const beats = { whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25 }[event.duration]
+  return beats * (event.dots > 0 ? 1.5 : 1) * (60 / tempo)
+}
+
+// Compare by *resolved* MIDI rather than written accidentals: a note tied
+// across a barline may drop its accidental yet sound the same pitch.
+function midisEqual(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false
+  return a.every((m, i) => m === b[i])
+}
+
+// Returns the effective tempo at a given measure number.
+function getEffectiveTempo(score: Score, measureNumber: number): number {
+  let tempo = score.tempo
+  for (const tc of score.tempoChanges) {
+    if (tc.measureNumber <= measureNumber) tempo = tc.tempo
+    else break
+  }
+  return tempo
+}
+
+interface ScheduledNote {
+  note: Note
+  time: number      // absolute seconds from start
+  duration: number  // seconds
+  tempo: number     // tempo active at this note (for tie-merging)
+  midis: number[]   // resolved MIDI per pitch (key sig + measure accidentals applied)
 }
 
 export async function buildAndPlayScore(score: Score, onStop?: () => void): Promise<void> {
@@ -40,35 +83,102 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void): Prom
     })),
   )
 
-  let time = 0
+  let totalTime = 0
   const measureCount = Math.max(...score.parts.map(p => p.measures.length))
 
-  for (let mIdx = 0; mIdx < measureCount; mIdx++) {
-    const timeSig = score.parts[0]?.measures[mIdx]?.timeSig ?? score.globalTimeSig
-    const beatsPerMeasure = timeSig.beats
+  for (const { part, sampler } of parts) {
+    const scheduled: ScheduledNote[] = []
+    let absTime = 0
 
-    for (const { part, sampler } of parts) {
-      const measure = part.measures[mIdx]
-      if (!measure) continue
+    // A tie continuation note (the `to`) inherits the sounding pitch of its
+    // `from`, even across a barline where the accidental isn't re-written.
+    const tieFromOf = new Map<string, string>()
+    for (const tie of part.ties ?? []) tieFromOf.set(tie.to, tie.from)
+    // note id → resolved accidental offset per `${step}${octave}`. We carry the
+    // *accidental* across a tie, keyed by pitch identity, so only a genuine tie
+    // (same letter + octave) inherits it — a slur to a different pitch does not.
+    const resolvedNoteOffsets = new Map<string, Map<string, number>>()
 
-      let beatOffset = 0
-      for (const event of measure.notes) {
-        if (event.type === 'note') {
-          const freq = noteToFreq(event)
-          const dur = durationToTone(event.duration, event.dots)
-          sampler.triggerAttackRelease(freq, dur, `+${time + beatOffset}`)
+    for (let mIdx = 0; mIdx < measureCount; mIdx++) {
+      // Effective time sig: look at measure-level override on first part, else global.
+      const timeSig = score.parts[0]?.measures[mIdx]?.timeSig ?? score.globalTimeSig
+      const measure  = part.measures[mIdx]
+      const measureNum = measure?.number ?? (mIdx + 1)
+      const tempo    = getEffectiveTempo(score, measureNum)
+
+      // Active key signature and a fresh accidental memory per measure (barline reset).
+      const keyMap = keySigOffsets(effectiveKeySig(part.measures, mIdx, score.globalKeySig).fifths)
+      const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
+
+      if (measure) {
+        for (const event of measure.notes) {
+          const dur = eventDurationSeconds(event, tempo)
+          if (event.type === 'note') {
+            const fromId = tieFromOf.get(event.id)
+            const fromOffsets = fromId ? resolvedNoteOffsets.get(fromId) : undefined
+            const offsets = new Map<string, number>()
+            const midis = event.pitches.map(pitch => {
+              const memKey = `${pitch.step}${pitch.octave}`
+              let offset: number
+              if (pitch.accidental !== null) {
+                offset = explicitOffset(pitch.accidental)
+                measureAcc.set(memKey, offset)
+              } else if (measureAcc.has(memKey)) {
+                offset = measureAcc.get(memKey)!
+              } else if (fromOffsets?.has(memKey)) {
+                // Genuine tie continuation (same letter + octave, no written
+                // accidental): carry the from-note's accidental. Per spec this does
+                // NOT establish accidental memory for later notes, so don't set
+                // measureAcc here. A slur to a different pitch won't match memKey.
+                offset = fromOffsets.get(memKey)!
+              } else {
+                offset = keyMap[pitch.step] ?? 0
+              }
+              offsets.set(memKey, offset)
+              return (pitch.octave + 1) * 12 + NOTE_MIDI[pitch.step] + offset
+            })
+            resolvedNoteOffsets.set(event.id, offsets)
+            scheduled.push({ note: event, time: absTime, duration: dur, tempo, midis })
+          }
+          absTime += dur
         }
-        const durationBeats =
-          { whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25 }[event.duration] *
-          (event.dots > 0 ? 1.5 : 1)
-        beatOffset += durationBeats * (60 / score.tempo)
+      } else {
+        absTime += timeSig.beats * (60 / tempo)
       }
     }
 
-    time += beatsPerMeasure * (60 / score.tempo)
+    // Apply tie rules: extend first note's duration across tied spans of identical pitch.
+    const extendedDuration = new Map<string, number>()
+    const skipped = new Set<string>()
+
+    for (const tie of part.ties ?? []) {
+      const fromIdx = scheduled.findIndex(s => s.note.id === tie.from)
+      const toIdx   = scheduled.findIndex(s => s.note.id === tie.to)
+      if (fromIdx === -1 || toIdx === -1 || fromIdx >= toIdx) continue
+
+      const spanned  = scheduled.slice(fromIdx, toIdx + 1)
+      const fromNote = spanned[0]
+
+      if (!spanned.every(s => midisEqual(s.midis, fromNote.midis))) continue
+
+      const combined = spanned.reduce((sum, s) => sum + s.duration, 0)
+      extendedDuration.set(fromNote.note.id, combined)
+      for (const s of spanned.slice(1)) skipped.add(s.note.id)
+    }
+
+    // Schedule: trigger all pitches in a chord simultaneously.
+    for (const { note, time, duration, midis } of scheduled) {
+      if (skipped.has(note.id)) continue
+      const dur = extendedDuration.get(note.id) ?? duration
+      for (const midi of midis) {
+        sampler.triggerAttackRelease(Tone.Frequency(midi, 'midi').toNote(), dur, `+${time}`)
+      }
+    }
+
+    totalTime = Math.max(totalTime, absTime)
   }
 
-  Tone.getTransport().scheduleOnce(() => onStop?.(), `+${time}`)
+  Tone.getTransport().scheduleOnce(() => onStop?.(), `+${totalTime}`)
   Tone.getTransport().start()
 }
 

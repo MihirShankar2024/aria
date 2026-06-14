@@ -6,10 +6,10 @@ const DEMO_MEASURE: Measure = {
   id: 'smoke-1',
   number: 1,
   notes: [
-    { id: 'n1', type: 'note', pitch: { step: 'C', octave: 4, accidental: null }, duration: 'quarter', dots: 0, tied: false },
-    { id: 'n2', type: 'note', pitch: { step: 'E', octave: 4, accidental: null }, duration: 'quarter', dots: 0, tied: false },
-    { id: 'n3', type: 'note', pitch: { step: 'G', octave: 4, accidental: null }, duration: 'quarter', dots: 0, tied: false },
-    { id: 'n4', type: 'note', pitch: { step: 'C', octave: 5, accidental: null }, duration: 'quarter', dots: 0, tied: false },
+    { id: 'n1', type: 'note', pitches: [{ step: 'C', octave: 4, accidental: null }], duration: 'quarter', dots: 0, tied: false },
+    { id: 'n2', type: 'note', pitches: [{ step: 'E', octave: 4, accidental: null }], duration: 'quarter', dots: 0, tied: false },
+    { id: 'n3', type: 'note', pitches: [{ step: 'G', octave: 4, accidental: null }], duration: 'quarter', dots: 0, tied: false },
+    { id: 'n4', type: 'note', pitches: [{ step: 'C', octave: 5, accidental: null }], duration: 'quarter', dots: 0, tied: false },
   ],
 }
 

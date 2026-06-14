@@ -28,15 +28,6 @@ export function PlaybackBar({ score, status, onPlay, onStop }: PlaybackBarProps)
           <Play className="h-3.5 w-3.5 fill-white stroke-white" />
         )}
       </Button>
-
-      <div className="flex items-center gap-2">
-        <div
-          className={`w-1.5 h-1.5 rounded-full transition-colors ${
-            isPlaying ? 'bg-violet-400' : 'bg-white/20'
-          }`}
-        />
-        <span className="text-xs text-white/40 tabular-nums">{score.tempo} BPM</span>
-      </div>
     </div>
   )
 }

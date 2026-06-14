@@ -56,6 +56,17 @@ export const INSTRUMENT_DB: Record<string, InstrumentConfig> = {
     comfortableMax: 72,
     soundfontUrl: 'https://gleitz.github.io/midi-js-soundfonts/MusyngKite/french_horn-mp3.js',
   },
+  piano_bass: {
+    key: 'piano_bass',
+    displayName: 'Piano (Bass)',
+    transposition: 0,
+    clef: 'bass',
+    rangeMin: 21,              // A0
+    rangeMax: 71,              // B4 (low register)
+    comfortableMin: 21,
+    comfortableMax: 71,
+    soundfontUrl: 'https://gleitz.github.io/midi-js-soundfonts/MusyngKite/acoustic_grand_piano-mp3.js',
+  },
 }
 
 export function getInstrument(key: string): InstrumentConfig {

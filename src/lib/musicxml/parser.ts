@@ -34,7 +34,7 @@ function parseNote(el: Element): NoteEvent {
   const note: Note = {
     id: crypto.randomUUID(),
     type: 'note',
-    pitch: { step, octave, accidental },
+    pitches: [{ step, octave, accidental }],
     duration,
     dots,
     tied,

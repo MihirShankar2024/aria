@@ -38,7 +38,7 @@ export function quantizeTiming(
       return {
         id: crypto.randomUUID(),
         type: 'note' as const,
-        pitch,
+        pitches: [pitch],
         duration,
         dots: 0,
         tied: false,

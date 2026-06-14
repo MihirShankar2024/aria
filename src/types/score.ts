@@ -12,7 +12,7 @@ export interface Pitch {
 export interface Note {
   id: string
   type: 'note'
-  pitch: Pitch
+  pitches: Pitch[]   // min 1 element; sorted low-to-high by octave for rendering
   duration: Duration
   dots: number
   tied: boolean
@@ -52,10 +52,25 @@ export interface Measure {
  * when all spanned notes share a pitch (sustained), otherwise a *slur* (legato).
  * Stored at the Part level since spans may cross barlines; note ids are global.
  */
+/**
+ * Manual override of a slur/tie's drawn curve, applied on top of the auto-computed
+ * shape. Set once the user drags a placed slur's handles; absent means fully automatic.
+ */
+export interface TieCurveOverride {
+  direction?: 1 | -1   // 1 = bulge down, -1 = bulge up
+  cp1?: number         // control-point depth (arch height)
+  cp2?: number
+  startDX?: number     // pixel shift of the start endpoint
+  startDY?: number
+  endDX?: number       // pixel shift of the end endpoint
+  endDY?: number
+}
+
 export interface Tie {
   id: string
   from: string   // note id, earlier in document order
   to: string     // note id, later in document order
+  curve?: TieCurveOverride  // manual drag adjustments, if any
 }
 
 export interface Part {
@@ -65,6 +80,7 @@ export interface Part {
   clef: Clef
   measures: Measure[]
   ties?: Tie[]
+  grandStaffPartnerId?: string  // ID of the linked part (piano: treble ↔ bass)
 }
 
 export interface Score {
@@ -74,6 +90,7 @@ export interface Score {
   globalTimeSig: TimeSig
   globalKeySig: KeySig
   parts: Part[]
+  tempoChanges: { measureNumber: number; tempo: number }[]  // sorted ascending by measureNumber
 }
 
 export interface Branch {

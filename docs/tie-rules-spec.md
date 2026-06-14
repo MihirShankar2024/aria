@@ -423,3 +423,135 @@ For every duration:
 8. Validate measure duration.
 
 The resulting notation should make the beat structure immediately visible to a trained musician.
+
+---
+
+# Slur Engraving Rules
+
+> These rules cover visual placement of slurs (and ties, which follow the same arc rules).
+> Aria targets the "95% case" — professional software uses dozens more heuristics, but
+> the rules below handle the vast majority of real scores correctly.
+
+---
+
+## Slur Direction
+
+### Single Voice
+
+Default slur direction follows stem direction:
+
+| Stem direction | Slur placement |
+|---------------|----------------|
+| Stems up      | Slur **above** notes |
+| Stems down    | Slur **below** notes |
+
+**Reason:** avoids collision with stems.
+
+**Mixed stem directions:** use the direction that places the slur furthest from the note stems. Goal: avoid stem collisions, avoid notehead collisions, maximize readability.
+
+### Two Voices on One Staff
+
+| Voice   | Slur placement |
+|---------|---------------|
+| Upper voice | Always **above** |
+| Lower voice | Always **below** |
+
+Voice separation takes precedence over stem direction.
+
+---
+
+## Slur Concavity
+
+A slur should curve **toward** the notes it connects:
+
+- **Slur above notes:** concavity points downward `╭────╮`
+- **Slur below notes:** concavity points upward `╰────╯`
+
+---
+
+## Height Rules
+
+### Basic Rule
+The middle of the slur should be farther from the staff than either endpoint. Never draw a straight line — always use visible curvature.
+
+### By Span Length
+
+| Span       | Note count | Arch height (staff spaces) |
+|------------|------------|---------------------------|
+| Short      | 2–3 notes  | ~1 space (shallow)        |
+| Medium     | 4–8 notes  | ~1.5–2 spaces             |
+| Long       | 9+ notes   | ~2–3 spaces               |
+
+Long slurs must not flatten — increase height to maintain a clear arc.
+
+### Increase height further if there is:
+- A beam collision
+- An accidental collision
+- An articulation collision
+
+---
+
+## Melodic Shape Adjustment
+
+The slur should roughly follow the contour of the melody:
+
+| Melody shape   | Adjustment                  |
+|----------------|-----------------------------|
+| Ascending      | Raise the right endpoint slightly |
+| Descending     | Raise the left endpoint slightly  |
+| Arch-shaped    | Mirror the melodic contour        |
+
+---
+
+## Distance from Notes
+
+- **Minimum clearance:** ~0.5 staff spaces between slur and nearest notehead/stem.
+- Slur must **never** touch: noteheads, stems, articulations, accidentals.
+
+---
+
+## Endpoint Placement
+
+Endpoints attach **near noteheads** — not to stems, beams, or flags.
+
+| Stem direction | Endpoint attachment          |
+|---------------|------------------------------|
+| Stem up       | Near **top** side of notehead |
+| Stem down     | Near **bottom** side of notehead |
+
+---
+
+## Special Cases
+
+### Slur Over Beamed Notes
+Raise the slur enough to clear the beam.
+
+### Slur With Articulations
+Articulation stays closest to the note; slur moves farther away.
+
+- Slur above: order is `slur → articulation → note`
+- Slur below: order is `note → articulation → slur`
+
+---
+
+## Implementation Heuristic
+
+```
+1. Determine slur direction:
+   - Single voice: opposite of stem direction
+     (stem up → direction = -1/below; stem down → direction = +1/above)
+   - Multiple voices: upper voice = above (+1), lower voice = below (-1)
+
+2. Find first and last notehead positions (getAbsoluteX()).
+
+3. Create cubic Bézier curve via VexFlow StaveTie:
+   - Set endpoint Y offset: ~0.5 staff spaces from noteheads
+   - Set arch height via renderOptions.cp1 / cp2:
+       pixel span < 60px  → cp ≈ 10  (1 staff space)
+       pixel span < 180px → cp ≈ 18  (1.5–2 spaces)
+       pixel span ≥ 180px → cp ≈ 28  (2.5–3 spaces)
+
+4. Increase cp values further if beam/accidental/articulation collision detected.
+
+5. Ensure slur never intersects: notes, stems, beams, articulations, dynamics.
+```

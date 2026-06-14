@@ -1,6 +1,6 @@
-import type { Score, Note, Rest, NoteEvent, Part, Measure } from '../../types/score'
+import type { Score, Note, Rest, NoteEvent, Part, Measure, Pitch } from '../../types/score'
 
-function accidentalToAlter(acc: Note['pitch']['accidental']): number {
+function accidentalToAlter(acc: Pitch['accidental']): number {
   const map: Record<string, number> = { sharp: 1, flat: -1, natural: 0, double_sharp: 2, double_flat: -2 }
   return acc ? (map[acc] ?? 0) : 0
 }
@@ -18,6 +18,19 @@ function durationToDivisions(dur: NoteEvent['duration'], dots: number): number {
   return dots > 0 ? Math.round(b * 1.5) : b
 }
 
+function pitchToXML(pitch: Pitch): string {
+  const alter = accidentalToAlter(pitch.accidental)
+  const accidentalTag = pitch.accidental
+    ? `<accidental>${pitch.accidental.replace('_', '-')}</accidental>`
+    : ''
+  return `<pitch>
+    <step>${pitch.step}</step>
+    ${alter !== 0 ? `<alter>${alter}</alter>` : ''}
+    <octave>${pitch.octave}</octave>
+  </pitch>
+  ${accidentalTag}`
+}
+
 function noteToXML(event: NoteEvent): string {
   if (event.type === 'rest') {
     const rest = event as Rest
@@ -25,23 +38,16 @@ function noteToXML(event: NoteEvent): string {
   }
 
   const note = event as Note
-  const alter = accidentalToAlter(note.pitch.accidental)
-  const accidentalTag = note.pitch.accidental
-    ? `<accidental>${note.pitch.accidental.replace('_', '-')}</accidental>`
-    : ''
+  // MusicXML represents chords with <chord/> elements on subsequent notes sharing a beat.
+  // For the primary pitch we emit a normal note; additional pitches use <chord/>.
+  const dots = note.dots > 0 ? '<dot/>' : ''
+  const tie  = note.tied ? '<tie type="start"/>' : ''
+  const dur  = `<duration>${durationToDivisions(note.duration, note.dots)}</duration><type>${durationToType(note.duration)}</type>${dots}${tie}`
 
-  return `<note>
-  <pitch>
-    <step>${note.pitch.step}</step>
-    ${alter !== 0 ? `<alter>${alter}</alter>` : ''}
-    <octave>${note.pitch.octave}</octave>
-  </pitch>
-  <duration>${durationToDivisions(note.duration, note.dots)}</duration>
-  <type>${durationToType(note.duration)}</type>
-  ${note.dots > 0 ? '<dot/>' : ''}
-  ${accidentalTag}
-  ${note.tied ? '<tie type="start"/>' : ''}
-</note>`
+  return note.pitches.map((pitch, idx) => {
+    const chord = idx > 0 ? '<chord/>' : ''
+    return `<note>${chord}\n  ${pitchToXML(pitch)}\n  ${dur}\n</note>`
+  }).join('\n')
 }
 
 function measureToXML(measure: Measure, number: number, timeSig?: Score['globalTimeSig'], keySig?: Score['globalKeySig']): string {

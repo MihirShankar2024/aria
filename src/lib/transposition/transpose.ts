@@ -12,21 +12,21 @@ function pitchToMidi(pitch: Pitch): number {
   return (pitch.octave + 1) * 12 + base[pitch.step] + accOffset
 }
 
+function transposePitch(pitch: Pitch, semitones: number): Pitch {
+  return midiToPitch(pitchToMidi(pitch) + semitones)
+}
+
 // Convert a concert-pitch note to the written pitch for a transposing instrument.
 // e.g. concert C4 → written D4 for Bb trumpet (transposition = +2)
 export function concertToWritten(note: Note, instrumentKey: string): Note {
   const instrument = getInstrument(instrumentKey)
   if (instrument.transposition === 0) return note
-  const concertMidi = pitchToMidi(note.pitch)
-  const writtenMidi = concertMidi + instrument.transposition
-  return { ...note, pitch: midiToPitch(writtenMidi) }
+  return { ...note, pitches: note.pitches.map(p => transposePitch(p, instrument.transposition)) }
 }
 
 // Convert a written pitch for a transposing instrument back to concert pitch.
 export function writtenToConcert(note: Note, instrumentKey: string): Note {
   const instrument = getInstrument(instrumentKey)
   if (instrument.transposition === 0) return note
-  const writtenMidi = pitchToMidi(note.pitch)
-  const concertMidi = writtenMidi - instrument.transposition
-  return { ...note, pitch: midiToPitch(concertMidi) }
+  return { ...note, pitches: note.pitches.map(p => transposePitch(p, -instrument.transposition)) }
 }

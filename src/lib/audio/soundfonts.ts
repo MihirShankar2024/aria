@@ -5,6 +5,24 @@ import { getInstrument } from '../instruments'
 const samplerCache = new Map<string, Tone.Sampler>()
 const statusCache = new Map<string, SoundFontStatus>()
 
+// Anchor samples spread across the full range. With only octave-4 samples,
+// every other pitch is pitch-shifted by changing playbackRate, which also
+// rescales the finite sample buffer's real-time length — so a whole-note chord
+// would have its higher tones run out of buffer (and cut off) before its lower
+// tones. Sampling every ~3 semitones across octaves 1–7 keeps the shift (and
+// thus the audible decay) near-uniform, so chord tones release together.
+// MusyngKite ships the full A0–C8 range for every instrument, so these all exist.
+const SAMPLE_URLS: Record<string, string> = (() => {
+  const anchors: [string, string][] = [['C', 'C'], ['D#', 'Eb'], ['F#', 'Gb'], ['A', 'A']]
+  const urls: Record<string, string> = {}
+  for (let octave = 1; octave <= 7; octave++) {
+    for (const [note, file] of anchors) {
+      urls[`${note}${octave}`] = `${file}${octave}.mp3`
+    }
+  }
+  return urls
+})()
+
 // Loads a GeneralUser GS soundfont sampler for the given instrument key.
 // Returns a promise that resolves when the sampler is ready.
 export async function loadSoundFont(instrumentKey: string): Promise<Tone.Sampler> {
@@ -17,7 +35,7 @@ export async function loadSoundFont(instrumentKey: string): Promise<Tone.Sampler
 
   return new Promise((resolve, reject) => {
     const sampler = new Tone.Sampler({
-      urls: { C4: 'C4.mp3', 'D#4': 'Eb4.mp3', 'F#4': 'Gb4.mp3', A4: 'A4.mp3' },
+      urls: SAMPLE_URLS,
       release: 1,
       baseUrl: `https://gleitz.github.io/midi-js-soundfonts/MusyngKite/${instrument.key.replace('_bb', '').replace('_', '-')}-mp3/`,
       onload: () => {

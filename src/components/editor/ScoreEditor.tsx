@@ -1,12 +1,45 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { Undo2, Redo2 } from 'lucide-react'
 import { useScore } from '../../hooks/useScore'
 import { usePlayback } from '../../hooks/usePlayback'
+import { useScrollSync } from '../../hooks/useScrollSync'
 import { Button } from '../ui/button'
 import { StaffCanvas } from './StaffCanvas'
+import { GrandStaffCanvas } from './GrandStaffCanvas'
 import { DurationToolbar } from './DurationToolbar'
+import { PartsSidebar } from './PartsSidebar'
+import { AddInstrumentButton } from './AddInstrumentButton'
 import { PlaybackBar } from '../playback/PlaybackBar'
-import type { Duration, Accidental } from '../../types/score'
+import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
+import { normalizeMeasureRests } from '../../lib/rests'
+import type { PendingRest } from './useDeleteTrail'
+import type { Part, Duration, Accidental } from '../../types/score'
+
+type PartGroup =
+  | { type: 'single'; part: Part }
+  | { type: 'grand'; treble: Part; bass: Part }
+
+function groupParts(parts: Part[]): PartGroup[] {
+  const rendered = new Set<string>()
+  const groups: PartGroup[] = []
+  for (const part of parts) {
+    if (rendered.has(part.id)) continue
+    if (part.grandStaffPartnerId) {
+      const partner = parts.find(p => p.id === part.grandStaffPartnerId)
+      if (partner) {
+        rendered.add(part.id)
+        rendered.add(partner.id)
+        const treble = part.clef === 'treble' ? part : partner
+        const bass   = part.clef === 'treble' ? partner : part
+        groups.push({ type: 'grand', treble, bass })
+        continue
+      }
+    }
+    rendered.add(part.id)
+    groups.push({ type: 'single', part })
+  }
+  return groups
+}
 
 export function ScoreEditor() {
   const { score, dispatch, undo, redo, canUndo, canRedo } = useScore()
@@ -18,10 +51,61 @@ export function ScoreEditor() {
   const [selectedAccidental, setSelectedAccidental] = useState<Accidental>(null)
   const [isTieMode, setIsTieMode] = useState(false)
   const [isFillMode, setIsFillMode] = useState(false)
+  const [isDeleteMode, setIsDeleteMode] = useState(false)
+  const [isInsertMode, setIsInsertMode] = useState(false)
+  const [pendingRests, setPendingRests] = useState<PendingRest[] | null>(null)
+  const scrollSync = useScrollSync()
+
+  // Refs so the (rarely re-subscribed) keydown handler reads current values.
+  const pendingRef = useRef<PendingRest[] | null>(null)
+  pendingRef.current = pendingRests
+  const scoreRef = useRef(score)
+  scoreRef.current = score
+
+  // Remove the red in-place rests and let following notes shift left.
+  const collapsePending = () => {
+    const pend = pendingRef.current
+    if (!pend) return
+    const sc = scoreRef.current
+    const edits: { partId: string; measureId: string; notes: typeof sc.parts[0]['measures'][0]['notes'] }[] = []
+    for (const { partId, measureId, restIds } of pend) {
+      const measure = sc.parts.find(p => p.id === partId)?.measures.find(m => m.id === measureId)
+      if (!measure) continue
+      const remove = new Set(restIds)
+      const notes = normalizeMeasureRests(measure.notes.filter(n => !remove.has(n.id)), measure.timeSig ?? sc.globalTimeSig)
+      edits.push({ partId, measureId, notes })
+    }
+    setPendingRests(null)
+    if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+  }
+
+  // The red "pending rests" state persists across multiple delete strokes and is
+  // cleared only when the delete tool is toggled off (effect below) or collapsed.
+  useEffect(() => {
+    if (!isDeleteMode) setPendingRests(null)
+  }, [isDeleteMode])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      // Undo / redo
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault()
+        e.shiftKey ? redo() : undo()
+        return
+      }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
+        e.preventDefault()
+        redo()
+        return
+      }
+      if (e.metaKey || e.ctrlKey) return
+      // Tab confirm-collapses the pending red rests left behind by deletes.
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        if (pendingRef.current) collapsePending()
+        return
+      }
       switch (e.key) {
         case 'w': setSelectedDuration('whole'); break
         case 'h': setSelectedDuration('half'); break
@@ -37,35 +121,104 @@ export function ScoreEditor() {
         case 's': setSelectedAccidental(prev => prev === 'sharp' ? null : 'sharp'); break
         case 'n': setSelectedAccidental(prev => prev === 'natural' ? null : 'natural'); break
         case 't': enterTieMode(prev => !prev); break
+        case 'i': enterInsertMode(prev => !prev); break
+        case 'Backspace':
+        case 'Delete':
+          e.preventDefault()
+          enterDeleteMode(prev => !prev)
+          break
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [])
+  }, [undo, redo])
 
   const handleNotePlaced = () => {
     setIsDotted(false)
     setSelectedAccidental(null)
   }
 
-  // Tie and fill are mutually exclusive modes — enabling one clears the other.
   const enterTieMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsTieMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) setIsFillMode(false)
+      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false) }
       return v
     })
   }
   const enterFillMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsFillMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) setIsTieMode(false)
+      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsInsertMode(false) }
+      return v
+    })
+  }
+  const enterDeleteMode = (next: boolean | ((p: boolean) => boolean)) => {
+    setIsDeleteMode(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsInsertMode(false) }
+      return v
+    })
+  }
+  const enterInsertMode = (next: boolean | ((p: boolean) => boolean)) => {
+    setIsInsertMode(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false) }
       return v
     })
   }
 
-  const handleTieComplete = () => setIsTieMode(false)    // one-shot
-  const handleFillComplete = () => setIsFillMode(false)  // one-shot
+  const handleTieComplete = () => setIsTieMode(false)
+  const handleFillComplete = () => setIsFillMode(false)
+  const handleInsertComplete = () => setIsInsertMode(false)
+
+  // Accumulate pending red rests across strokes; a re-touched measure's entry is
+  // replaced (its rests were re-IDed), other measures are kept.
+  const handleRestsCommitted = (pending: PendingRest[]) => {
+    setPendingRests(prev => {
+      const byKey = new Map<string, PendingRest>()
+      for (const p of prev ?? []) byKey.set(`${p.partId}|${p.measureId}`, p)
+      for (const p of pending) byKey.set(`${p.partId}|${p.measureId}`, p)
+      const arr = [...byKey.values()].filter(p => p.restIds.length > 0)
+      return arr.length ? arr : null
+    })
+  }
+
+  const pendingRestIdSet = useMemo(
+    () => new Set(pendingRests?.flatMap(p => p.restIds) ?? []),
+    [pendingRests],
+  )
+
+  const groups = groupParts(score.parts)
+  const measureCount = Math.max(1, ...score.parts.map(p => p.measures.length))
+
+  // One shared stave-width per measure index across all parts, so barlines align
+  // vertically across every staff (standard system engraving).
+  const systemStaveWidths = useMemo(
+    () => computeSystemStaveWidths(score.parts, score.globalTimeSig, score.globalKeySig),
+    [score.parts, score.globalTimeSig, score.globalKeySig],
+  )
+
+  const commonCanvasProps = {
+    dispatch,
+    selectedDuration,
+    selectedAccidental,
+    isDotted,
+    isRest,
+    isTieMode,
+    isFillMode,
+    isDeleteMode,
+    isInsertMode,
+    initialTempo: score.tempo,
+    tempoChanges: score.tempoChanges,
+    forcedStaveWidths: systemStaveWidths.length ? systemStaveWidths : undefined,
+    scrollSync,
+    pendingRestIds: pendingRestIdSet,
+    onNotePlaced: handleNotePlaced,
+    onTieComplete: handleTieComplete,
+    onFillComplete: handleFillComplete,
+    onInsertComplete: handleInsertComplete,
+    onRestsCommitted: handleRestsCommitted,
+  }
 
   return (
     <div className="relative min-h-screen text-white flex flex-col">
@@ -96,7 +249,7 @@ export function ScoreEditor() {
         </div>
       </header>
 
-      {/* Duration toolbar */}
+      {/* Toolbar */}
       <div className="px-6 py-3 border-b border-white/10">
         <DurationToolbar
           selectedDuration={selectedDuration}
@@ -111,40 +264,69 @@ export function ScoreEditor() {
           onTieModeChange={enterTieMode}
           isFillMode={isFillMode}
           onFillModeChange={enterFillMode}
+          isDeleteMode={isDeleteMode}
+          onDeleteModeChange={enterDeleteMode}
+          isInsertMode={isInsertMode}
+          onInsertModeChange={enterInsertMode}
+          hasPendingRests={!!pendingRests}
+          onCollapseRests={collapsePending}
+          globalTimeSig={score.globalTimeSig}
+          globalKeySig={score.globalKeySig}
+          initialTempo={score.tempo}
+          measureCount={measureCount}
+          dispatch={dispatch}
         />
       </div>
 
-      {/* Staff area */}
-      <main className="flex-1 px-6 py-8 space-y-8 overflow-y-auto">
-        {score.parts.map((part) => (
-          <div key={part.id}>
-            <p className="text-[11px] text-white/35 mb-2 font-medium tracking-widest uppercase">
-              {part.name}
-            </p>
-            <StaffCanvas
-              partId={part.id}
-              measures={part.measures}
-              timeSig={score.globalTimeSig}
-              keySig={score.globalKeySig}
-              dispatch={dispatch}
-              selectedDuration={selectedDuration}
-              selectedAccidental={selectedAccidental}
-              isDotted={isDotted}
-              isRest={isRest}
-              ties={part.ties ?? []}
-              isTieMode={isTieMode}
-              isFillMode={isFillMode}
-              onNotePlaced={handleNotePlaced}
-              onTieComplete={handleTieComplete}
-              onFillComplete={handleFillComplete}
-            />
-          </div>
-        ))}
-      </main>
+      {/* Body: sidebar + score */}
+      <div className="flex flex-1 overflow-hidden">
+        <PartsSidebar parts={score.parts} dispatch={dispatch} />
 
-      {/* Playback bar */}
+        <main className="flex-1 px-6 py-8 space-y-8 overflow-y-auto">
+          {groups.map((group) => {
+            if (group.type === 'grand') {
+              return (
+                <div key={group.treble.id}>
+                  <p className="text-[11px] text-white/35 mb-2 font-medium tracking-widest uppercase">
+                    Piano
+                  </p>
+                  <GrandStaffCanvas
+                    treblePart={group.treble}
+                    bassPart={group.bass}
+                    timeSig={score.globalTimeSig}
+                    keySig={score.globalKeySig}
+                    {...commonCanvasProps}
+                  />
+                </div>
+              )
+            }
+            const { part } = group
+            return (
+              <div key={part.id}>
+                <p className="text-[11px] text-white/35 mb-2 font-medium tracking-widest uppercase">
+                  {part.name}
+                </p>
+                <StaffCanvas
+                  partId={part.id}
+                  measures={part.measures}
+                  timeSig={score.globalTimeSig}
+                  keySig={score.globalKeySig}
+                  clef={part.clef}
+                  ties={part.ties ?? []}
+                  {...commonCanvasProps}
+                />
+              </div>
+            )
+          })}
+        </main>
+      </div>
+
+      {/* Playback bar + add instrument, grouped to fit within the left column width */}
       <footer className="sticky bottom-0 px-6 py-4 border-t border-white/10 bg-black/30 backdrop-blur-sm">
-        <PlaybackBar score={score} status={status} onPlay={play} onStop={stop} />
+        <div className="w-52 flex items-center gap-2">
+          <PlaybackBar score={score} status={status} onPlay={play} onStop={stop} />
+          <AddInstrumentButton dispatch={dispatch} />
+        </div>
       </footer>
     </div>
   )

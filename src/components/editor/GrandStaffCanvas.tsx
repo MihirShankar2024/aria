@@ -7,23 +7,22 @@ import {
   GRAND_BASS_Y,
   GRAND_STAFF_HEIGHT,
 } from '../../lib/vexflow/renderer'
-import { staffYToPitch, staffStepToY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
+import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, whichGrandStaffStave, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
 import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats } from '../../lib/beats'
 import { computeTieSpans } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
+import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
 import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { applyRestErase } from '../../lib/rests'
-import type { TimeSig, KeySig, Duration, Accidental, Part, NoteEvent } from '../../types/score'
+import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20
 const BRUSH_R = 15
-
-// The vertical midpoint between treble and bass staves — clicks above go to treble, below to bass.
-const MIDPOINT_Y = (GRAND_TREBLE_Y + GRAND_BASS_Y) / 2 + STAVE_TOP_OFFSET
+const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
 
 const TREBLE_TOP_Y    = GRAND_TREBLE_Y + STAVE_TOP_OFFSET
 const TREBLE_BOTTOM_Y = TREBLE_TOP_Y + 4 * LINE_SPACING
@@ -31,7 +30,7 @@ const BASS_TOP_Y      = GRAND_BASS_Y + STAVE_TOP_OFFSET
 const BASS_BOTTOM_Y   = BASS_TOP_Y + 4 * LINE_SPACING
 const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
 
-interface HoverInfo { x: number; snapY: number; stave: 'treble' | 'bass'; isChordTarget: boolean; restTarget: { x: number; y: number } | null }
+interface HoverInfo { x: number; snapY: number; stave: 'treble' | 'bass'; isChordTarget: boolean; restTarget: { x: number; y: number } | null; noteTarget: { x: number; y: number } | null }
 interface TieDrag { partId: string; fromId: string; fromX: number; fromY: number; curX: number; curY: number }
 
 // A chosen insertion point on a specific stave.
@@ -69,6 +68,7 @@ interface GrandStaffCanvasProps {
   onFillComplete?: () => void
   onInsertComplete?: () => void
   onRestsCommitted?: (pending: PendingRest[]) => void
+  onPlaybackLayoutChange?: (layout: PlaybackLayout) => void
 }
 
 export function GrandStaffCanvas({
@@ -98,6 +98,7 @@ export function GrandStaffCanvas({
   onFillComplete,
   onInsertComplete,
   onRestsCommitted,
+  onPlaybackLayoutChange,
 }: GrandStaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -139,6 +140,14 @@ export function GrandStaffCanvas({
       console.error('Grand staff render failed', err)
     }
   }, [treblePart, bassPart, timeSig, keySig, initialTempo, tempoChanges, forcedStaveWidths])
+
+  useEffect(() => {
+    if (!layout || !onPlaybackLayoutChange) return
+    onPlaybackLayoutChange({
+      measures: layout.measures,
+      notes: [...layout.trebleNotes, ...layout.bassNotes],
+    })
+  }, [layout, onPlaybackLayoutChange])
 
   // Smoothly recenter the active measure once it drifts into the right quarter.
   useEffect(() => {
@@ -201,7 +210,7 @@ export function GrandStaffCanvas({
   }
 
   // Determine which stave a Y coordinate belongs to.
-  const whichStave = (y: number): 'treble' | 'bass' => y < MIDPOINT_Y ? 'treble' : 'bass'
+  const whichStave = (y: number): 'treble' | 'bass' => whichGrandStaffStave(y, GRAND_TREBLE_Y, GRAND_BASS_Y)
 
   const nearestNoteAtX = (notes: NoteGeometry[], x: number, maxDist = Infinity): NoteGeometry | null => {
     let best: NoteGeometry | null = null
@@ -223,6 +232,46 @@ export function GrandStaffCanvas({
       if (d < bestDist) { bestDist = d; best = n }
     }
     return best
+  }
+
+  // Find the note whose notehead sits directly under (x, y) on a stave — a precise
+  // hit on the glyph (used by the dot/accidental click-to-apply path).
+  const noteHeadAt = (notes: NoteGeometry[], x: number, y: number): NoteGeometry | null => {
+    const r2 = NOTEHEAD_HIT_R * NOTEHEAD_HIT_R
+    let best: NoteGeometry | null = null
+    let bestDist = r2
+    for (const n of notes) {
+      if (n.type !== 'note') continue
+      for (const ny of n.ys) {
+        const d = (n.x - x) * (n.x - x) + (ny - y) * (ny - y)
+        if (d <= bestDist) { bestDist = d; best = n }
+      }
+    }
+    return best
+  }
+
+  // Apply the active modifier tool(s) — dot and/or accidental — to an existing note,
+  // the accidental landing on the chord tone at the clicked staff position. onNotePlaced
+  // then clears the tool selection so it doesn't carry to the next placement.
+  const applyModifierToExistingNote = (part: Part, staveY: number, clef: 'treble' | 'bass', target: NoteGeometry, clickY: number) => {
+    const measure = part.measures[target.measureIndex]
+    if (!measure) return
+    const ev = measure.notes.find(n => n.id === target.id)
+    if (!ev || ev.type !== 'note') return
+    const patch: Partial<Note> = {}
+    if (isDotted) patch.dots = 1
+    if (selectedAccidental !== null) {
+      const clicked = staffYToPitch(clickY, staveY, clef)
+      patch.pitches = ev.pitches.map(p =>
+        p.step === clicked.step && p.octave === clicked.octave
+          ? { ...p, accidental: selectedAccidental }
+          : p,
+      )
+    }
+    if (Object.keys(patch).length === 0) return
+    pendingCenterRef.current = target.measureIndex
+    dispatch({ type: 'UPDATE_NOTE', partId: part.id, measureId: measure.id, noteId: target.id, patch })
+    onNotePlaced?.()
   }
 
   // Resolve a cursor x to an insertion gap within a measure on the given stave.
@@ -333,7 +382,7 @@ export function GrandStaffCanvas({
     if (isDeleteMode) {
       const coords = getCoords(e)
       if (!coords) return
-      pushTrail(coords.x, coords.y)
+      pushTrail(coords.x, coords.y, markingRef.current)
       if (markingRef.current) markAt(coords.x, coords.y)
       return
     }
@@ -356,7 +405,6 @@ export function GrandStaffCanvas({
       setInsertHover(coords ? gapAtX(whichStave(coords.y), getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
-    if (isRest) { setHoverInfo(null); return }
     const coords = getCoords(e)
     if (!coords) return
     const stave = whichStave(coords.y)
@@ -364,9 +412,14 @@ export function GrandStaffCanvas({
     const stepsDown = Math.round((coords.y - (staveY + STAVE_TOP_OFFSET)) / (LINE_SPACING / 2))
     const snapY = staffStepToY(stepsDown, staveY)
     const notes = stave === 'treble' ? layout?.trebleNotes ?? [] : layout?.bassNotes ?? []
+    if (isRest) {
+      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+      setHoverInfo({ x: coords.x, snapY, stave, isChordTarget: false, restTarget: null, noteTarget: nearNote ? { x: nearNote.cx, y: nearNote.y } : null })
+      return
+    }
     const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
     const nearRest = nearNote ? null : nearestRestAtX(notes, coords.x)
-    setHoverInfo({ x: coords.x, snapY, stave, isChordTarget: !!nearNote, restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null })
+    setHoverInfo({ x: coords.x, snapY, stave, isChordTarget: !!nearNote, restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null, noteTarget: null })
   }
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -380,7 +433,7 @@ export function GrandStaffCanvas({
     if (isDeleteMode) {
       if (performance.now() < clickCooldownRef.current) return
       markingRef.current = true
-      pushTrail(coords.x, coords.y)
+      pushTrail(coords.x, coords.y, true)
       markAt(coords.x, coords.y)
       return
     }
@@ -465,6 +518,25 @@ export function GrandStaffCanvas({
       return
     }
 
+    const clef = stave === 'treble' ? 'treble' : 'bass'
+
+    // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
+    // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
+    // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
+    if (!isRest && (isDotted || selectedAccidental !== null)) {
+      const hit = noteHeadAt(notes, coords.x, coords.y)
+      if (hit) { applyModifierToExistingNote(part, staveY, clef, hit, coords.y); return }
+      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+      if (nearNote) {
+        const measure = part.measures[nearNote.measureIndex]
+        const ev = measure?.notes.find(n => n.id === nearNote.id)
+        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, coords.y, staveY, clef)) {
+          applyModifierToExistingNote(part, staveY, clef, nearNote, coords.y)
+          return
+        }
+      }
+    }
+
     // Chord add
     if (!isRest) {
       const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
@@ -499,6 +571,25 @@ export function GrandStaffCanvas({
         }
         return
       }
+    } else {
+      // Rest mode: clicking an existing note replaces it with a rest — mirror of
+      // replacing a rest with a note above.
+      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+      if (nearNote) {
+        const measure = part.measures[nearNote.measureIndex]
+        if (measure) {
+          pendingCenterRef.current = nearNote.measureIndex
+          dispatch({
+            type: 'REPLACE_EVENT',
+            partId: part.id,
+            measureId: measure.id,
+            eventId: nearNote.id,
+            event: { id: crypto.randomUUID(), type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
+          })
+          onNotePlaced?.()
+        }
+        return
+      }
     }
 
     const measure = part.measures[idx]
@@ -516,7 +607,6 @@ export function GrandStaffCanvas({
       })
       onNotePlaced?.()
     } else {
-      const clef = stave === 'treble' ? 'treble' : 'bass'
       const pitch = staffYToPitch(coords.y, staveY, clef)
       const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
       dispatch({
@@ -668,6 +758,22 @@ export function GrandStaffCanvas({
           </svg>
         )}
 
+        {/* Replace-on-note target (rest mode): ring the note the next click will overwrite. */}
+        {hoverInfo?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+          <div
+            className="absolute pointer-events-none rounded-md"
+            style={{
+              left: hoverInfo.noteTarget.x - 12,
+              top: hoverInfo.noteTarget.y - 16,
+              width: 24,
+              height: 32,
+              border: '1.5px solid rgba(139,92,246,0.7)',
+              background: 'rgba(139,92,246,0.10)',
+              zIndex: 16,
+            }}
+          />
+        )}
+
         {/* Replace-on-rest target: ring the rest the next click will overwrite. */}
         {hoverInfo?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
@@ -743,7 +849,8 @@ export function GrandStaffCanvas({
               const age = (performance.now() - p.born) / TRAIL_MS
               const op = Math.max(0, 1 - age)
               const r = 2 + op * 7
-              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(239,68,68,${op * 0.5})`} />
+              const rgb = p.pressed ? '239,68,68' : '148,163,184'
+              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
             })}
           </svg>
         )}

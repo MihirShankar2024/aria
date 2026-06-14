@@ -1,10 +1,10 @@
 import type { Pitch, Clef } from '../../types/score'
 
 // VexFlow Stave internals: new Stave(x, y, width) places the TOP LINE at
-// y + spaceAboveStaffLn * lineSpacing = y + 4*10 = y + 40
+// y + spaceAboveStaffLn * lineSpacing = y + 4*12 = y + 48
 export const VEXFLOW_HEADROOM = 4    // spaceAboveStaffLn (VexFlow default)
-export const LINE_SPACING = 10       // px between staff lines (VexFlow default)
-export const STAVE_TOP_OFFSET = VEXFLOW_HEADROOM * LINE_SPACING  // 40px
+export const LINE_SPACING = 12       // px between staff lines
+export const STAVE_TOP_OFFSET = VEXFLOW_HEADROOM * LINE_SPACING  // 48px
 
 // ── Treble clef ──────────────────────────────────────────────────────────────
 // Top line = F5, steps down: F E D C B A G (repeating)
@@ -64,4 +64,37 @@ export function staffStepToY(
   lineSpacing = LINE_SPACING,
 ): number {
   return staveY + VEXFLOW_HEADROOM * lineSpacing + stepsDown * (lineSpacing / 2)
+}
+
+/** True when clickY resolves to the same diatonic step/octave as any pitch in the chord. */
+export function noteHasPitchAtStaffY(
+  pitches: Pitch[],
+  clickY: number,
+  staveY: number,
+  clef: Clef = 'treble',
+  lineSpacing = LINE_SPACING,
+): boolean {
+  const clicked = staffYToPitch(clickY, staveY, clef, lineSpacing)
+  return pitches.some(p => p.step === clicked.step && p.octave === clicked.octave)
+}
+
+/**
+ * Pick treble vs bass for a grand-staff click/hover Y. Snaps to the nearer staff
+ * line/space; ties in the gap split at the midpoint between the two staff bodies.
+ */
+export function whichGrandStaffStave(
+  y: number,
+  trebleStaveY: number,
+  bassStaveY: number,
+  lineSpacing = LINE_SPACING,
+): 'treble' | 'bass' {
+  const halfStep = lineSpacing / 2
+  const trebleSteps = Math.round((y - (trebleStaveY + VEXFLOW_HEADROOM * lineSpacing)) / halfStep)
+  const bassSteps = Math.round((y - (bassStaveY + VEXFLOW_HEADROOM * lineSpacing)) / halfStep)
+  const trebleDist = Math.abs(y - staffStepToY(trebleSteps, trebleStaveY, lineSpacing))
+  const bassDist = Math.abs(y - staffStepToY(bassSteps, bassStaveY, lineSpacing))
+  if (trebleDist < bassDist) return 'treble'
+  if (bassDist < trebleDist) return 'bass'
+  const gapMid = (staffStepToY(8, trebleStaveY, lineSpacing) + staffStepToY(0, bassStaveY, lineSpacing)) / 2
+  return y < gapMid ? 'treble' : 'bass'
 }

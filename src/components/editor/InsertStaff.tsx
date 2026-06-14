@@ -5,7 +5,7 @@ import { staffYToPitch, staffStepToY, STAVE_TOP_OFFSET, LINE_SPACING } from '../
 import { noteBeatDuration } from '../../lib/beats'
 import type { Measure, TimeSig, KeySig, Duration, Accidental, Clef, NoteEvent, Pitch } from '../../types/score'
 
-const STAVE_Y = 40
+const STAVE_Y = 48
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20
 const EPS = 0.001

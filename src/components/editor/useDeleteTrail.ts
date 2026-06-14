@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-export interface TrailPoint { x: number; y: number; born: number }
+export interface TrailPoint { x: number; y: number; born: number; pressed: boolean }
 
 // A group of in-place rests left behind after a delete-brush release, awaiting a
 // "confirm collapse" (or clear). Highlighted red until resolved.
@@ -18,8 +18,10 @@ export function useDeleteTrail(active: boolean) {
   const pointsRef = useRef<TrailPoint[]>([])
   const [trail, setTrail] = useState<TrailPoint[]>([])
 
-  const push = (x: number, y: number) => {
-    pointsRef.current.push({ x, y, born: performance.now() })
+  // `pressed` marks points laid down while actively erasing (mouse held), so the
+  // trail can render red there and gray for passive hovering.
+  const push = (x: number, y: number, pressed = false) => {
+    pointsRef.current.push({ x, y, born: performance.now(), pressed })
     if (pointsRef.current.length > MAX_POINTS) pointsRef.current.shift()
   }
 

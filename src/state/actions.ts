@@ -4,6 +4,7 @@ export type ScoreAction =
   | { type: 'ADD_NOTE'; partId: string; measureId: string; note: Note }
   | { type: 'ADD_REST'; partId: string; measureId: string; rest: Rest }
   | { type: 'REPLACE_REST'; partId: string; measureId: string; restId: string; note: Note }
+  | { type: 'REPLACE_EVENT'; partId: string; measureId: string; eventId: string; event: NoteEvent }
   | { type: 'INSERT_EVENTS'; partId: string; measureId: string; index: number; events: NoteEvent[] }
   | { type: 'DELETE_NOTE'; partId: string; measureId: string; noteId: string }
   | { type: 'ADD_TIES'; partId: string; ties: Tie[] }

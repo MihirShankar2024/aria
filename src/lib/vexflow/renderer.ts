@@ -76,7 +76,7 @@ const MAX_NOTE_AREA = 400
 const SNAP_STEP = 32
 const SPACING_FACTOR = 1.5
 const BLEND_FACTOR = 0.35
-export const STAFF_HEIGHT = 160
+export const STAFF_HEIGHT = 192
 
 // Key signature: fifths → VexFlow key name
 const FIFTHS_TO_KEY = ['Cb', 'Gb', 'Db', 'Ab', 'Eb', 'Bb', 'F', 'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#']
@@ -119,10 +119,10 @@ function drawLedgerGuides(ctx: ReturnType<InstanceType<typeof Renderer>['getCont
 
 // Per-measure raw note-area widths (and the VexFlow minimums) for one staff —
 // the busiest-content sizing used for both single-staff and system-wide layout.
-function computeColumnWidths(measures: Measure[], effTimeSigs: TimeSig[]): { raws: number[]; mins: number[] } {
+function computeColumnWidths(measures: Measure[], effTimeSigs: TimeSig[], clef: Clef = 'treble'): { raws: number[]; mins: number[] } {
   const mins: number[] = []
   const raws = measures.map((m, i) => {
-    const { voice } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1])
+    const { voice } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1], clef)
     if (!voice) { mins.push(0); return MIN_NOTE_AREA }
     const min = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
     mins.push(min)
@@ -155,7 +155,7 @@ export function computeSystemStaveWidths(parts: Part[], globalTimeSig: TimeSig, 
   const perPart = parts.map(part => {
     const effTs = part.measures.map((_, i) => effectiveTimeSigAt(part.measures, i, globalTimeSig))
     const effKs = part.measures.map((_, i) => effectiveKeySigAt(part.measures, i, globalKeySig))
-    const { raws, mins } = computeColumnWidths(part.measures, effTs)
+    const { raws, mins } = computeColumnWidths(part.measures, effTs, part.clef)
     return { isGrand: !!part.grandStaffPartnerId, effTs, effKs, raws, mins }
   })
 
@@ -225,9 +225,9 @@ function buildGhostNotes(remainingBeats: number): GhostNote[] {
   return ghosts
 }
 
-function buildVexNote(event: NoteEvent): StaveNote {
+function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
   if (event.type === 'rest') {
-    const vn = new StaveNote({ keys: ['b/4'], duration: durationToVex(event.duration, event.dots) + 'r' })
+    const vn = new StaveNote({ keys: ['b/4'], duration: durationToVex(event.duration, event.dots) + 'r', clef })
     if (event.dots > 0) Dot.buildAndAttach([vn], { all: true })
     return vn
   }
@@ -237,6 +237,7 @@ function buildVexNote(event: NoteEvent): StaveNote {
   const vn = new StaveNote({
     keys,
     duration: durationToVex(note.duration, note.dots),
+    clef,
   })
   // Attach accidentals per key index, then dots.
   note.pitches.forEach((pitch, idx) => {
@@ -252,10 +253,10 @@ interface BuiltMeasure {
   voice: Voice | null
 }
 
-function buildMeasure(measure: Measure, timeSig: TimeSig): BuiltMeasure {
+function buildMeasure(measure: Measure, timeSig: TimeSig, clef: Clef = 'treble'): BuiltMeasure {
   if (measure.notes.length === 0) return { realNotes: [], voice: null }
 
-  const realNotes = measure.notes.map(buildVexNote)
+  const realNotes = measure.notes.map(ev => buildVexNote(ev, clef))
   const ghosts = buildGhostNotes(measureCapacity(timeSig) - measureBeatCount(measure))
   const voice = new Voice({ numBeats: timeSig.beats, beatValue: timeSig.beatType })
     .setStrict(false)
@@ -341,7 +342,7 @@ export function renderStaff({
   keySig,
   clef = 'treble',
   ties = [],
-  staveY = 40,
+  staveY = 48,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -355,7 +356,7 @@ export function renderStaff({
   const effKeySigs  = measures.map((_, i) => effectiveKeySigAt(measures, i, keySig))
 
   // Pass 1 — build voices and compute note-area widths.
-  const built = measures.map((m, i) => buildMeasure(m, effTimeSigs[i]))
+  const built = measures.map((m, i) => buildMeasure(m, effTimeSigs[i], clef))
   const vexMins: number[] = []
   const rawWidths = built.map(({ voice }) => {
     if (!voice) { vexMins.push(0); return MIN_NOTE_AREA }
@@ -404,7 +405,7 @@ export function renderStaff({
     const prevKeySig  = idx > 0 ? effKeySigs[idx - 1] : null
     const prevTimeSig = idx > 0 ? effTimeSigs[idx - 1] : null
 
-    const stave = new Stave(x, staveY, staveWidth)
+    const stave = new Stave(x, staveY, staveWidth, { spacingBetweenLinesPx: 12 })
 
     if (idx === 0) {
       stave.addClef(clef)
@@ -500,9 +501,9 @@ function getTempoAtMeasure(
 // Grand Staff rendering (piano: treble + bass linked, with brace)
 // ──────────────────────────────────────────────────────────────────────────────
 
-export const GRAND_TREBLE_Y = 30
-export const GRAND_BASS_Y = 130
-export const GRAND_STAFF_HEIGHT = 280
+export const GRAND_TREBLE_Y = 36
+export const GRAND_BASS_Y = 192   // +36px gap vs prior 156 — more space between staves
+export const GRAND_STAFF_HEIGHT = 348
 
 export interface GrandStaffLayout {
   width: number
@@ -552,8 +553,8 @@ export function renderGrandStaff({
   const effKeySigs  = trebleMeasures.map((_, i) => effectiveKeySigAt(trebleMeasures, i, keySig))
 
   // Build voices for both staves.
-  const trebleBuilt = trebleMeasures.map((m, i) => buildMeasure(m, effTimeSigs[i]))
-  const bassBuilt   = bassMeasures.map((m, i) => buildMeasure(m, effTimeSigs[i] ?? timeSig))
+  const trebleBuilt = trebleMeasures.map((m, i) => buildMeasure(m, effTimeSigs[i], 'treble'))
+  const bassBuilt   = bassMeasures.map((m, i) => buildMeasure(m, effTimeSigs[i] ?? timeSig, 'bass'))
 
   // Compute per-measure note-area widths — take max of treble and bass so columns align.
   function computeRawWidths(built: BuiltMeasure[]): number[] {
@@ -608,9 +609,9 @@ export function renderGrandStaff({
     const prevTimeSig = idx > 0 ? effTimeSigs[idx - 1] : null
 
     // Treble stave
-    const trebleStave = new Stave(x, GRAND_TREBLE_Y, staveWidth)
+    const trebleStave = new Stave(x, GRAND_TREBLE_Y, staveWidth, { spacingBetweenLinesPx: 12 })
     // Bass stave
-    const bassStave   = new Stave(x, GRAND_BASS_Y, staveWidth)
+    const bassStave   = new Stave(x, GRAND_BASS_Y, staveWidth, { spacingBetweenLinesPx: 12 })
 
     if (idx === 0) {
       trebleStave.addClef('treble')

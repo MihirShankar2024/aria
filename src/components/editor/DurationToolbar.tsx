@@ -109,27 +109,23 @@ export function DurationToolbar({
 
         <div className="w-px h-5 bg-white/15" />
 
-        {/* Modifiers */}
-        <div className="flex gap-0.5">
+        {/* Modifiers + accidentals — one group */}
+        <div className="flex items-center gap-0.5">
           <Toggle pressed={isDotted} onPressedChange={onDottedChange} title="Dotted" className={TOGGLE_ITEM_CLASS}>·</Toggle>
           <Toggle pressed={isRest} onPressedChange={onRestChange} title="Rest" className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
+          <ToggleGroup
+            type="single"
+            value={selectedAccidental ?? ''}
+            onValueChange={(v) => onAccidentalChange(v ? (v as NonNullable<Accidental>) : null)}
+            className="gap-0.5"
+          >
+            {ACCIDENTALS.map(({ value, label, title }) => (
+              <ToggleGroupItem key={value} value={value} title={title} className={TOGGLE_ITEM_CLASS + ' text-base'}>
+                {label}
+              </ToggleGroupItem>
+            ))}
+          </ToggleGroup>
         </div>
-
-        <div className="w-px h-5 bg-white/15" />
-
-        {/* Accidentals */}
-        <ToggleGroup
-          type="single"
-          value={selectedAccidental ?? ''}
-          onValueChange={(v) => onAccidentalChange(v ? (v as NonNullable<Accidental>) : null)}
-          className="gap-0.5"
-        >
-          {ACCIDENTALS.map(({ value, label, title }) => (
-            <ToggleGroupItem key={value} value={value} title={title} className={TOGGLE_ITEM_CLASS + ' text-base'}>
-              {label}
-            </ToggleGroupItem>
-          ))}
-        </ToggleGroup>
 
         <div className="w-px h-5 bg-white/15" />
 

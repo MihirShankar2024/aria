@@ -11,17 +11,30 @@ export interface ScrollSync {
   register: (el: HTMLDivElement | null) => void
   onScroll: (el: HTMLDivElement) => void
   scrollAllTo: (left: number, smooth?: boolean) => void
+  getPrimaryScroll: () => HTMLDivElement | null
 }
 
 export function useScrollSync(): ScrollSync {
   const containers = useRef<Set<HTMLDivElement>>(new Set())
+  const primary = useRef<HTMLDivElement | null>(null)
   const syncing = useRef(false)
   const suppressUntil = useRef(0)
 
   const register = useCallback((el: HTMLDivElement | null) => {
     // We can't reliably know when an element unmounts here, so prune detached
     // nodes lazily on each sync rather than tracking removals.
-    if (el) containers.current.add(el)
+    if (el) {
+      containers.current.add(el)
+      if (!primary.current?.isConnected) primary.current = el
+    }
+  }, [])
+
+  const getPrimaryScroll = useCallback(() => {
+    if (primary.current?.isConnected) return primary.current
+    for (const el of containers.current) {
+      if (el.isConnected) { primary.current = el; return el }
+    }
+    return null
   }, [])
 
   const apply = useCallback((left: number, source?: HTMLDivElement) => {
@@ -58,5 +71,5 @@ export function useScrollSync(): ScrollSync {
   }, [apply])
 
   // Stable object identity so consumers' ref callbacks/effects don't churn.
-  return useMemo(() => ({ register, onScroll, scrollAllTo }), [register, onScroll, scrollAllTo])
+  return useMemo(() => ({ register, onScroll, scrollAllTo, getPrimaryScroll }), [register, onScroll, scrollAllTo, getPrimaryScroll])
 }

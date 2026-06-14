@@ -1,20 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
-import { staffYToPitch, staffStepToY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
+import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
 import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats } from '../../lib/beats'
 import { computeTieSpans } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
+import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
 import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { applyRestErase } from '../../lib/rests'
-import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, NoteEvent } from '../../types/score'
+import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
-const STAVE_Y = 40
+const STAVE_Y = 48
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20  // px — click within this of an existing note's x-center → chord add
 const BRUSH_R = 15            // px radius of the delete brush
+const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
 
 const STAVE_TOP_Y    = STAVE_Y + STAVE_TOP_OFFSET
 const STAVE_BOTTOM_Y = STAVE_TOP_Y + 4 * LINE_SPACING
@@ -49,6 +51,7 @@ interface StaffCanvasProps {
   onFillComplete?: () => void
   onInsertComplete?: () => void
   onRestsCommitted?: (pending: PendingRest[]) => void
+  onPlaybackLayoutChange?: (layout: PlaybackLayout) => void
 }
 
 // A chosen insertion point: insert before measure.notes[gapIndex] in measure `measureIndex`.
@@ -63,6 +66,7 @@ interface HoverInfo {
   snapY: number
   isChordTarget: boolean  // true when hovering near an existing note
   restTarget: { x: number; y: number } | null  // the rest this click would replace
+  noteTarget: { x: number; y: number } | null  // (rest mode) the note this click would replace
 }
 
 interface TieDrag {
@@ -102,6 +106,7 @@ export function StaffCanvas({
   onFillComplete,
   onInsertComplete,
   onRestsCommitted,
+  onPlaybackLayoutChange,
 }: StaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -165,6 +170,11 @@ export function StaffCanvas({
       console.error('Staff render failed', err)
     }
   }, [measures, timeSig, keySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths])
+
+  useEffect(() => {
+    if (!layout || !onPlaybackLayoutChange) return
+    onPlaybackLayoutChange({ measures: layout.measures, notes: layout.notes })
+  }, [layout, onPlaybackLayoutChange])
 
   // After a reflow (e.g. first note in a bar, or adding a chord tone) a note's
   // visual center shifts. If the keyboard cursor is anchored to that note, snap its
@@ -373,6 +383,47 @@ export function StaffCanvas({
     return best
   }
 
+  // Find the note whose notehead sits directly under (x, y) — a precise hit on the
+  // glyph, not just the same column (used by the dot/accidental click-to-apply path).
+  const noteHeadAt = (x: number, y: number): NoteGeometry | null => {
+    if (!layout) return null
+    const r2 = NOTEHEAD_HIT_R * NOTEHEAD_HIT_R
+    let best: NoteGeometry | null = null
+    let bestDist = r2
+    for (const n of layout.notes) {
+      if (n.type !== 'note') continue
+      for (const ny of n.ys) {
+        const d = (n.x - x) * (n.x - x) + (ny - y) * (ny - y)
+        if (d <= bestDist) { bestDist = d; best = n }
+      }
+    }
+    return best
+  }
+
+  // Apply the active modifier tool(s) — dot and/or accidental — to an existing note.
+  // The accidental lands on the chord tone at the clicked staff position. onNotePlaced
+  // then clears the tool selection (so it doesn't carry to the next placement).
+  const applyModifierToExistingNote = (target: NoteGeometry, clickY: number) => {
+    const measure = measures[target.measureIndex]
+    if (!measure) return
+    const ev = measure.notes.find(n => n.id === target.id)
+    if (!ev || ev.type !== 'note') return
+    const patch: Partial<Note> = {}
+    if (isDotted) patch.dots = 1
+    if (selectedAccidental !== null) {
+      const clicked = staffYToPitch(clickY, STAVE_Y, clef)
+      patch.pitches = ev.pitches.map(p =>
+        p.step === clicked.step && p.octave === clicked.octave
+          ? { ...p, accidental: selectedAccidental }
+          : p,
+      )
+    }
+    if (Object.keys(patch).length === 0) return
+    pendingCenterRef.current = target.measureIndex
+    dispatch({ type: 'UPDATE_NOTE', partId, measureId: measure.id, noteId: target.id, patch })
+    onNotePlaced?.()
+  }
+
   // Resolve a cursor x to an insertion gap within a measure: which slot to insert
   // before, and the x to anchor the marker/scratch staff at.
   const gapAtX = (measureIndex: number, cursorX: number): InsertSession | null => {
@@ -482,7 +533,7 @@ export function StaffCanvas({
     if (isDeleteMode) {
       const coords = getCoords(e)
       if (!coords) return
-      pushTrail(coords.x, coords.y)
+      pushTrail(coords.x, coords.y, markingRef.current)
       if (markingRef.current) markAt(coords.x, coords.y)
       return
     }
@@ -514,12 +565,13 @@ export function StaffCanvas({
     // In rest mode the cursor still follows the mouse vertically (purely visual —
     // pitch is irrelevant for rests), so it doesn't feel frozen on one line.
     if (isRest) {
-      setHoverInfo({ x: coords.x, snapY, isChordTarget: false, restTarget: null })
+      const nearNote = nearestNoteAtX(coords.x, CHORD_PROXIMITY_X)
+      setHoverInfo({ x: coords.x, snapY, isChordTarget: false, restTarget: null, noteTarget: nearNote ? { x: nearNote.cx, y: nearNote.y } : null })
       return
     }
     const nearNote = nearestNoteAtX(coords.x, CHORD_PROXIMITY_X)
     const nearRest = nearNote ? null : nearestRestAtX(coords.x)
-    setHoverInfo({ x: coords.x, snapY, isChordTarget: !!nearNote, restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null })
+    setHoverInfo({ x: coords.x, snapY, isChordTarget: !!nearNote, restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null, noteTarget: null })
   }
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -533,7 +585,7 @@ export function StaffCanvas({
     if (isDeleteMode) {
       if (performance.now() < clickCooldownRef.current) return
       markingRef.current = true
-      pushTrail(coords.x, coords.y)
+      pushTrail(coords.x, coords.y, true)
       markAt(coords.x, coords.y)
       return
     }
@@ -587,6 +639,22 @@ export function StaffCanvas({
   // note/rest that was placed or modified (so the keyboard cursor can anchor to it).
   const placeAt = (x: number, y: number): string | null => {
     if (measures.length === 0) return null
+    // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
+    // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
+    // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
+    if (!isRest && (isDotted || selectedAccidental !== null)) {
+      const hit = noteHeadAt(x, y)
+      if (hit) { applyModifierToExistingNote(hit, y); return hit.id }
+      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
+      if (nearNote) {
+        const measure = measures[nearNote.measureIndex]
+        const ev = measure?.notes.find(n => n.id === nearNote.id)
+        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, y, STAVE_Y, clef)) {
+          applyModifierToExistingNote(nearNote, y)
+          return nearNote.id
+        }
+      }
+    }
     if (!isRest) {
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
       if (nearNote) {
@@ -615,6 +683,27 @@ export function StaffCanvas({
             measureId: measure.id,
             restId: nearRest.id,
             note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false },
+          })
+          onNotePlaced?.()
+          return newId
+        }
+        return null
+      }
+    } else {
+      // Rest mode: clicking an existing note replaces it with a rest — mirror of
+      // replacing a rest with a note above.
+      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
+      if (nearNote) {
+        const measure = measures[nearNote.measureIndex]
+        if (measure) {
+          pendingCenterRef.current = nearNote.measureIndex
+          const newId = crypto.randomUUID()
+          dispatch({
+            type: 'REPLACE_EVENT',
+            partId,
+            measureId: measure.id,
+            eventId: nearNote.id,
+            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
           })
           onNotePlaced?.()
           return newId
@@ -682,8 +771,9 @@ export function StaffCanvas({
     return {
       x: keyboardCursor.x,
       snapY,
-      isChordTarget: !!nearNote,
-      restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null,
+      isChordTarget: !isRest && !!nearNote,
+      restTarget: !isRest && nearRest ? { x: nearRest.cx, y: nearRest.y } : null,
+      noteTarget: isRest && nearNote ? { x: nearNote.cx, y: nearNote.y } : null,
     }
   })()
 
@@ -861,6 +951,22 @@ export function StaffCanvas({
           />
         )}
 
+        {/* Replace-on-note target (rest mode): ring the note the next click will overwrite. */}
+        {activeHover?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+          <div
+            className="absolute pointer-events-none rounded-md"
+            style={{
+              left: activeHover.noteTarget.x - 12,
+              top: activeHover.noteTarget.y - 16,
+              width: 24,
+              height: 32,
+              border: '1.5px solid rgba(139,92,246,0.7)',
+              background: 'rgba(139,92,246,0.10)',
+              zIndex: 16,
+            }}
+          />
+        )}
+
         {activeHover && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
             className="absolute pointer-events-none rounded-full"
@@ -925,7 +1031,8 @@ export function StaffCanvas({
               const age = (performance.now() - p.born) / TRAIL_MS
               const op = Math.max(0, 1 - age)
               const r = 2 + op * 7
-              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(239,68,68,${op * 0.5})`} />
+              const rgb = p.pressed ? '239,68,68' : '148,163,184'
+              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
             })}
           </svg>
         )}

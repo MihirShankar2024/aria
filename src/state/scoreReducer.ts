@@ -3,6 +3,7 @@ import type { Score, Part, Measure, TimeSig, Pitch } from '../types/score'
 import type { ScoreAction } from './actions'
 import { normalizeMeasureRests, fillMeasureWithRests } from '../lib/rests'
 import { measureBeatCount, measureCapacity, noteBeatDuration } from '../lib/beats'
+import { INSTRUMENT_DB } from '../lib/instruments'
 
 function createDefaultMeasure(number: number): Measure {
   return { id: crypto.randomUUID(), number, notes: [] }
@@ -77,6 +78,23 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           const newTotal = measureBeatCount(measure) - noteBeatDuration(rest) + noteBeatDuration(action.note)
           if (newTotal <= measureCapacity(ts) + 0.001) {
             measure.notes[idx] = action.note
+            measure.notes = normalizeMeasureRests(measure.notes, ts)
+          }
+        }
+        break
+      }
+      case 'REPLACE_EVENT': {
+        const measure = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+        const idx = measure?.notes.findIndex(n => n.id === action.eventId) ?? -1
+        if (measure && idx !== -1) {
+          const old = measure.notes[idx]
+          const ts = effectiveTimeSig(draft, measure)
+          // Reject only if the swapped-in event would overflow the measure.
+          const newTotal = measureBeatCount(measure) - noteBeatDuration(old) + noteBeatDuration(action.event)
+          if (newTotal <= measureCapacity(ts) + 0.001) {
+            measure.notes[idx] = action.event
             measure.notes = normalizeMeasureRests(measure.notes, ts)
           }
         }
@@ -320,7 +338,10 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
       }
       case 'SET_PART_INSTRUMENT': {
         const part = draft.parts.find(p => p.id === action.partId)
-        if (part) part.instrument = action.instrument
+        if (part) {
+          part.instrument = action.instrument
+          part.name = INSTRUMENT_DB[action.instrument]?.displayName ?? action.instrument
+        }
         break
       }
       // UNDO/REDO handled in useUndoRedo hook — no-op here

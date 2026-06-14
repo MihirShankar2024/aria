@@ -1,8 +1,9 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { Undo2, Redo2 } from 'lucide-react'
 import { useScore } from '../../hooks/useScore'
 import { usePlayback } from '../../hooks/usePlayback'
 import { useScrollSync } from '../../hooks/useScrollSync'
+import { usePlaybackScroll, scrollToStartIfNeeded } from '../../hooks/usePlaybackScroll'
 import { Button } from '../ui/button'
 import { StaffCanvas } from './StaffCanvas'
 import { GrandStaffCanvas } from './GrandStaffCanvas'
@@ -13,7 +14,9 @@ import { PlaybackBar } from '../playback/PlaybackBar'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
 import type { PendingRest } from './useDeleteTrail'
-import type { Part, Duration, Accidental, NoteEvent } from '../../types/score'
+import type { Part, Duration, Accidental, NoteEvent, Tie } from '../../types/score'
+
+const EMPTY_TIES: Tie[] = []
 
 type PartGroup =
   | { type: 'single'; part: Part }
@@ -57,6 +60,12 @@ export function ScoreEditor() {
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
   const [pendingRests, setPendingRests] = useState<PendingRest[] | null>(null)
   const scrollSync = useScrollSync()
+  const { reportLayout } = usePlaybackScroll({ scrollSync, score, status })
+
+  const handlePlay = useCallback((sc: typeof score, selectedNoteIds?: Set<string>) => {
+    if (status === 'stopped') scrollToStartIfNeeded(scrollSync)
+    play(sc, selectedNoteIds)
+  }, [status, play, scrollSync])
 
   // Refs so the (rarely re-subscribed) keydown handler reads current values.
   const pendingRef = useRef<PendingRest[] | null>(null)
@@ -359,7 +368,10 @@ export function ScoreEditor() {
         <PartsSidebar parts={score.parts} dispatch={dispatch} />
 
         <main className="flex-1 px-6 py-8 space-y-8 overflow-y-auto">
-          {groups.map((group) => {
+          {groups.map((group, groupIdx) => {
+            const playbackLayoutProps = groupIdx === 0
+              ? { onPlaybackLayoutChange: reportLayout }
+              : {}
             if (group.type === 'grand') {
               return (
                 <div key={group.treble.id}>
@@ -371,6 +383,7 @@ export function ScoreEditor() {
                     bassPart={group.bass}
                     timeSig={score.globalTimeSig}
                     keySig={score.globalKeySig}
+                    {...playbackLayoutProps}
                     {...commonCanvasProps}
                   />
                 </div>
@@ -388,7 +401,8 @@ export function ScoreEditor() {
                   timeSig={score.globalTimeSig}
                   keySig={score.globalKeySig}
                   clef={part.clef}
-                  ties={part.ties ?? []}
+                  ties={part.ties ?? EMPTY_TIES}
+                  {...playbackLayoutProps}
                   {...commonCanvasProps}
                 />
               </div>
@@ -403,7 +417,7 @@ export function ScoreEditor() {
           <PlaybackBar
             score={score}
             status={status}
-            onPlay={play}
+            onPlay={handlePlay}
             onStop={pause}
             onReset={() => { reset(); scrollSync.scrollAllTo(0, true) }}
             selectedNoteIds={selectedNoteIds.size > 0 ? selectedNoteIds : undefined}

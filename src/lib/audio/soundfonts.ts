@@ -17,7 +17,7 @@ export async function loadSoundFont(instrumentKey: string): Promise<Tone.Sampler
 
   return new Promise((resolve, reject) => {
     const sampler = new Tone.Sampler({
-      urls: { C4: 'C4.mp3', 'D#4': 'Ds4.mp3', 'F#4': 'Fs4.mp3', A4: 'A4.mp3' },
+      urls: { C4: 'C4.mp3', 'D#4': 'Eb4.mp3', 'F#4': 'Gb4.mp3', A4: 'A4.mp3' },
       release: 1,
       baseUrl: `https://gleitz.github.io/midi-js-soundfonts/MusyngKite/${instrument.key.replace('_bb', '').replace('_', '-')}-mp3/`,
       onload: () => {

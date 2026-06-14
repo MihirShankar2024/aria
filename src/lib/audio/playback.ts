@@ -23,7 +23,8 @@ function durationToTone(dur: Note['duration'], dots: number): Tone.Unit.Time {
     whole: '1n', half: '2n', quarter: '4n', eighth: '8n', sixteenth: '16n',
   }
   if (dots === 0) return base[dur] as Tone.Unit.Time
-  return `${base[dur]}d` as Tone.Unit.Time
+  // Tone.js dotted notation is a trailing period (e.g. "4n."), not "d".
+  return `${base[dur]}.` as Tone.Unit.Time
 }
 
 export async function buildAndPlayScore(score: Score, onStop?: () => void): Promise<void> {

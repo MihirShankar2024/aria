@@ -45,12 +45,26 @@ export interface Measure {
   keySig?: KeySig       // only set when it changes from global
 }
 
+/**
+ * A tie/slur span connecting two notes. Visually one curve covering every note
+ * between `from` and `to` (rests break a drag into separate spans, so a span
+ * never crosses a rest). Tie vs. slur is derived later by the engine: a *tie*
+ * when all spanned notes share a pitch (sustained), otherwise a *slur* (legato).
+ * Stored at the Part level since spans may cross barlines; note ids are global.
+ */
+export interface Tie {
+  id: string
+  from: string   // note id, earlier in document order
+  to: string     // note id, later in document order
+}
+
 export interface Part {
   id: string
   name: string
   instrument: string    // key into INSTRUMENT_DB
   clef: Clef
   measures: Measure[]
+  ties?: Tie[]
 }
 
 export interface Score {

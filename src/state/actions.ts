@@ -1,9 +1,12 @@
-import type { Note, Rest, TimeSig, KeySig, Clef } from '../types/score'
+import type { Note, Rest, TimeSig, KeySig, Clef, Tie } from '../types/score'
 
 export type ScoreAction =
   | { type: 'ADD_NOTE'; partId: string; measureId: string; note: Note }
   | { type: 'ADD_REST'; partId: string; measureId: string; rest: Rest }
   | { type: 'DELETE_NOTE'; partId: string; measureId: string; noteId: string }
+  | { type: 'ADD_TIES'; partId: string; ties: Tie[] }
+  | { type: 'REMOVE_TIE'; partId: string; tieId: string }
+  | { type: 'FILL_MEASURE_RESTS'; partId: string; measureId: string }
   | { type: 'UPDATE_NOTE'; partId: string; measureId: string; noteId: string; patch: Partial<Note> }
   | { type: 'ADD_MEASURE'; partId: string }
   | { type: 'DELETE_MEASURE'; partId: string; measureId: string }

@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Aria — PRD</title>
+<style>
+  :root {
+    --bg-primary: #ffffff;
+    --bg-secondary: #f5f4f0;
+    --bg-tertiary: #eeede9;
+    --text-primary: #1a1a18;
+    --text-secondary: #5a5a55;
+    --text-tertiary: #9a9a92;
+    --border: rgba(26,26,24,0.12);
+    --border-md: rgba(26,26,24,0.22);
+    --teal-50: #E1F5EE;
+    --teal-100: #9FE1CB;
+    --teal-200: #5DCAA5;
+    --teal-400: #1D9E75;
+    --teal-600: #0F6E56;
+    --teal-800: #085041;
+    --teal-900: #04342C;
+    --purple-50: #EEEDFE;
+    --purple-200: #AFA9EC;
+    --purple-400: #7F77DD;
+    --purple-800: #3C3489;
+    --coral-50: #FAECE7;
+    --coral-600: #993C1D;
+    --coral-800: #712B13;
+    --amber-50: #FAEEDA;
+    --amber-600: #854F0B;
+    --red-50: #FCEBEB;
+    --red-400: #E24B4A;
+    --red-800: #791F1F;
+    --green-50: #EAF3DE;
+    --green-800: #27500A;
+    --gray-400: #888780;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --font: -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg-primary: #1e1e1c;
+      --bg-secondary: #282826;
+      --bg-tertiary: #313130;
+      --text-primary: #f0efe9;
+      --text-secondary: #a8a8a0;
+      --text-tertiary: #6a6a62;
+      --border: rgba(240,239,233,0.10);
+      --border-md: rgba(240,239,233,0.20);
+      --teal-50: #04342C;
+      --teal-100: #085041;
+      --teal-200: #0F6E56;
+      --teal-400: #1D9E75;
+      --teal-800: #9FE1CB;
+      --teal-900: #E1F5EE;
+      --purple-50: #26215C;
+      --purple-200: #534AB7;
+      --purple-400: #7F77DD;
+      --purple-800: #CECBF6;
+      --coral-50: #4A1B0C;
+      --coral-800: #F0997B;
+      --amber-50: #412402;
+      --amber-600: #EF9F27;
+      --red-50: #501313;
+      --red-400: #E24B4A;
+      --red-800: #F09595;
+      --green-50: #173404;
+      --green-800: #C0DD97;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 15px;
+    line-height: 1.65;
+  }
+  .page { max-width: 860px; margin: 0 auto; padding: 48px 24px 80px; }
+
+  .doc-header { margin-bottom: 40px; padding-bottom: 28px; border-bottom: 0.5px solid var(--border-md); }
+  .doc-eyebrow { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .tag { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 500; padding: 4px 10px; border-radius: var(--radius-md); letter-spacing: 0.03em; }
+  .tag-teal { background: var(--teal-50); color: var(--teal-800); }
+  .tag-purple { background: var(--purple-50); color: var(--purple-800); }
+  .tag-amber { background: var(--amber-50); color: var(--amber-600); }
+  .tag-red { background: var(--red-50); color: var(--red-800); }
+  .tag-coral { background: var(--coral-50); color: var(--coral-800); }
+  .doc-title { font-size: 32px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 10px; }
+  .doc-subtitle { font-size: 16px; color: var(--text-secondary); max-width: 620px; line-height: 1.6; }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 20px; }
+  .meta-item { display: flex; flex-direction: column; gap: 2px; }
+  .meta-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary); font-weight: 500; }
+  .meta-value { font-size: 13px; color: var(--text-secondary); font-weight: 500; }
+
+  .section { margin-bottom: 36px; }
+  .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-tertiary); margin-bottom: 16px; padding-bottom: 8px; border-bottom: 0.5px solid var(--border); }
+
+  .card { background: var(--bg-primary); border: 0.5px solid var(--border); border-radius: var(--radius-lg); padding: 18px 20px; }
+  .card + .card { margin-top: 10px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .three-col { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  @media (max-width: 600px) { .two-col, .three-col { grid-template-columns: 1fr; } }
+
+  .card-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  .card-desc { font-size: 13px; color: var(--text-secondary); line-height: 1.55; }
+
+  .flist { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  .flist li { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.5; }
+  .flist li::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--teal-400); flex-shrink: 0; margin-top: 6px; }
+  .flist.purple li::before { background: var(--purple-400); }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .stat-card { background: var(--bg-secondary); border-radius: var(--radius-md); padding: 14px 16px; }
+  .stat-num { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; color: var(--text-primary); }
+  .stat-label { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+  .roadmap { display: flex; flex-direction: column; gap: 0; }
+  .phase { display: flex; gap: 14px; }
+  .phase-left { display: flex; flex-direction: column; align-items: center; width: 36px; flex-shrink: 0; }
+  .phase-num { width: 28px; height: 28px; border-radius: 50%; background: var(--teal-50); color: var(--teal-800); font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .phase-line { width: 1px; background: var(--teal-200); flex: 1; min-height: 14px; margin: 4px 0; }
+  .phase-body { padding-bottom: 22px; flex: 1; padding-top: 3px; }
+  .phase-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+  .phase-weeks { font-size: 11px; color: var(--text-tertiary); margin-bottom: 8px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.04em; }
+  .phase-items { display: flex; flex-direction: column; gap: 5px; }
+  .phase-item { font-size: 13px; color: var(--text-secondary); display: flex; align-items: flex-start; gap: 7px; line-height: 1.45; }
+  .phase-item::before { content: '→'; color: var(--text-tertiary); flex-shrink: 0; font-size: 12px; }
+
+  .pill-group { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill { font-size: 12px; padding: 4px 10px; border-radius: 99px; border: 0.5px solid var(--border-md); color: var(--text-secondary); background: var(--bg-secondary); }
+  .pill-teal { background: var(--teal-50); color: var(--teal-800); border-color: var(--teal-200); }
+  .pill-purple { background: var(--purple-50); color: var(--purple-800); border-color: var(--purple-200); }
+
+  .risk-row { display: grid; grid-template-columns: 1fr 80px 1fr; gap: 12px; padding: 10px 0; border-bottom: 0.5px solid var(--border); align-items: start; }
+  .risk-row:last-child { border-bottom: none; }
+  .risk-title { font-size: 13px; font-weight: 500; }
+  .risk-level { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 99px; text-align: center; }
+  .risk-high { background: var(--red-50); color: var(--red-800); }
+  .risk-med { background: var(--amber-50); color: var(--amber-600); }
+  .risk-low { background: var(--teal-50); color: var(--teal-800); }
+  .risk-mit { font-size: 12px; color: var(--text-secondary); line-height: 1.45; }
+
+  hr { border: none; border-top: 0.5px solid var(--border); margin: 36px 0; }
+
+  code { background: var(--bg-secondary); border: 0.5px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 12px; font-family: 'SF Mono', 'Fira Code', monospace; color: var(--text-primary); }
+
+  .callout { border-left: 3px solid var(--teal-400); padding: 12px 16px; background: var(--teal-50); border-radius: 0 var(--radius-md) var(--radius-md) 0; }
+  .callout p { font-size: 14px; color: var(--teal-900); line-height: 1.6; margin: 0; }
+
+  /* Comp table */
+  .comp-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .comp-table th { font-size: 11px; font-weight: 600; color: var(--text-secondary); text-align: left; padding: 7px 10px; border-bottom: 0.5px solid var(--border-md); background: var(--bg-secondary); }
+  .comp-table td { padding: 8px 10px; border-bottom: 0.5px solid var(--border); vertical-align: middle; }
+  .comp-table tr:last-child td { border-bottom: none; }
+  .comp-table .you { background: rgba(29,158,117,0.04); }
+  .tick { color: var(--teal-400); font-weight: 600; }
+  .cross { color: var(--text-tertiary); }
+  .partial { color: var(--amber-600); font-size: 11px; }
+  .feat-name { font-weight: 500; }
+  .you-col { color: var(--teal-800); font-weight: 600; }
+
+  /* AI flow */
+  .flow-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .flow-step { background: var(--bg-secondary); border: 0.5px solid var(--border); border-radius: var(--radius-md); padding: 8px 12px; font-size: 12px; color: var(--text-secondary); flex: 1; min-width: 100px; text-align: center; line-height: 1.4; }
+  .flow-arrow { color: var(--text-tertiary); font-size: 16px; flex-shrink: 0; }
+
+  .divider { height: 0.5px; background: var(--border); margin: 10px 0; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="doc-header">
+    <div class="doc-eyebrow">
+      <span class="tag tag-teal">PRD</span>
+      <span class="tag tag-purple">Web App · AI</span>
+      <span class="tag tag-amber">Music · TypeScript</span>
+      <span class="tag tag-amber">Summer 2025</span>
+    </div>
+    <h1 class="doc-title">Aria</h1>
+    <p class="doc-subtitle">An AI-native score editor for working musicians — write notation on a real staff, hum ideas directly onto the page, and have Claude harmonize, arrange, and extend your compositions in natural language.</p>
+    <div class="meta-row">
+      <div class="meta-item"><span class="meta-label">Timeline</span><span class="meta-value">12 weeks</span></div>
+      <div class="meta-item"><span class="meta-label">Stack</span><span class="meta-value">React · TypeScript · Tailwind</span></div>
+      <div class="meta-item"><span class="meta-label">AI layer</span><span class="meta-value">Claude API (claude-sonnet-4-6)</span></div>
+      <div class="meta-item"><span class="meta-label">Output</span><span class="meta-value">Deployed web app</span></div>
+      <div class="meta-item"><span class="meta-label">Target user</span><span class="meta-value">Trained musicians who compose</span></div>
+    </div>
+  </div>
+
+  <!-- Problem -->
+  <div class="section">
+    <p class="section-title">Problem & positioning</p>
+    <div class="callout">
+      <p>The composition tool market is split: notation editors (Flat, Noteflight, MuseScore) have no AI, while AI sketchpads (Hookpad) have no real staff. A musician who plays trumpet or piano, wants to capture ideas fast, and needs an AI collaborator who speaks music theory — not just "generate something" — has no tool. Aria fills that exact gap.</p>
+    </div>
+    <div style="margin-top: 12px;" class="two-col">
+      <div class="card">
+        <p class="card-title">What existing tools miss</p>
+        <ul class="flist purple">
+          <li>Flat.io — best web notation UI, zero AI features</li>
+          <li>Hookpad — AI chord suggestions, no staff view, pop-biased</li>
+          <li>Noteflight — records audio but outputs a waveform, not notation</li>
+          <li>MuseScore — gold standard engraving, desktop only, no AI, not a sketching tool</li>
+          <li>AIVA / Suno — generate audio from prompts, no score, not editable</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Aria's unique position</p>
+        <ul class="flist">
+          <li>The only tool combining a real staff with an AI that understands what's on it</li>
+          <li>Mic → quantized, editable notation — no competitor does this in-browser</li>
+          <li>Natural language directing: "reharmonize this with a tritone sub" actually works</li>
+          <li>Built by and for someone who plays trumpet + piano — the AI speaks that vocabulary</li>
+          <li>Score branching: audition AI suggestions risk-free without touching your original</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Competitive matrix -->
+  <div class="section">
+    <p class="section-title">Competitive feature matrix</p>
+    <div class="card" style="padding: 0; overflow: hidden;">
+      <table class="comp-table">
+        <thead>
+          <tr>
+            <th style="min-width:170px">Feature</th>
+            <th>Flat.io</th>
+            <th>Hookpad</th>
+            <th>Noteflight</th>
+            <th>MuseScore</th>
+            <th style="background:var(--teal-50); color:var(--teal-800)">Aria</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="feat-name">Full staff notation</td><td class="tick">✓</td><td class="cross">✗</td><td class="tick">✓</td><td class="tick">✓</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">AI harmony / arrangement</td><td class="cross">✗</td><td class="partial">chords only</td><td class="cross">✗</td><td class="cross">✗</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">Mic → notation transcription</td><td class="cross">✗</td><td class="cross">✗</td><td class="partial">audio only</td><td class="cross">✗</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">Natural language AI prompt</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">Instrument transposition</td><td class="partial">basic</td><td class="cross">✗</td><td class="partial">basic</td><td class="tick">✓</td><td class="you tick">✓ + spelling</td></tr>
+          <tr><td class="feat-name">Score branching</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">Brass / orchestral range warnings</td><td class="partial">basic</td><td class="cross">✗</td><td class="partial">basic</td><td class="tick">✓</td><td class="you tick">✓ idiomatic</td></tr>
+          <tr><td class="feat-name">Browser-based, no install</td><td class="tick">✓</td><td class="tick">✓</td><td class="tick">✓</td><td class="cross">✗</td><td class="you tick">✓</td></tr>
+          <tr><td class="feat-name">MIDI + MusicXML export</td><td class="tick">✓</td><td class="partial">MIDI only</td><td class="tick">✓</td><td class="tick">✓</td><td class="you tick">✓</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Core features -->
+  <div class="section">
+    <p class="section-title">Core features — MVP</p>
+    <div class="two-col">
+      <div class="card">
+        <p class="card-title">1. Score editor</p>
+        <p class="card-desc" style="margin-bottom: 10px;">Click-to-place notation on a rendered staff via VexFlow. This is the foundation everything else builds on.</p>
+        <ul class="flist">
+          <li>Note and rest placement, ties, dots, accidentals</li>
+          <li>Multi-staff layout (e.g. trumpet + piano grand staff)</li>
+          <li>Time signature, key signature, tempo changes</li>
+          <li>Dynamics and articulations (mp, f, sfz, staccato, tenuto)</li>
+          <li>Undo / redo stack, keyboard shortcuts</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">2. Playback</p>
+        <p class="card-desc" style="margin-bottom: 10px;">Real instrument samples, not MIDI beeps. Built on Tone.js + SoundFont2 samples.</p>
+        <ul class="flist">
+          <li>Per-staff instrument assignment (trumpet, piano, violin, etc.)</li>
+          <li>Solo / mute per staff</li>
+          <li>Loop region for practicing a section</li>
+          <li>Tempo slider, playhead scrubbing</li>
+          <li>SoundFont2 samples loaded from CDN (no backend)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">3. Audio input (mic → notation)</p>
+        <p class="card-desc" style="margin-bottom: 10px;">Hum or play your instrument — it appears as editable notes on the staff.</p>
+        <ul class="flist">
+          <li>Basic Pitch WASM runs entirely in the browser</li>
+          <li>Outputs MIDI pitch + timing; snapped to current time sig + quantization</li>
+          <li>Monophonic input: trumpet, voice, single-line instruments</li>
+          <li>Confidence threshold: only notes above threshold are placed</li>
+          <li>Review before commit: recorded notes preview before being written to staff</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">4. Transposition & instruments</p>
+        <p class="card-desc" style="margin-bottom: 10px;">Smart transposition, not mechanical semitone shifting.</p>
+        <ul class="flist">
+          <li>Concert pitch → Bb trumpet → Eb alto → F horn toggle</li>
+          <li>Enharmonic spelling: Db vs. C# chosen by key context</li>
+          <li>Range warning system — idiomatic per instrument ("above the staff for Bb trumpet")</li>
+          <li>Reassign any staff to a different instrument, with range recheck</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">5. AI panel (Claude)</p>
+        <p class="card-desc" style="margin-bottom: 10px;">Select measures, describe what you want. Claude reads the score context and writes back to the staff.</p>
+        <ul class="flist">
+          <li>Selection → MusicXML serialization → Claude API prompt</li>
+          <li>Supported commands: harmonize, reharmonize, add countermelody, extend, simplify, transpose style</li>
+          <li>Response parsed from MusicXML back into note events, previewed before commit</li>
+          <li>Chat history context — "make that even darker" understands the previous request</li>
+          <li>Explains its reasoning ("I used a borrowed iv chord here because...")</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">6. Score branching</p>
+        <p class="card-desc" style="margin-bottom: 10px;">The risk-free AI exploration model — borrowed from version control.</p>
+        <ul class="flist">
+          <li>Fork current score into a named branch at any point</li>
+          <li>Audition AI suggestions in a branch without touching the original</li>
+          <li>Merge a branch back, or discard it — original is always intact</li>
+          <li>Branch list in sidebar with playback preview per branch</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- AI architecture -->
+  <div class="section">
+    <p class="section-title">AI layer — how Claude is integrated</p>
+    <div class="card" style="margin-bottom: 10px;">
+      <p class="card-title">The prompt pipeline</p>
+      <div class="flow-row" style="margin: 12px 0;">
+        <div class="flow-step">User selects measures + types request</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step">Selection serialized to compact MusicXML</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step">Sent to Claude with full score context + instrument info</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step">Claude returns modified MusicXML for that region</div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step">Parsed → previewed on staff → user commits or discards</div>
+      </div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <p class="card-title">System prompt design</p>
+        <ul class="flist">
+          <li>Claude is given the full score context: key, time sig, tempo, all staves, instrument names</li>
+          <li>Instructed to return only valid MusicXML for the modified region — no prose, no backtick fences</li>
+          <li>Constraint injection: instrument ranges, voice-leading rules, style instructions from user preferences</li>
+          <li>Musician-level vocabulary expected: "tritone sub", "Neapolitan chord", "con sordino" are valid inputs</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Parsing & error handling</p>
+        <ul class="flist">
+          <li>Strip any markdown fences from response before XML parsing</li>
+          <li>Schema validate against MusicXML 3.1 spec before rendering</li>
+          <li>Graceful fallback: if parse fails, show raw text + "try again" rather than crashing</li>
+          <li>Range check after insertion: any out-of-range notes are flagged immediately</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Stack -->
+  <div class="section">
+    <p class="section-title">Technical stack</p>
+    <div class="two-col">
+      <div class="card">
+        <p class="card-title">Frontend core</p>
+        <div class="pill-group" style="margin-bottom: 10px;">
+          <span class="pill pill-teal">React 18</span>
+          <span class="pill pill-teal">TypeScript</span>
+          <span class="pill pill-teal">Tailwind CSS</span>
+          <span class="pill pill-teal">Vite</span>
+        </div>
+        <ul class="flist">
+          <li>React with <code>useReducer</code> for the score state machine — notation state is complex enough to need a reducer pattern</li>
+          <li>TypeScript throughout — strong types for note events, score data model, API responses</li>
+          <li>Tailwind for all UI outside the score canvas</li>
+          <li>Vite for fast dev iteration</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Notation & audio</p>
+        <div class="pill-group" style="margin-bottom: 10px;">
+          <span class="pill pill-teal">VexFlow 4</span>
+          <span class="pill pill-teal">Tone.js</span>
+          <span class="pill">SoundFont2</span>
+          <span class="pill">Basic Pitch WASM</span>
+        </div>
+        <ul class="flist">
+          <li><code>VexFlow</code> renders staves — you manage the note data model, VexFlow only draws</li>
+          <li><code>Tone.js</code> for scheduling note playback with sample-accurate timing</li>
+          <li>SoundFont2 samples (GeneralUser GS or Sonatina) loaded lazily per instrument</li>
+          <li>Basic Pitch WASM from Spotify's open-source model — monophonic pitch detection in browser</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">AI & backend</p>
+        <div class="pill-group" style="margin-bottom: 10px;">
+          <span class="pill pill-purple">Claude API</span>
+          <span class="pill">Supabase</span>
+          <span class="pill">Vercel Edge Functions</span>
+        </div>
+        <ul class="flist">
+          <li>Claude API calls proxied through Vercel Edge Function (keeps API key server-side)</li>
+          <li>Model: <code>claude-sonnet-4-6</code> — fast enough for real-time feel, smart enough for music theory</li>
+          <li>Supabase for auth (magic link) and score persistence (JSON score + MusicXML)</li>
+          <li>Supabase Realtime for future collaborative editing</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Export & sharing</p>
+        <div class="pill-group" style="margin-bottom: 10px;">
+          <span class="pill">MusicXML 3.1</span>
+          <span class="pill">MIDI</span>
+          <span class="pill">PDF (print CSS)</span>
+        </div>
+        <ul class="flist">
+          <li>MusicXML export for import into MuseScore, Sibelius, Dorico</li>
+          <li>MIDI export via <code>@tonejs/midi</code></li>
+          <li>PDF via browser print CSS with engraving-optimized print stylesheet</li>
+          <li>Shareable URL: score stored in Supabase, link encodes score ID + current view state</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Skills -->
+  <div class="section">
+    <p class="section-title">Skills developed</p>
+    <div class="three-col">
+      <div class="card">
+        <p class="card-title">React / TypeScript</p>
+        <ul class="flist">
+          <li>Complex state management with <code>useReducer</code> at scale</li>
+          <li>Custom canvas interaction (click-to-place on SVG staff)</li>
+          <li>Real-time audio scheduling in React's render lifecycle</li>
+          <li>TypeScript generics for score data model</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">AI product engineering</p>
+        <ul class="flist">
+          <li>Prompt engineering for structured output (MusicXML)</li>
+          <li>Parsing + validating LLM responses reliably</li>
+          <li>Context window management for large scores</li>
+          <li>Designing AI UX — preview before commit, explainability</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Audio / music tech</p>
+        <ul class="flist">
+          <li>Web Audio API scheduling and synthesis</li>
+          <li>MusicXML schema and score serialization</li>
+          <li>Basic Pitch pitch detection pipeline</li>
+          <li>Quantization algorithms for free-rhythm audio input</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Roadmap -->
+  <div class="section">
+    <p class="section-title">12-week project roadmap</p>
+    <div class="roadmap">
+      <div class="phase">
+        <div class="phase-left"><div class="phase-num">1</div><div class="phase-line"></div></div>
+        <div class="phase-body">
+          <p class="phase-title">Score editor core</p>
+          <p class="phase-weeks">Weeks 1 – 3</p>
+          <div class="phase-items">
+            <p class="phase-item">VexFlow integration in React — render a single staff from a note array</p>
+            <p class="phase-item">Score data model: <code>Score → Parts → Measures → Notes</code>, fully typed in TypeScript</p>
+            <p class="phase-item">Click-to-place notes on staff (pitch detection from Y position, duration from toolbar)</p>
+            <p class="phase-item">Multi-staff layout (trumpet + piano grand staff)</p>
+            <p class="phase-item">Basic playback via Tone.js with a piano SoundFont</p>
+            <p class="phase-item">Undo/redo with <code>useReducer</code> action history</p>
+          </div>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-left"><div class="phase-num">2</div><div class="phase-line"></div></div>
+        <div class="phase-body">
+          <p class="phase-title">Audio input + transposition</p>
+          <p class="phase-weeks">Weeks 4 – 6</p>
+          <div class="phase-items">
+            <p class="phase-item">Integrate Basic Pitch WASM — mic input → pitch/timing events → quantized note array</p>
+            <p class="phase-item">Preview overlay: show transcribed notes before committing to staff</p>
+            <p class="phase-item">Transposition engine: concert pitch → Bb → Eb → F horn with enharmonic spelling logic</p>
+            <p class="phase-item">Instrument range database + warning system (flag notes outside comfortable range)</p>
+            <p class="phase-item">Multiple SoundFonts loaded per instrument assignment</p>
+          </div>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-left"><div class="phase-num">3</div><div class="phase-line"></div></div>
+        <div class="phase-body">
+          <p class="phase-title">Claude AI layer</p>
+          <p class="phase-weeks">Weeks 7 – 9</p>
+          <div class="phase-items">
+            <p class="phase-item">MusicXML serializer: selected measures → clean XML Claude can parse</p>
+            <p class="phase-item">Vercel Edge Function as Claude API proxy (API key never in client)</p>
+            <p class="phase-item">System prompt engineering: score context injection, MusicXML output constraints, instrument ranges</p>
+            <p class="phase-item">Response parser + validator: MusicXML → score data model, with graceful error handling</p>
+            <p class="phase-item">AI panel UI: selection highlight, text input, suggestion preview on staff</p>
+            <p class="phase-item">Score branching: fork/merge/discard model with branch sidebar</p>
+          </div>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-left"><div class="phase-num">4</div><div class="phase-line"></div></div>
+        <div class="phase-body">
+          <p class="phase-title">Auth, persistence & export</p>
+          <p class="phase-weeks">Weeks 10 – 11</p>
+          <div class="phase-items">
+            <p class="phase-item">Supabase auth (magic link) + score storage (JSON score document per user)</p>
+            <p class="phase-item">Auto-save on every edit, manual save with version name</p>
+            <p class="phase-item">Shareable URL — score ID in URL, public/private toggle</p>
+            <p class="phase-item">MusicXML export, MIDI export via <code>@tonejs/midi</code></p>
+            <p class="phase-item">PDF via print CSS — engraving-optimized print stylesheet</p>
+          </div>
+        </div>
+      </div>
+      <div class="phase">
+        <div class="phase-left"><div class="phase-num">5</div></div>
+        <div class="phase-body">
+          <p class="phase-title">Polish + public launch</p>
+          <p class="phase-weeks">Week 12</p>
+          <div class="phase-items">
+            <p class="phase-item">Keyboard shortcuts for all common operations (matches MuseScore conventions where possible)</p>
+            <p class="phase-item">Score gallery — public scores browseable by visitors</p>
+            <p class="phase-item">Onboarding flow for new users (3-step: create staff → place a note → try AI panel)</p>
+            <p class="phase-item">Performance audit: lazy load SoundFonts, code-split AI panel</p>
+            <p class="phase-item">Deploy to Vercel with custom domain</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Risks -->
+  <div class="section">
+    <p class="section-title">Risks & mitigations</p>
+    <div class="card">
+      <div class="risk-row" style="padding-top: 4px;">
+        <p class="risk-title">Claude returns invalid or unparseable MusicXML</p>
+        <span class="risk-level risk-high">High</span>
+        <p class="risk-mit">Strict system prompt with few-shot MusicXML examples. Schema validate every response. Graceful fallback: show raw text + "regenerate" button rather than crashing the editor.</p>
+      </div>
+      <div class="risk-row">
+        <p class="risk-title">Basic Pitch transcription quality on trumpet</p>
+        <span class="risk-level risk-high">High</span>
+        <p class="risk-mit">Basic Pitch was trained on guitar/piano — trumpet's overtone series may cause pitch detection errors. Mitigate with confidence thresholding and a review-before-commit step. Consider fallback to Web Audio frequency estimation for brass.</p>
+      </div>
+      <div class="risk-row">
+        <p class="risk-title">VexFlow API complexity for full notation</p>
+        <span class="risk-level risk-med">Medium</span>
+        <p class="risk-mit">VexFlow's API is verbose but well-documented. Scope MVP to essential notation symbols (notes, rests, ties, basic dynamics). Defer ornaments, extended techniques, and complex beaming to post-MVP.</p>
+      </div>
+      <div class="risk-row">
+        <p class="risk-title">Score state complexity as features compound</p>
+        <span class="risk-level risk-med">Medium</span>
+        <p class="risk-mit">Define the full TypeScript score data model in Week 1 before writing any UI. Use Immer for immutable state updates in the reducer. Treat the score model as the single source of truth — VexFlow, Claude, and exports all derive from it.</p>
+      </div>
+      <div class="risk-row">
+        <p class="risk-title">SoundFont loading latency on first play</p>
+        <span class="risk-level risk-low">Low</span>
+        <p class="risk-mit">Lazy-load SoundFonts per instrument on first assignment, not on page load. Show a loading indicator. Cache via Service Worker after first load.</p>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Key libraries -->
+  <div class="section">
+    <p class="section-title">Key libraries & resources</p>
+    <div class="two-col">
+      <div class="card">
+        <p class="card-title">Libraries to study first</p>
+        <ul class="flist">
+          <li><code>VexFlow</code> — vexflow.com — read the tutorial series before starting Phase 1</li>
+          <li><code>Tone.js</code> — tonejs.github.io — understand Transport, Part, and Sampler before Phase 1</li>
+          <li><code>Basic Pitch</code> — github.com/spotify/basic-pitch-ts — WASM build docs</li>
+          <li><code>@tonejs/midi</code> — MIDI read/write from note events</li>
+          <li><code>music21j</code> — MIT's JS music theory library — useful for MusicXML parsing helpers</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-title">Reference & learning</p>
+        <ul class="flist">
+          <li>MusicXML 3.1 spec — w3.org/2021/06/musicxml40 — the schema Claude must output</li>
+          <li>Antlr/Hookpad source code — study how they model score state in JS</li>
+          <li>Flat.io product — use it for a week before building to identify the gaps firsthand</li>
+          <li>Web Audio API docs — MDN's Web Audio cookbook for scheduling and synthesis</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <hr/>
+
+  <!-- Success criteria -->
+  <div class="section">
+    <p class="section-title">Success criteria</p>
+    <div class="stat-grid">
+      <div class="stat-card"><p class="stat-num">5</p><p class="stat-label">Core AI commands working</p></div>
+      <div class="stat-card"><p class="stat-num">4</p><p class="stat-label">Instruments with SoundFont playback</p></div>
+      <div class="stat-card"><p class="stat-num">3</p><p class="stat-label">Export formats (MIDI, MusicXML, PDF)</p></div>
+      <div class="stat-card"><p class="stat-num">Mic</p><p class="stat-label">Input → staff working for trumpet</p></div>
+      <div class="stat-card"><p class="stat-num">Live</p><p class="stat-label">Deployed, shareable, publicly accessible</p></div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

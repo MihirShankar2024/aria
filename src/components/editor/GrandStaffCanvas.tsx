@@ -61,6 +61,9 @@ interface GrandStaffCanvasProps {
   forcedStaveWidths?: number[]
   scrollSync?: ScrollSync
   pendingRestIds?: Set<string>
+  isSelectMode?: boolean
+  selectedNoteIds?: Set<string>
+  onSelectionChange?: (ids: Set<string>) => void
   onNotePlaced?: () => void
   onTieComplete?: () => void
   onFillComplete?: () => void
@@ -87,6 +90,9 @@ export function GrandStaffCanvas({
   forcedStaveWidths,
   scrollSync,
   pendingRestIds,
+  isSelectMode = false,
+  selectedNoteIds,
+  onSelectionChange,
   onNotePlaced,
   onTieComplete,
   onFillComplete,
@@ -104,6 +110,8 @@ export function GrandStaffCanvas({
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
   const [scrollLeft, setScrollLeft] = useState(0)
+  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
+  const isSelectingRef = useRef(false)
 
   const markingRef = useRef(false)
   const markedRef = useRef<Set<string>>(new Set())  // synchronous mirror of markedIds
@@ -158,6 +166,11 @@ export function GrandStaffCanvas({
   useEffect(() => {
     if (!isInsertMode) { setInsertSession(null); setInsertHover(null) }
   }, [isInsertMode])
+
+  // Entering select mode drops the edit cursor so it doesn't stay frozen on the staff.
+  useEffect(() => {
+    if (isSelectMode) setHoverInfo(null)
+  }, [isSelectMode])
 
   const commitInsert = (events: NoteEvent[]) => {
     if (insertSession) {
@@ -288,7 +301,35 @@ export function GrandStaffCanvas({
         ]
       : []
 
+  const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
+    isSelectingRef.current = false
+    setSelectionBox(null)
+    if (!layout) return
+    const minX = Math.min(box.startX, box.endX)
+    const maxX = Math.max(box.startX, box.endX)
+    const minY = Math.min(box.startY, box.endY)
+    const maxY = Math.max(box.startY, box.endY)
+    if (maxX - minX < 3 && maxY - minY < 3) {
+      onSelectionChange?.(new Set())
+      return
+    }
+    const ids = new Set<string>()
+    for (const notes of [layout.trebleNotes, layout.bassNotes]) {
+      for (const n of notes) {
+        if (n.x < minX || n.x > maxX) continue
+        if (n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+      }
+    }
+    onSelectionChange?.(ids)
+  }
+
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isSelectMode) {
+      const coords = getCoords(e)
+      if (!coords) return
+      if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
+      return
+    }
     if (isDeleteMode) {
       const coords = getCoords(e)
       if (!coords) return
@@ -331,6 +372,11 @@ export function GrandStaffCanvas({
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const coords = getCoords(e)
     if (!coords) return
+    if (isSelectMode) {
+      isSelectingRef.current = true
+      setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
+      return
+    }
     if (isDeleteMode) {
       if (performance.now() < clickCooldownRef.current) return
       markingRef.current = true
@@ -363,6 +409,10 @@ export function GrandStaffCanvas({
   }
 
   const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isSelectMode) {
+      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      return
+    }
     if (isDeleteMode) { endErase(); return }
     if (!isTieMode) return
     if (slurEdit) {
@@ -389,7 +439,7 @@ export function GrandStaffCanvas({
   }
 
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (isTieMode || isDeleteMode) return
+    if (isSelectMode || isTieMode || isDeleteMode) return
     const coords = getCoords(e)
     if (!coords) return
     const stave = whichStave(coords.y)
@@ -542,12 +592,48 @@ export function GrandStaffCanvas({
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}
       onMouseMove={handleMouseMove}
-      onMouseLeave={() => { setHoverInfo(null); setTieDrag(null); setHoverMeasure(null); if (!insertSession) setInsertHover(null); endErase() }}
+      onMouseLeave={() => {
+        setHoverInfo(null); setTieDrag(null); setHoverMeasure(null)
+        if (!insertSession) setInsertHover(null)
+        endErase()
+        if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      }}
     >
       <div className="relative inline-block">
         <div ref={containerRef} />
         {measureOverlays}
         {tempoOverlays}
+
+        {/* Violet highlights for selected notes */}
+        {selectedNoteIds && layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {
+          if (!selectedNoteIds.has(n.id)) return null
+          return (
+            <div
+              key={`sel-${n.id}`}
+              className="absolute pointer-events-none rounded-full"
+              style={{
+                left: n.x - 10, top: n.y - 10, width: 20, height: 20,
+                background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18,
+              }}
+            />
+          )
+        })}
+
+        {/* Rubber-band selection box */}
+        {isSelectMode && selectionBox && (
+          <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}>
+            <rect
+              x={Math.min(selectionBox.startX, selectionBox.endX)}
+              y={Math.min(selectionBox.startY, selectionBox.endY)}
+              width={Math.abs(selectionBox.endX - selectionBox.startX)}
+              height={Math.abs(selectionBox.endY - selectionBox.startY)}
+              fill="rgba(139,92,246,0.08)"
+              stroke="rgba(139,92,246,0.8)"
+              strokeWidth={1.5}
+              strokeDasharray="5 3"
+            />
+          </svg>
+        )}
 
         {/* Red highlights: marked-for-delete (during drag) and pending rests (after release) */}
         {layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {
@@ -583,7 +669,7 @@ export function GrandStaffCanvas({
         )}
 
         {/* Replace-on-rest target: ring the rest the next click will overwrite. */}
-        {hoverInfo?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && (
+        {hoverInfo?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
@@ -598,7 +684,7 @@ export function GrandStaffCanvas({
           />
         )}
 
-        {hoverInfo && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && (
+        {hoverInfo && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
             className="absolute pointer-events-none rounded-full"
             style={{

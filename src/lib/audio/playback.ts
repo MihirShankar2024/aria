@@ -70,11 +70,17 @@ interface ScheduledNote {
   midis: number[]   // resolved MIDI per pitch (key sig + measure accidentals applied)
 }
 
-export async function buildAndPlayScore(score: Score, onStop?: () => void): Promise<void> {
+// Samplers from the current playthrough, kept so pause/stop can silence any
+// notes still ringing (their envelopes live on the audio clock, not the transport).
+let activeSamplers: Tone.Sampler[] = []
+
+export async function buildAndPlayScore(score: Score, onStop?: () => void, selectedNoteIds?: Set<string>): Promise<void> {
   await Tone.start()
-  Tone.getTransport().cancel()
-  Tone.getTransport().stop()
-  Tone.getTransport().bpm.value = score.tempo
+  const transport = Tone.getTransport()
+  transport.cancel()
+  transport.stop()
+  transport.position = 0
+  transport.bpm.value = score.tempo
 
   const parts = await Promise.all(
     score.parts.map(async part => ({
@@ -82,6 +88,8 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void): Prom
       sampler: await loadSoundFont(part.instrument),
     })),
   )
+
+  activeSamplers = parts.map(p => p.sampler)
 
   let totalTime = 0
   const measureCount = Math.max(...score.parts.map(p => p.measures.length))
@@ -110,7 +118,8 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void): Prom
       const keyMap = keySigOffsets(effectiveKeySig(part.measures, mIdx, score.globalKeySig).fifths)
       const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
 
-      if (measure) {
+      const measureDuration = timeSig.beats * (60 / tempo)
+      if (measure && measure.notes.length > 0) {
         for (const event of measure.notes) {
           const dur = eventDurationSeconds(event, tempo)
           if (event.type === 'note') {
@@ -138,12 +147,15 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void): Prom
               return (pitch.octave + 1) * 12 + NOTE_MIDI[pitch.step] + offset
             })
             resolvedNoteOffsets.set(event.id, offsets)
-            scheduled.push({ note: event, time: absTime, duration: dur, tempo, midis })
+            if (!selectedNoteIds || selectedNoteIds.size === 0 || selectedNoteIds.has(event.id)) {
+              scheduled.push({ note: event, time: absTime, duration: dur, tempo, midis })
+            }
           }
           absTime += dur
         }
       } else {
-        absTime += timeSig.beats * (60 / tempo)
+        // Empty or missing measure: infer a whole rest so all parts stay aligned.
+        absTime += measureDuration
       }
     }
 
@@ -166,23 +178,39 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void): Prom
       for (const s of spanned.slice(1)) skipped.add(s.note.id)
     }
 
-    // Schedule: trigger all pitches in a chord simultaneously.
+    // Schedule on the transport (not via `+time`) so pause/resume halt and
+    // continue playback in lock-step. Trigger all pitches in a chord at once.
     for (const { note, time, duration, midis } of scheduled) {
       if (skipped.has(note.id)) continue
       const dur = extendedDuration.get(note.id) ?? duration
-      for (const midi of midis) {
-        sampler.triggerAttackRelease(Tone.Frequency(midi, 'midi').toNote(), dur, `+${time}`)
-      }
+      const notes = midis.map(m => Tone.Frequency(m, 'midi').toNote())
+      transport.schedule(t => sampler.triggerAttackRelease(notes, dur, t), time)
     }
 
     totalTime = Math.max(totalTime, absTime)
   }
 
-  Tone.getTransport().scheduleOnce(() => onStop?.(), `+${totalTime}`)
+  transport.scheduleOnce(() => onStop?.(), `+${totalTime}`)
+  transport.start()
+}
+
+// Halt playback but keep the playhead position so a later resume continues from
+// here. Also releases any sounding notes so nothing rings on past the pause.
+export function pausePlayback(): void {
+  Tone.getTransport().pause()
+  for (const s of activeSamplers) s.releaseAll()
+}
+
+// Resume from the paused playhead position.
+export function resumePlayback(): void {
   Tone.getTransport().start()
 }
 
+// Fully stop and rewind the playhead to the beginning, silencing all notes.
 export function stopPlayback(): void {
-  Tone.getTransport().stop()
-  Tone.getTransport().cancel()
+  const transport = Tone.getTransport()
+  transport.stop()
+  transport.cancel()
+  transport.position = 0
+  for (const s of activeSamplers) s.releaseAll()
 }

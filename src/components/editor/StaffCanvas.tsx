@@ -41,6 +41,9 @@ interface StaffCanvasProps {
   forcedStaveWidths?: number[]
   scrollSync?: ScrollSync
   pendingRestIds?: Set<string>
+  isSelectMode?: boolean
+  selectedNoteIds?: Set<string>
+  onSelectionChange?: (ids: Set<string>) => void
   onNotePlaced?: () => void
   onTieComplete?: () => void
   onFillComplete?: () => void
@@ -91,6 +94,9 @@ export function StaffCanvas({
   forcedStaveWidths,
   scrollSync,
   pendingRestIds,
+  isSelectMode = false,
+  selectedNoteIds,
+  onSelectionChange,
   onNotePlaced,
   onTieComplete,
   onFillComplete,
@@ -101,6 +107,8 @@ export function StaffCanvas({
   const scrollRef = useRef<HTMLDivElement>(null)
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null)
   const [layout, setLayout] = useState<StaffLayout | null>(null)
+  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
+  const isSelectingRef = useRef(false)
   const [tieDrag, setTieDrag] = useState<TieDrag | null>(null)
   const [slurEdit, setSlurEdit] = useState<SlurEdit | null>(null)
   const [hoverMeasure, setHoverMeasure] = useState<number | null>(null)
@@ -109,10 +117,32 @@ export function StaffCanvas({
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
   const [scrollLeft, setScrollLeft] = useState(0)
 
+  // Keyboard adjustment: arrow keys nudge the cursor away from the raw mouse position.
+  // Moving the mouse resets these back to null (mouse takes over again).
+  const [keyboardCursor, setKeyboardCursor] = useState<{
+    stepsDown: number   // overrides the mouse-derived stepsDown when set
+    x: number           // overrides the mouse x when set
+    measureIndex: number
+    // When the cursor is sitting on a note/rest, anchor to its id so the x can be
+    // re-derived from the note's center after layout reflows (adds/chords shift it).
+    anchorId?: string
+    // When the cursor is parked past the last note (the empty end slot), track it so
+    // it stays pinned to the measure's end after the measure shifts/expands.
+    atEnd?: boolean
+  } | null>(null)
+  const keyboardCursorRef = useRef(keyboardCursor)
+  keyboardCursorRef.current = keyboardCursor
+
   const markingRef = useRef(false)
   const markedRef = useRef<Set<string>>(new Set())  // synchronous mirror of markedIds
   const clickCooldownRef = useRef(0)
   const pendingCenterRef = useRef<number | null>(null)
+  // Stable refs so the once-subscribed keydown handler never reads stale values.
+  const layoutRef = useRef<StaffLayout | null>(null)
+  layoutRef.current = layout
+  const hoverInfoRef = useRef<HoverInfo | null>(null)
+  hoverInfoRef.current = hoverInfo
+  const mouseInStaffRef = useRef(false)
   const { trail, push: pushTrail } = useDeleteTrail(isDeleteMode)
 
   useEffect(() => {
@@ -135,6 +165,29 @@ export function StaffCanvas({
       console.error('Staff render failed', err)
     }
   }, [measures, timeSig, keySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths])
+
+  // After a reflow (e.g. first note in a bar, or adding a chord tone) a note's
+  // visual center shifts. If the keyboard cursor is anchored to that note, snap its
+  // x to the new center so the user stays "on" the note instead of just beside it.
+  useEffect(() => {
+    if (!layout) return
+    const kc = keyboardCursorRef.current
+    if (!kc) return
+    if (kc.anchorId) {
+      const note = layout.notes.find(n => n.id === kc.anchorId)
+      if (!note) return
+      if (Math.abs(note.cx - kc.x) > 0.5 || note.measureIndex !== kc.measureIndex) {
+        setKeyboardCursor({ ...kc, x: note.cx, measureIndex: note.measureIndex })
+      }
+      return
+    }
+    if (kc.atEnd) {
+      const g = layout.measures[kc.measureIndex]
+      if (!g) return
+      const endX = g.x + g.width - 16
+      if (Math.abs(endX - kc.x) > 0.5) setKeyboardCursor({ ...kc, x: endX })
+    }
+  }, [layout])
 
   // After an edit re-renders the staff, smoothly recenter the active measure once
   // it drifts into the right quarter of the viewport (or off the left).
@@ -163,6 +216,124 @@ export function StaffCanvas({
   useEffect(() => {
     if (!isInsertMode) { setInsertSession(null); setInsertHover(null) }
   }, [isInsertMode])
+
+  // Entering select mode drops the edit cursor so it doesn't stay frozen on the staff.
+  useEffect(() => {
+    if (isSelectMode) { setHoverInfo(null); setKeyboardCursor(null) }
+  }, [isSelectMode])
+
+  // Arrow-key cursor: works whenever the mouse is inside this staff (no click needed).
+  // Mouse movement resets the keyboard adjustment — the two coexist, last one wins.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      // Only active when the mouse is inside this staff canvas.
+      if (!mouseInStaffRef.current) return
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
+
+      const currentLayout = layoutRef.current
+      const hover = hoverInfoRef.current
+
+      // Derive the current cursor: keyboard adjustment if active, else raw mouse hover.
+      const baseCursor = (() => {
+        if (keyboardCursorRef.current) return keyboardCursorRef.current
+        if (!hover || !currentLayout) return null
+        const stepsDown = Math.round((hover.snapY - STAVE_TOP_Y) / (LINE_SPACING / 2))
+        const mIdx = (() => {
+          for (let i = 0; i < currentLayout.measures.length; i++) {
+            const g = currentLayout.measures[i]
+            if (hover.x >= g.x && hover.x < g.x + g.width) return i
+          }
+          return currentLayout.measures.length - 1
+        })()
+        return { stepsDown, x: hover.x, measureIndex: mIdx }
+      })()
+
+      if (!baseCursor) return
+
+      switch (e.key) {
+        case 'ArrowUp': {
+          e.preventDefault()
+          setKeyboardCursor({ ...baseCursor, stepsDown: baseCursor.stepsDown - 1 })
+          break
+        }
+        case 'ArrowDown': {
+          e.preventDefault()
+          setKeyboardCursor({ ...baseCursor, stepsDown: baseCursor.stepsDown + 1 })
+          break
+        }
+        case 'ArrowLeft': {
+          e.preventDefault()
+          if (!currentLayout) break
+          const mIdx = baseCursor.measureIndex
+          const notesInM = currentLayout.notes
+            .filter(n => n.measureIndex === mIdx)
+            .sort((a, b) => a.x - b.x)
+          const prev = [...notesInM].reverse().find(n => n.cx < baseCursor.x - 1)
+          if (prev) {
+            setKeyboardCursor({ ...baseCursor, x: prev.cx, anchorId: prev.id, atEnd: false })
+            break
+          }
+          // At the left edge: cross into the previous measure (its last note, or end slot).
+          const prevG = currentLayout.measures[mIdx - 1]
+          if (prevG) {
+            const prevNotes = currentLayout.notes
+              .filter(n => n.measureIndex === mIdx - 1)
+              .sort((a, b) => a.cx - b.cx)
+            const last = prevNotes[prevNotes.length - 1]
+            const targetX = last ? last.cx : prevG.x + prevG.width - 16
+            setKeyboardCursor({ ...baseCursor, x: targetX, measureIndex: mIdx - 1, anchorId: last?.id, atEnd: !last })
+          }
+          break
+        }
+        case 'ArrowRight': {
+          e.preventDefault()
+          if (!currentLayout) break
+          const mIdx = baseCursor.measureIndex
+          const g = currentLayout.measures[mIdx]
+          const notesInM = currentLayout.notes
+            .filter(n => n.measureIndex === mIdx)
+            .sort((a, b) => a.x - b.x)
+          const next = notesInM.find(n => n.cx > baseCursor.x + 1)
+          if (next) {
+            setKeyboardCursor({ ...baseCursor, x: next.cx, anchorId: next.id, atEnd: false })
+            break
+          }
+          // No further note in this measure: first land on the empty end slot,
+          // then a second press crosses into the next measure.
+          const endSlotX = g ? g.x + g.width - 16 : baseCursor.x
+          if (baseCursor.x < endSlotX - 1) {
+            setKeyboardCursor({ ...baseCursor, x: endSlotX, anchorId: undefined, atEnd: true })
+            break
+          }
+          const nextG = currentLayout.measures[mIdx + 1]
+          if (nextG) {
+            const nextNotes = currentLayout.notes
+              .filter(n => n.measureIndex === mIdx + 1)
+              .sort((a, b) => a.cx - b.cx)
+            const first = nextNotes[0]
+            const targetX = first ? first.cx : nextG.x + 16
+            setKeyboardCursor({ ...baseCursor, x: targetX, measureIndex: mIdx + 1, anchorId: first?.id, atEnd: false })
+          }
+          break
+        }
+        case 'Enter': {
+          e.preventDefault()
+          const snapY = staffStepToY(baseCursor.stepsDown, STAVE_Y)
+          const placedId = placeAtRef.current(baseCursor.x, snapY)
+          // If parked at the end slot, stay at the end (so you can keep adding, or
+          // press Left to reach the note just placed). Otherwise anchor to the
+          // placed/modified note so the cursor follows it through the reflow.
+          if (placedId && !baseCursor.atEnd) {
+            setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
+          }
+          break
+        }
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
 
   const commitInsert = (events: NoteEvent[]) => {
     if (insertSession) {
@@ -280,7 +451,34 @@ export function StaffCanvas({
     onRestsCommitted?.(pending)
   }
 
+  const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
+    isSelectingRef.current = false
+    setSelectionBox(null)
+    if (!layout) return
+    const minX = Math.min(box.startX, box.endX)
+    const maxX = Math.max(box.startX, box.endX)
+    const minY = Math.min(box.startY, box.endY)
+    const maxY = Math.max(box.startY, box.endY)
+    // Tiny box = click without drag: clear selection
+    if (maxX - minX < 3 && maxY - minY < 3) {
+      onSelectionChange?.(new Set())
+      return
+    }
+    const ids = new Set<string>()
+    for (const n of layout.notes) {
+      if (n.x < minX || n.x > maxX) continue
+      if (n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+    }
+    onSelectionChange?.(ids)
+  }
+
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isSelectMode) {
+      const coords = getCoords(e)
+      if (!coords) return
+      if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
+      return
+    }
     if (isDeleteMode) {
       const coords = getCoords(e)
       if (!coords) return
@@ -307,11 +505,18 @@ export function StaffCanvas({
       setInsertHover(coords ? gapAtX(getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
-    if (isRest) { setHoverInfo(null); return }
     const coords = getCoords(e)
     if (!coords) return
+    // Mouse moving resets any keyboard adjustment — mouse has priority again.
+    setKeyboardCursor(null)
     const stepsDown = Math.round((coords.y - STAVE_TOP_Y) / (LINE_SPACING / 2))
     const snapY = staffStepToY(stepsDown, STAVE_Y)
+    // In rest mode the cursor still follows the mouse vertically (purely visual —
+    // pitch is irrelevant for rests), so it doesn't feel frozen on one line.
+    if (isRest) {
+      setHoverInfo({ x: coords.x, snapY, isChordTarget: false, restTarget: null })
+      return
+    }
     const nearNote = nearestNoteAtX(coords.x, CHORD_PROXIMITY_X)
     const nearRest = nearNote ? null : nearestRestAtX(coords.x)
     setHoverInfo({ x: coords.x, snapY, isChordTarget: !!nearNote, restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null })
@@ -320,6 +525,11 @@ export function StaffCanvas({
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const coords = getCoords(e)
     if (!coords) return
+    if (isSelectMode) {
+      isSelectingRef.current = true
+      setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
+      return
+    }
     if (isDeleteMode) {
       if (performance.now() < clickCooldownRef.current) return
       markingRef.current = true
@@ -347,6 +557,10 @@ export function StaffCanvas({
   }
 
   const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isSelectMode) {
+      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      return
+    }
     if (isDeleteMode) { endErase(); return }
     if (!isTieMode) return
     // Commit a slur handle drag.
@@ -369,8 +583,70 @@ export function StaffCanvas({
     onTieComplete?.()
   }
 
+  // Core placement logic shared by mouse click and Enter key. Returns the id of the
+  // note/rest that was placed or modified (so the keyboard cursor can anchor to it).
+  const placeAt = (x: number, y: number): string | null => {
+    if (measures.length === 0) return null
+    if (!isRest) {
+      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
+      if (nearNote) {
+        const pitch = staffYToPitch(y, STAVE_Y, clef)
+        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+        const measure = measures[nearNote.measureIndex]
+        if (measure) {
+          pendingCenterRef.current = nearNote.measureIndex
+          dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
+          onNotePlaced?.()
+          return nearNote.id
+        }
+        return null
+      }
+      const nearRest = nearestRestAtX(x)
+      if (nearRest) {
+        const pitch = staffYToPitch(y, STAVE_Y, clef)
+        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+        const measure = measures[nearRest.measureIndex]
+        if (measure) {
+          pendingCenterRef.current = nearRest.measureIndex
+          const newId = crypto.randomUUID()
+          dispatch({
+            type: 'REPLACE_REST',
+            partId,
+            measureId: measure.id,
+            restId: nearRest.id,
+            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false },
+          })
+          onNotePlaced?.()
+          return newId
+        }
+        return null
+      }
+    }
+    const idx = getMeasureIndexAtX(x)
+    const measure = measures[idx]
+    if (!measure) return null
+    const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
+    if (!noteCanFit(measure, candidate, timeSig)) return null
+    pendingCenterRef.current = idx
+    const newId = crypto.randomUUID()
+    if (isRest) {
+      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 } })
+      onNotePlaced?.()
+    } else {
+      const pitch = staffYToPitch(y, STAVE_Y, clef)
+      const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false } })
+      onNotePlaced?.()
+    }
+    return newId
+  }
+  // Stable ref so the keydown handler always calls the current closure.
+  const placeAtRef = useRef(placeAt)
+  placeAtRef.current = placeAt
+
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (measures.length === 0) return
+    if (isSelectMode) return
     if (isDeleteMode) return
     if (isFillMode) {
       const coords = getCoords(e)
@@ -388,83 +664,28 @@ export function StaffCanvas({
 
     // Insert mode: clicking a gap locks it and opens the scratch staff.
     if (isInsertMode) {
-      if (insertSession) return  // already building — use ✓ / ✗
+      if (insertSession) return
       const session = gapAtX(getMeasureIndexAtX(coords.x), coords.x)
       if (session && measures[session.measureIndex]) { setInsertSession(session); setInsertHover(null) }
       return
     }
 
-    // Chord add: click within CHORD_PROXIMITY_X of an existing note → ADD_CHORD_NOTE.
-    if (!isRest) {
-      const nearNote = nearestNoteAtX(coords.x, CHORD_PROXIMITY_X)
-      if (nearNote) {
-        const pitch = staffYToPitch(coords.y, STAVE_Y, clef)
-        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-        const measure = measures[nearNote.measureIndex]
-        if (measure) {
-          pendingCenterRef.current = nearNote.measureIndex
-          dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
-          onNotePlaced?.()
-        }
-        return
-      }
-
-      // Replace-on-rest: click within CHORD_PROXIMITY_X of a rest → swap it for a note.
-      const nearRest = nearestRestAtX(coords.x)
-      if (nearRest) {
-        const pitch = staffYToPitch(coords.y, STAVE_Y, clef)
-        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-        const measure = measures[nearRest.measureIndex]
-        if (measure) {
-          pendingCenterRef.current = nearRest.measureIndex
-          dispatch({
-            type: 'REPLACE_REST',
-            partId,
-            measureId: measure.id,
-            restId: nearRest.id,
-            note: { id: crypto.randomUUID(), type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false },
-          })
-          onNotePlaced?.()
-        }
-        return
-      }
-    }
-
-    const idx = getMeasureIndexAtX(coords.x)
-    const measure = measures[idx]
-    if (!measure) return
-
-    const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, timeSig)) return
-    pendingCenterRef.current = idx
-
-    if (isRest) {
-      dispatch({
-        type: 'ADD_REST',
-        partId,
-        measureId: measure.id,
-        rest: { id: crypto.randomUUID(), type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
-      })
-      onNotePlaced?.()
-    } else {
-      const pitch = staffYToPitch(coords.y, STAVE_Y, clef)
-      const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-      dispatch({
-        type: 'ADD_NOTE',
-        partId,
-        measureId: measure.id,
-        note: {
-          id: crypto.randomUUID(),
-          type: 'note',
-          pitches: [finalPitch],
-          duration: selectedDuration,
-          dots: isDotted ? 1 : 0,
-          tied: false,
-        },
-      })
-      onNotePlaced?.()
-    }
+    placeAt(coords.x, coords.y)
   }
+
+  // When keyboard cursor is active it overrides mouse hover for the ghost-dot display.
+  const activeHover: HoverInfo | null = (() => {
+    if (!keyboardCursor) return hoverInfo
+    const snapY = staffStepToY(keyboardCursor.stepsDown, STAVE_Y)
+    const nearNote = nearestNoteAtX(keyboardCursor.x, CHORD_PROXIMITY_X)
+    const nearRest = nearNote ? null : nearestRestAtX(keyboardCursor.x)
+    return {
+      x: keyboardCursor.x,
+      snapY,
+      isChordTarget: !!nearNote,
+      restTarget: nearRest ? { x: nearRest.cx, y: nearRest.y } : null,
+    }
+  })()
 
   const measureOverlays = layout?.measures.map((g, i) => {
     const measure = measures[i]
@@ -519,13 +740,59 @@ export function StaffCanvas({
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}
       onMouseMove={handleMouseMove}
-      onMouseLeave={() => { setHoverInfo(null); setTieDrag(null); setHoverMeasure(null); if (!insertSession) setInsertHover(null); endErase() }}
+      onMouseEnter={() => { mouseInStaffRef.current = true }}
+      onMouseLeave={() => {
+        mouseInStaffRef.current = false
+        setHoverInfo(null); setTieDrag(null); setHoverMeasure(null); setKeyboardCursor(null)
+        if (!insertSession) setInsertHover(null)
+        endErase()
+        if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      }}
     >
       <div className="relative inline-block">
         <div ref={containerRef} />
 
         {measureOverlays}
         {tempoOverlays}
+
+        {/* Violet highlights for selected notes */}
+        {selectedNoteIds && layout?.notes.map(n => {
+          if (!selectedNoteIds.has(n.id)) return null
+          return (
+            <div
+              key={`sel-${n.id}`}
+              className="absolute pointer-events-none rounded-full"
+              style={{
+                left: n.x - 10,
+                top: n.y - 10,
+                width: 20,
+                height: 20,
+                background: 'rgba(139,92,246,0.30)',
+                boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)',
+                zIndex: 18,
+              }}
+            />
+          )
+        })}
+
+        {/* Rubber-band selection box */}
+        {isSelectMode && selectionBox && (
+          <svg
+            className="absolute pointer-events-none"
+            style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}
+          >
+            <rect
+              x={Math.min(selectionBox.startX, selectionBox.endX)}
+              y={Math.min(selectionBox.startY, selectionBox.endY)}
+              width={Math.abs(selectionBox.endX - selectionBox.startX)}
+              height={Math.abs(selectionBox.endY - selectionBox.startY)}
+              fill="rgba(139,92,246,0.08)"
+              stroke="rgba(139,92,246,0.8)"
+              strokeWidth={1.5}
+              strokeDasharray="5 3"
+            />
+          </svg>
+        )}
 
         {/* Red highlights: marked-for-delete (during drag) and pending rests (after release) */}
         {layout?.notes.map(n => {
@@ -579,12 +846,12 @@ export function StaffCanvas({
         )}
 
         {/* Replace-on-rest target: ring the rest the next click will overwrite. */}
-        {hoverInfo?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && (
+        {activeHover?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
-              left: hoverInfo.restTarget.x - 12,
-              top: hoverInfo.restTarget.y - 16,
+              left: activeHover.restTarget.x - 12,
+              top: activeHover.restTarget.y - 16,
               width: 24,
               height: 32,
               border: '1.5px solid rgba(139,92,246,0.7)',
@@ -594,19 +861,18 @@ export function StaffCanvas({
           />
         )}
 
-        {hoverInfo && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && (
+        {activeHover && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
           <div
             className="absolute pointer-events-none rounded-full"
             style={{
-              left: hoverInfo.x - DOT_R,
-              top: hoverInfo.snapY - DOT_R,
+              left: activeHover.x - DOT_R,
+              top: activeHover.snapY - DOT_R,
               width: DOT_R * 2,
               height: DOT_R * 2,
-              // Chord target: amber; new note: violet
-              background: hoverInfo.isChordTarget
+              background: activeHover.isChordTarget
                 ? 'rgba(251,191,36,0.85)'
                 : 'rgba(139,92,246,0.75)',
-              boxShadow: hoverInfo.isChordTarget
+              boxShadow: activeHover.isChordTarget
                 ? '0 0 14px 7px rgba(251,191,36,0.30)'
                 : '0 0 14px 7px rgba(139,92,246,0.35)',
               zIndex: 20,

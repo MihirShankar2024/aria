@@ -37,7 +37,10 @@ export async function loadSoundFont(instrumentKey: string): Promise<Tone.Sampler
     const sampler = new Tone.Sampler({
       urls: SAMPLE_URLS,
       release: 1,
-      baseUrl: `https://gleitz.github.io/midi-js-soundfonts/MusyngKite/${instrument.key.replace('_bb', '').replace('_', '-')}-mp3/`,
+      // Derive the sample directory from the instrument's known-good soundfont
+      // URL (e.g. ".../acoustic_grand_piano-mp3.js" → ".../acoustic_grand_piano-mp3/").
+      // Munging the instrument key instead produced wrong folders (piano → "piano-mp3").
+      baseUrl: instrument.soundfontUrl.replace(/\.js$/, '/'),
       onload: () => {
         statusCache.set(instrumentKey, 'ready')
         samplerCache.set(instrumentKey, sampler)

@@ -1,4 +1,4 @@
-import { Trash2, Eraser } from 'lucide-react'
+import { Trash2, Eraser, MousePointer2 } from 'lucide-react'
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { TimeSigPicker } from './TimeSigPicker'
@@ -47,6 +47,10 @@ interface DurationToolbarProps {
   onDeleteModeChange: (v: boolean) => void
   isInsertMode: boolean
   onInsertModeChange: (v: boolean) => void
+  isSelectMode: boolean
+  onSelectModeChange: (v: boolean) => void
+  selectedNoteCount: number
+  onDeleteSelected: () => void
   hasPendingRests: boolean
   onCollapseRests: () => void
   // Score-level props for pickers
@@ -74,6 +78,10 @@ export function DurationToolbar({
   onDeleteModeChange,
   isInsertMode,
   onInsertModeChange,
+  isSelectMode,
+  onSelectModeChange,
+  selectedNoteCount,
+  onDeleteSelected,
   hasPendingRests,
   onCollapseRests,
   globalTimeSig,
@@ -143,6 +151,29 @@ export function DurationToolbar({
         <Toggle pressed={isFillMode} onPressedChange={onFillModeChange} title="Fill rests — click a measure to fill it" className={TOGGLE_ITEM_CLASS}>
           𝄽+
         </Toggle>
+
+        <div className="w-px h-5 bg-white/15" />
+
+        {/* Select */}
+        <div className="relative">
+          <Toggle
+            pressed={isSelectMode}
+            onPressedChange={onSelectModeChange}
+            title="Select — draw box to select notes (Esc to clear)"
+            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+          >
+            <MousePointer2 className="h-3.5 w-3.5" />
+          </Toggle>
+          {isSelectMode && selectedNoteCount > 0 && (
+            <button
+              onClick={onDeleteSelected}
+              title="Delete selected notes"
+              className="absolute left-1/2 -translate-x-1/2 top-full mt-1 z-30 flex h-6 w-6 items-center justify-center rounded-md bg-violet-500/30 text-violet-200 hover:bg-violet-500/50 ring-1 ring-violet-400/50 animate-in fade-in"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
 
         <div className="w-px h-5 bg-white/15" />
 

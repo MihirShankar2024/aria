@@ -146,6 +146,22 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (tie) tie.curve = { ...tie.curve, ...action.curve }
         break
       }
+      case 'UPDATE_GLYPH_OFFSET': {
+        const note = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+          ?.notes.find(n => n.id === action.noteId)
+        if (note && note.type === 'note') {
+          const pitch = note.pitches[action.pitchIndex]
+          if (pitch) {
+            const key = action.kind === 'accidental' ? 'accidentalOffset' : 'dotOffset'
+            const prev = pitch[key]
+            // X is anchored to the notehead (absolute), Y accumulates the drag delta.
+            pitch[key] = { dx: action.ax, dy: (prev?.dy ?? 0) + action.dy }
+          }
+        }
+        break
+      }
       case 'APPLY_MEASURE_NOTES': {
         for (const edit of action.edits) {
           const measure = draft.parts

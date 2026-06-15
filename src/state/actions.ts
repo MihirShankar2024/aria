@@ -10,6 +10,9 @@ export type ScoreAction =
   | { type: 'ADD_TIES'; partId: string; ties: Tie[] }
   | { type: 'REMOVE_TIE'; partId: string; tieId: string }
   | { type: 'UPDATE_TIE_CURVE'; partId: string; tieId: string; curve: Partial<TieCurveOverride> }
+  // ax = glyph-center X relative to the notehead anchor (absolute; replaces). dy = vertical
+  // drag delta (accumulates). Pins the glyph to its notehead so chord edits don't move it.
+  | { type: 'UPDATE_GLYPH_OFFSET'; partId: string; measureId: string; noteId: string; pitchIndex: number; kind: 'accidental' | 'dot'; ax: number; dy: number }
   | { type: 'FILL_MEASURE_RESTS'; partId: string; measureId: string }
   | { type: 'APPLY_MEASURE_NOTES'; edits: { partId: string; measureId: string; notes: NoteEvent[] }[]; removedIds?: string[] }
   | { type: 'UPDATE_NOTE'; partId: string; measureId: string; noteId: string; patch: Partial<Note> }

@@ -125,7 +125,8 @@ export function InsertStaff({
     let bestDist = maxDist
     for (const n of layout.notes) {
       if (n.type !== 'note') continue
-      const d = Math.abs(n.x - x)
+      // Distance to the note's horizontal span (incl. accidentals), 0 when inside it.
+      const d = x < n.leftX ? n.leftX - x : x > n.rightX ? x - n.rightX : 0
       if (d < bestDist) { bestDist = d; best = n }
     }
     return best

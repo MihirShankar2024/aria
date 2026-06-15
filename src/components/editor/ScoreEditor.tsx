@@ -13,6 +13,7 @@ import { AddInstrumentButton } from './AddInstrumentButton'
 import { PlaybackBar } from '../playback/PlaybackBar'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
+import { transposeChromatic } from '../../lib/transposition/transpose'
 import type { PendingRest } from './useDeleteTrail'
 import type { Part, Duration, Accidental, NoteEvent, Tie } from '../../types/score'
 
@@ -148,6 +149,31 @@ export function ScoreEditor() {
         case 'n': setSelectedAccidental(prev => prev === 'natural' ? null : 'natural'); break
         case 't': enterTieMode(prev => !prev); break
         case 'i': enterInsertMode(prev => !prev); break
+        case 'ArrowUp':
+        case 'ArrowDown': {
+          // In select mode, arrows nudge the selected notes chromatically
+          // (±1 half step, Shift = ±1 octave). Otherwise leave arrows to the
+          // staff's keyboard cursor.
+          if (!isSelectModeRef.current || selectedNoteIdsRef.current.size === 0) break
+          e.preventDefault()
+          const semis = (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 12 : 1)
+          const sc = scoreRef.current
+          const ids = selectedNoteIdsRef.current
+          const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+          for (const part of sc.parts) {
+            for (const measure of part.measures) {
+              if (!measure.notes.some(n => n.type === 'note' && ids.has(n.id))) continue
+              const notes = measure.notes.map(ev =>
+                ev.type === 'note' && ids.has(ev.id)
+                  ? { ...ev, pitches: ev.pitches.map(p => transposeChromatic(p, semis)) }
+                  : ev,
+              )
+              edits.push({ partId: part.id, measureId: measure.id, notes })
+            }
+          }
+          if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+          break
+        }
         case 'Escape':
           if (isSelectModeRef.current) {
             if (selectedNoteIdsRef.current.size > 0) setSelectedNoteIds(new Set())

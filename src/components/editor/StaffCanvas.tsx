@@ -1,20 +1,34 @@
 import { useEffect, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats } from '../../lib/beats'
+import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration } from '../../lib/beats'
 import { computeTieSpans } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
 import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
+import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { applyRestErase } from '../../lib/rests'
+import { diatonicStep } from '../../lib/transposition/transpose'
 import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const STAVE_Y = 48
 const DOT_R = 7
-const CHORD_PROXIMITY_X = 20  // px — click within this of an existing note's x-center → chord add
+const CHORD_PROXIMITY_X = 20  // px — base chord-stacking radius (quarter notes and longer)
+// The chord-stacking radius scales down for shorter durations: densely packed
+// sixteenths sit close together, so a fixed 20px zone would cover the whole bar and
+// leave no room to register a fresh-note placement. Subtle, threshold-based scaling.
+function chordProximityForBeats(beats: number): number {
+  if (beats <= 0.25) return 8   // sixteenth
+  if (beats <= 0.5) return 12   // eighth
+  if (beats < 1) return 16      // dotted eighth (0.75)
+  return CHORD_PROXIMITY_X      // quarter and longer
+}
+// End-slot ghost preview: how far the next note would sit past the last one.
+const FALLBACK_PER_BEAT = 30  // px per quarter-beat when a measure has only one note to measure from
+const PREVIEW_MIN_GAP = 18    // px — keep the preview clear of the last notehead
 const BRUSH_R = 15            // px radius of the delete brush
 const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
 
@@ -114,9 +128,16 @@ export function StaffCanvas({
   const [layout, setLayout] = useState<StaffLayout | null>(null)
   const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
   const isSelectingRef = useRef(false)
+  // Drag-move of selected notes: started on a notehead in select mode. deltaSteps is
+  // the snapped vertical staff-position offset (down = positive) since the press.
+  const [moveDrag, setMoveDrag] = useState<{ ids: string[]; hitId: string; startY: number; deltaSteps: number } | null>(null)
   const [tieDrag, setTieDrag] = useState<TieDrag | null>(null)
   const [slurEdit, setSlurEdit] = useState<SlurEdit | null>(null)
+  const [glyphEdit, setGlyphEdit] = useState<GlyphEdit | null>(null)
   const [hoverMeasure, setHoverMeasure] = useState<number | null>(null)
+  // Set when a glyph-handle drag is committed on mouseup, so the trailing click doesn't
+  // also place a note.
+  const suppressClickRef = useRef(false)
   const [markedIds, setMarkedIds] = useState<Set<string>>(new Set())
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
@@ -147,7 +168,19 @@ export function StaffCanvas({
   layoutRef.current = layout
   const hoverInfoRef = useRef<HoverInfo | null>(null)
   hoverInfoRef.current = hoverInfo
+  // Set by placeAt: true when the last placement appended a brand-new note/rest (vs.
+  // chord-add, rest-replace, or modifier-on-existing). Lets the keyboard flow advance
+  // to the next open spot after appending, while staying put when editing an existing note.
+  const placementAppendedRef = useRef(false)
+  // The keydown handler is registered once (deps []), so it must read live measure
+  // data through refs rather than its stale capture.
+  const measuresRef = useRef(measures)
+  measuresRef.current = measures
+  const timeSigRef = useRef(timeSig)
+  timeSigRef.current = timeSig
   const mouseInStaffRef = useRef(false)
+  const isSelectModeRef = useRef(isSelectMode)
+  isSelectModeRef.current = isSelectMode
   const { trail, push: pushTrail } = useDeleteTrail(isDeleteMode)
 
   useEffect(() => {
@@ -194,6 +227,25 @@ export function StaffCanvas({
     if (kc.atEnd) {
       const g = layout.measures[kc.measureIndex]
       if (!g) return
+      // If placing the last note just filled this bar, there's nothing more to add
+      // here — advance to the start of the next measure (if one exists) so the cursor
+      // doesn't linger in the now-dead end slot.
+      const measureHere = measures[kc.measureIndex]
+      const nextG = layout.measures[kc.measureIndex + 1]
+      if (measureHere && nextG && isMeasureFull(measureHere, timeSig)) {
+        const nextNotes = layout.notes
+          .filter(n => n.measureIndex === kc.measureIndex + 1)
+          .sort((a, b) => a.cx - b.cx)
+        const first = nextNotes[0]
+        setKeyboardCursor({
+          ...kc,
+          x: first ? first.cx : nextG.x + 16,
+          measureIndex: kc.measureIndex + 1,
+          anchorId: first?.id,
+          atEnd: false,
+        })
+        return
+      }
       const endX = g.x + g.width - 16
       if (Math.abs(endX - kc.x) > 0.5) setKeyboardCursor({ ...kc, x: endX })
     }
@@ -237,12 +289,30 @@ export function StaffCanvas({
     if (isSelectMode) { setHoverInfo(null); setKeyboardCursor(null) }
   }, [isSelectMode])
 
+  // "Glyph adjust" mode: while an accidental or dot tool is active (and no other mode
+  // owns the canvas), existing accidental/dot glyphs in the hovered measure expose drag
+  // handles. Placement still works on empty staff — drag-on-handle takes priority.
+  const isGlyphMode =
+    !isSelectMode && !isDeleteMode && !isFillMode && !isTieMode && !isInsertMode &&
+    (selectedAccidental !== null || isDotted)
+
+  // Leaving glyph mode abandons any in-progress glyph drag.
+  useEffect(() => {
+    if (!isGlyphMode) setGlyphEdit(null)
+  }, [isGlyphMode])
+
+  // measureId for a note id (for committing a glyph offset).
+  const measureIdForNote = (noteId: string): string | null =>
+    measures.find(m => m.notes.some(n => n.id === noteId))?.id ?? null
+
   // Arrow-key cursor: works whenever the mouse is inside this staff (no click needed).
   // Mouse movement resets the keyboard adjustment — the two coexist, last one wins.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Only active when the mouse is inside this staff canvas.
       if (!mouseInStaffRef.current) return
+      // Select mode owns the arrow keys (nudge selected notes) — handled in ScoreEditor.
+      if (isSelectModeRef.current) return
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
 
@@ -314,10 +384,15 @@ export function StaffCanvas({
             setKeyboardCursor({ ...baseCursor, x: next.cx, anchorId: next.id, atEnd: false })
             break
           }
-          // No further note in this measure: first land on the empty end slot,
-          // then a second press crosses into the next measure.
+          // No further note in this measure. If the bar still has room, park on the
+          // end slot (to add the next note); a second press then crosses into the next
+          // measure. If the bar is full, there's nothing to add here — skip straight to
+          // the next measure. Gate purely on capacity, not pixel position, so the slot
+          // is reliable even when the last note renders near the bar's edge.
+          const measureHere = measuresRef.current[mIdx]
+          const full = measureHere ? isMeasureFull(measureHere, timeSigRef.current) : false
           const endSlotX = g ? g.x + g.width - 16 : baseCursor.x
-          if (baseCursor.x < endSlotX - 1) {
+          if (!full && !baseCursor.atEnd) {
             setKeyboardCursor({ ...baseCursor, x: endSlotX, anchorId: undefined, atEnd: true })
             break
           }
@@ -335,12 +410,17 @@ export function StaffCanvas({
         case 'Enter': {
           e.preventDefault()
           const snapY = staffStepToY(baseCursor.stepsDown, STAVE_Y)
-          const placedId = placeAtRef.current(baseCursor.x, snapY)
-          // If parked at the end slot, stay at the end (so you can keep adding, or
-          // press Left to reach the note just placed). Otherwise anchor to the
-          // placed/modified note so the cursor follows it through the reflow.
-          if (placedId && !baseCursor.atEnd) {
-            setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
+          const placedId = placeAtRef.current(baseCursor.x, snapY, baseCursor.atEnd === true)
+          if (placedId) {
+            if (placementAppendedRef.current) {
+              // Appended a new note: hover the next open spot of that measure (the end
+              // slot previews where the next note goes). If this filled the bar, the
+              // reflow effect auto-advances to the next measure. Press Left to go back.
+              setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+            } else if (!baseCursor.atEnd) {
+              // Edited an existing note (chord-add / rest-replace / modifier): stay on it.
+              setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
+            }
           }
           break
         }
@@ -362,15 +442,26 @@ export function StaffCanvas({
     onInsertComplete?.()
   }
 
-  // Find the nearest note (not rest) within CHORD_PROXIMITY_X of an x position.
+  // Per-note chord radius lookup: shorter durations get a tighter zone.
+  const noteBeatsById = new Map<string, number>()
+  for (const meas of measures) for (const ev of meas.notes) noteBeatsById.set(ev.id, noteBeatDuration(ev))
+  const chordProximityFor = (id: string) => chordProximityForBeats(noteBeatsById.get(id) ?? 1)
+
+  // Find the nearest note (not rest) whose chord zone covers x. A finite maxDist is a
+  // chord-stacking query, so each note's zone is capped by its duration-scaled radius;
+  // an infinite maxDist (tie/delete targeting) keeps the plain nearest-note behaviour.
   const nearestNoteAtX = (x: number, maxDist = Infinity): NoteGeometry | null => {
     if (!layout) return null
+    const scaled = Number.isFinite(maxDist)
     let best: NoteGeometry | null = null
-    let bestDist = maxDist
+    let bestDist = Infinity
     for (const n of layout.notes) {
       if (n.type !== 'note') continue
-      const d = Math.abs(n.x - x)
-      if (d < bestDist) { bestDist = d; best = n }
+      // Distance to the note's horizontal span (incl. accidentals), 0 when inside it,
+      // so the chord-target zone covers the accidentals to the left of the notehead.
+      const d = x < n.leftX ? n.leftX - x : x > n.rightX ? x - n.rightX : 0
+      const limit = scaled ? Math.min(maxDist, chordProximityFor(n.id)) : maxDist
+      if (d < limit && d < bestDist) { bestDist = d; best = n }
     }
     return best
   }
@@ -528,10 +619,37 @@ export function StaffCanvas({
     onSelectionChange?.(ids)
   }
 
+  // Snapped vertical staff-position delta (each line/space = one step), down = positive.
+  const snapDeltaSteps = (y: number, startY: number) =>
+    Math.round((y - startY) / (LINE_SPACING / 2))
+
+  // Commit a drag-move: shift every selected note diatonically by the snapped delta
+  // (dragging down lowers pitch) in a single undo-able edit. Selection is preserved.
+  const commitMove = (drag: { ids: string[]; deltaSteps: number }) => {
+    if (drag.deltaSteps === 0) return
+    const idset = new Set(drag.ids)
+    const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+    for (const measure of measures) {
+      if (!measure.notes.some(n => n.type === 'note' && idset.has(n.id))) continue
+      const notes = measure.notes.map(ev =>
+        ev.type === 'note' && idset.has(ev.id)
+          ? { ...ev, pitches: ev.pitches.map(p => diatonicStep(p, -drag.deltaSteps)) }
+          : ev,
+      )
+      edits.push({ partId, measureId: measure.id, notes })
+    }
+    if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+  }
+
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isSelectMode) {
       const coords = getCoords(e)
       if (!coords) return
+      if (moveDrag) {
+        const d = snapDeltaSteps(coords.y, moveDrag.startY)
+        if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
+        return
+      }
       if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
       return
     }
@@ -561,6 +679,12 @@ export function StaffCanvas({
       setInsertHover(coords ? gapAtX(getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
+    if (isGlyphMode) {
+      const coords = getCoords(e)
+      setHoverMeasure(coords ? getMeasureIndexAtX(coords.x) : null)
+      if (glyphEdit && coords) { setGlyphEdit({ ...glyphEdit, curX: coords.x, curY: coords.y }); return }
+      // fall through so the placement ghost cursor keeps following the mouse
+    }
     const coords = getCoords(e)
     if (!coords) return
     // Mouse moving resets any keyboard adjustment — mouse has priority again.
@@ -583,6 +707,15 @@ export function StaffCanvas({
     const coords = getCoords(e)
     if (!coords) return
     if (isSelectMode) {
+      // Pressing on a notehead selects/drag-moves it; pressing empty staff rubber-bands.
+      const hit = noteHeadAt(coords.x, coords.y)
+      if (hit) {
+        // Drag the whole current selection if the note is already in it, else grab just it.
+        const ids = selectedNoteIds?.has(hit.id) ? [...selectedNoteIds] : [hit.id]
+        if (!selectedNoteIds?.has(hit.id)) onSelectionChange?.(new Set([hit.id]))
+        setMoveDrag({ ids, hitId: hit.id, startY: coords.y, deltaSteps: 0 })
+        return
+      }
       isSelectingRef.current = true
       setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
       return
@@ -593,6 +726,18 @@ export function StaffCanvas({
       pushTrail(coords.x, coords.y, true)
       markAt(coords.x, coords.y)
       return
+    }
+    if (isGlyphMode) {
+      // Grabbing an accidental/dot handle starts a move; otherwise fall through to placement.
+      const g = layout ? hitGlyphHandle(layout.glyphs, coords.x, coords.y) : null
+      const measureId = g ? measureIdForNote(g.noteId) : null
+      if (g && measureId) {
+        setGlyphEdit({
+          partId, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind,
+          downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y,
+        })
+        return
+      }
     }
     if (!isTieMode) return
     // Editing a placed slur takes priority over starting a new one.
@@ -614,7 +759,31 @@ export function StaffCanvas({
   }
 
   const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+    // Commit a glyph (accidental/dot) handle drag. X is stored relative to the notehead
+    // anchor so the glyph stays pinned when other chord tones/accidentals are added.
+    if (glyphEdit) {
+      const coords = getCoords(e) ?? { x: glyphEdit.curX, y: glyphEdit.curY }
+      const note = layout?.notes.find(n => n.id === glyphEdit.noteId)
+      const moved = coords.x !== glyphEdit.downX || coords.y !== glyphEdit.downY
+      setGlyphEdit(null)
+      suppressClickRef.current = true
+      if (note && moved) {
+        dispatch({
+          type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+          noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind,
+          ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+        })
+      }
+      return
+    }
     if (isSelectMode) {
+      if (moveDrag) {
+        // No drag = a plain click: narrow the selection to the clicked note.
+        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
+        else onSelectionChange?.(new Set([moveDrag.hitId]))
+        setMoveDrag(null)
+        return
+      }
       if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       return
     }
@@ -642,12 +811,17 @@ export function StaffCanvas({
 
   // Core placement logic shared by mouse click and Enter key. Returns the id of the
   // note/rest that was placed or modified (so the keyboard cursor can anchor to it).
-  const placeAt = (x: number, y: number): string | null => {
+  // forceNew=true bypasses all proximity logic (chord-add, rest-replace, modifier-on-
+  // existing) and always appends a brand-new event. Used by the end-of-bar slot, where
+  // the intent is unambiguously "add the next note" even if the stored x happens to sit
+  // near the last note.
+  const placeAt = (x: number, y: number, forceNew = false): string | null => {
+    placementAppendedRef.current = false
     if (measures.length === 0) return null
     // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
     // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
     // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
-    if (!isRest && (isDotted || selectedAccidental !== null)) {
+    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
       const hit = noteHeadAt(x, y)
       if (hit) { applyModifierToExistingNote(hit, y); return hit.id }
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
@@ -660,7 +834,7 @@ export function StaffCanvas({
         }
       }
     }
-    if (!isRest) {
+    if (!forceNew && !isRest) {
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
       if (nearNote) {
         const pitch = staffYToPitch(y, STAVE_Y, clef)
@@ -694,7 +868,7 @@ export function StaffCanvas({
         }
         return null
       }
-    } else {
+    } else if (!forceNew) {
       // Rest mode: clicking an existing note replaces it with a rest — mirror of
       // replacing a rest with a note above.
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
@@ -721,6 +895,7 @@ export function StaffCanvas({
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
     if (!noteCanFit(measure, candidate, timeSig)) return null
+    placementAppendedRef.current = true
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
     if (isRest) {
@@ -740,6 +915,8 @@ export function StaffCanvas({
 
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (measures.length === 0) return
+    // A glyph-handle drag just finished — swallow the synthesized click so it doesn't place.
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
     if (isSelectMode) return
     if (isDeleteMode) return
     if (isFillMode) {
@@ -767,10 +944,59 @@ export function StaffCanvas({
     placeAt(coords.x, coords.y)
   }
 
+  // For the end-slot cursor, compute where the *next* note would actually begin so
+  // the ghost dot previews the next slot instead of jumping to the bar line. The
+  // next note's start is governed by how much horizontal space the last note
+  // occupies (a function of its duration). This is visual-only — the stored cursor
+  // x stays at the end slot, so placement/navigation logic is unaffected.
+  const previewNextSlotX = (mIdx: number): number => {
+    if (!layout) return keyboardCursor?.x ?? 0
+    const g = layout.measures[mIdx]
+    if (!g) return keyboardCursor?.x ?? 0
+    const endSlotX = g.x + g.width - 16
+    // Use all events (notes and rests): the next note begins after whatever is last.
+    const notes = layout.notes
+      .filter(n => n.measureIndex === mIdx)
+      .sort((a, b) => a.cx - b.cx)
+    // Empty measure: preview where the first note would land.
+    if (notes.length === 0) return g.x + 16
+    const events = measures[mIdx]?.notes ?? []
+    const eventById = new Map(events.map(ev => [ev.id, ev]))
+    const last = notes[notes.length - 1]
+    const lastEvent = eventById.get(last.id)
+    const lastBeats = lastEvent ? noteBeatDuration(lastEvent) : 1
+    let gap: number
+    if (notes.length >= 2) {
+      // Measured: derive a real per-beat width from the rendered note span.
+      const first = notes[0]
+      let beatsToLast = 0
+      for (let i = 0; i < notes.length - 1; i++) {
+        const ev = eventById.get(notes[i].id)
+        beatsToLast += ev ? noteBeatDuration(ev) : 1
+      }
+      const perBeat = beatsToLast > 0 ? (last.cx - first.cx) / beatsToLast : FALLBACK_PER_BEAT
+      gap = perBeat * lastBeats
+    } else {
+      gap = FALLBACK_PER_BEAT * lastBeats
+    }
+    return Math.min(Math.max(last.cx + gap, last.cx + PREVIEW_MIN_GAP), endSlotX)
+  }
+
   // When keyboard cursor is active it overrides mouse hover for the ghost-dot display.
   const activeHover: HoverInfo | null = (() => {
     if (!keyboardCursor) return hoverInfo
     const snapY = staffStepToY(keyboardCursor.stepsDown, STAVE_Y)
+    // The end-slot cursor always previews a brand-new note — never a chord stack or
+    // rest replacement — so keep it purple regardless of proximity to the last note.
+    if (keyboardCursor.atEnd) {
+      return {
+        x: previewNextSlotX(keyboardCursor.measureIndex),
+        snapY,
+        isChordTarget: false,
+        restTarget: null,
+        noteTarget: null,
+      }
+    }
     const nearNote = nearestNoteAtX(keyboardCursor.x, CHORD_PROXIMITY_X)
     const nearRest = nearNote ? null : nearestRestAtX(keyboardCursor.x)
     return {
@@ -839,8 +1065,10 @@ export function StaffCanvas({
       onMouseLeave={() => {
         mouseInStaffRef.current = false
         setHoverInfo(null); setTieDrag(null); setHoverMeasure(null); setKeyboardCursor(null)
+        if (glyphEdit) setGlyphEdit(null)
         if (!insertSession) setInsertHover(null)
         endErase()
+        if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
         if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
     >
@@ -853,13 +1081,14 @@ export function StaffCanvas({
         {/* Violet highlights for selected notes */}
         {selectedNoteIds && layout?.notes.map(n => {
           if (!selectedNoteIds.has(n.id)) return null
+          const dy = moveDrag && moveDrag.ids.includes(n.id) ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
           return (
             <div
               key={`sel-${n.id}`}
               className="absolute pointer-events-none rounded-full"
               style={{
                 left: n.x - 10,
-                top: n.y - 10,
+                top: n.y - 10 + dy,
                 width: 20,
                 height: 20,
                 background: 'rgba(139,92,246,0.30)',
@@ -1024,6 +1253,34 @@ export function StaffCanvas({
               />
             )
           })
+        })}
+
+        {/* Accidental/dot adjust handles — only for glyphs in the hovered measure, so they
+            don't clutter the rest of the staff. The glyph being dragged follows the cursor. */}
+        {isGlyphMode && layout?.glyphs.map(g => {
+          const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
+          const note = layout.notes.find(n => n.id === g.noteId)
+          const hovered = note != null && hoverMeasure === note.measureIndex
+          if (!editing && !hovered) return null
+          const cx = editing ? glyphEdit!.curX : g.x
+          const cy = editing ? glyphEdit!.curY : g.y
+          return (
+            <div
+              key={g.noteId + g.kind + g.pitchIndex}
+              className="absolute rounded-full"
+              style={{
+                left: cx - GLYPH_HANDLE_R / 2,
+                top: cy - GLYPH_HANDLE_R / 2,
+                width: GLYPH_HANDLE_R,
+                height: GLYPH_HANDLE_R,
+                background: editing ? 'rgba(139,92,246,0.9)' : 'rgba(139,92,246,0.45)',
+                border: '1.5px solid white',
+                boxShadow: '0 0 6px rgba(139,92,246,0.5)',
+                cursor: 'grab',
+                zIndex: 28,
+              }}
+            />
+          )
         })}
 
         {/* Delete brush trail */}

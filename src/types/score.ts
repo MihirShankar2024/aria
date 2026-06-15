@@ -3,10 +3,22 @@ export type Accidental = 'sharp' | 'flat' | 'natural' | 'double_sharp' | 'double
 export type Duration = 'whole' | 'half' | 'quarter' | 'eighth' | 'sixteenth'
 export type Clef = 'treble' | 'bass' | 'alto'
 
+/** Manual placement of a notehead's accidental or dot glyph. Set when the user drags the
+ *  glyph's handle. `dx` is the glyph-center X relative to the notehead anchor, so the glyph
+ *  is pinned to its notehead and stays put when other tones/accidentals are added to the
+ *  chord (independent of VexFlow's auto column layout). `dy` is a vertical offset from the
+ *  auto line. Once set, the glyph is fully user-controlled. */
+export interface GlyphOffset {
+  dx: number
+  dy: number
+}
+
 export interface Pitch {
   step: NoteName
   octave: number
   accidental: Accidental
+  accidentalOffset?: GlyphOffset   // manual nudge of this pitch's accidental glyph
+  dotOffset?: GlyphOffset          // manual nudge of this pitch's dot(s)
 }
 
 export interface Note {

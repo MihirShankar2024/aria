@@ -14,8 +14,10 @@ import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
 import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
+import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { applyRestErase } from '../../lib/rests'
+import { diatonicStep } from '../../lib/transposition/transpose'
 import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
@@ -106,13 +108,19 @@ export function GrandStaffCanvas({
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null)
   const [tieDrag, setTieDrag] = useState<TieDrag | null>(null)
   const [slurEdit, setSlurEdit] = useState<SlurEdit | null>(null)
+  const [glyphEdit, setGlyphEdit] = useState<GlyphEdit | null>(null)
   const [hoverMeasure, setHoverMeasure] = useState<number | null>(null)
+  // Set when a glyph-handle drag is committed on mouseup, so the trailing click doesn't place.
+  const suppressClickRef = useRef(false)
   const [markedIds, setMarkedIds] = useState<Set<string>>(new Set())
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
   const [scrollLeft, setScrollLeft] = useState(0)
   const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
   const isSelectingRef = useRef(false)
+  // Drag-move of selected notes in select mode (started on a notehead). deltaSteps is
+  // the snapped vertical staff-position offset (down = positive) since the press.
+  const [moveDrag, setMoveDrag] = useState<{ ids: string[]; hitId: string; startY: number; deltaSteps: number } | null>(null)
 
   const markingRef = useRef(false)
   const markedRef = useRef<Set<string>>(new Set())  // synchronous mirror of markedIds
@@ -186,6 +194,17 @@ export function GrandStaffCanvas({
     if (isSelectMode) setHoverInfo(null)
   }, [isSelectMode])
 
+  // "Glyph adjust" mode: while an accidental or dot tool is active (and no other mode owns
+  // the canvas), existing accidental/dot glyphs in the hovered measure expose drag handles.
+  const isGlyphMode =
+    !isSelectMode && !isDeleteMode && !isFillMode && !isTieMode && !isInsertMode &&
+    (selectedAccidental !== null || isDotted)
+
+  // Leaving glyph mode abandons any in-progress glyph drag.
+  useEffect(() => {
+    if (!isGlyphMode) setGlyphEdit(null)
+  }, [isGlyphMode])
+
   const commitInsert = (events: NoteEvent[]) => {
     if (insertSession) {
       const part = insertSession.stave === 'treble' ? treblePart : bassPart
@@ -222,7 +241,8 @@ export function GrandStaffCanvas({
     let bestDist = maxDist
     for (const n of notes) {
       if (n.type !== 'note') continue
-      const d = Math.abs(n.x - x)
+      // Distance to the note's horizontal span (incl. accidentals), 0 when inside it.
+      const d = x < n.leftX ? n.leftX - x : x > n.rightX ? x - n.rightX : 0
       if (d < bestDist) { bestDist = d; best = n }
     }
     return best
@@ -355,6 +375,15 @@ export function GrandStaffCanvas({
         ]
       : []
 
+  // Accidental/dot glyph handles per stave, paired with their part and note geometry.
+  const allGlyphHandles = () =>
+    layout
+      ? [
+          { part: treblePart, glyphs: layout.trebleGlyphs, notes: layout.trebleNotes },
+          { part: bassPart, glyphs: layout.bassGlyphs, notes: layout.bassNotes },
+        ]
+      : []
+
   const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
     isSelectingRef.current = false
     setSelectionBox(null)
@@ -377,10 +406,43 @@ export function GrandStaffCanvas({
     onSelectionChange?.(ids)
   }
 
+  // A notehead hit on either stave (for click-select / drag-move in select mode).
+  const noteHeadAtAny = (x: number, y: number): NoteGeometry | null =>
+    noteHeadAt(layout?.trebleNotes ?? [], x, y) ?? noteHeadAt(layout?.bassNotes ?? [], x, y)
+
+  // Snapped vertical staff-position delta (each line/space = one step), down = positive.
+  const snapDeltaSteps = (y: number, startY: number) =>
+    Math.round((y - startY) / (LINE_SPACING / 2))
+
+  // Commit a drag-move: shift every selected note diatonically by the snapped delta
+  // (dragging down lowers pitch) across both parts, in one undo-able edit.
+  const commitMove = (drag: { ids: string[]; deltaSteps: number }) => {
+    if (drag.deltaSteps === 0) return
+    const idset = new Set(drag.ids)
+    const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+    for (const part of [treblePart, bassPart]) {
+      for (const measure of part.measures) {
+        if (!measure.notes.some(n => n.type === 'note' && idset.has(n.id))) continue
+        const notes = measure.notes.map(ev =>
+          ev.type === 'note' && idset.has(ev.id)
+            ? { ...ev, pitches: ev.pitches.map(p => diatonicStep(p, -drag.deltaSteps)) }
+            : ev,
+        )
+        edits.push({ partId: part.id, measureId: measure.id, notes })
+      }
+    }
+    if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+  }
+
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isSelectMode) {
       const coords = getCoords(e)
       if (!coords) return
+      if (moveDrag) {
+        const d = snapDeltaSteps(coords.y, moveDrag.startY)
+        if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
+        return
+      }
       if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
       return
     }
@@ -410,6 +472,12 @@ export function GrandStaffCanvas({
       setInsertHover(coords ? gapAtX(whichStave(coords.y), getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
+    if (isGlyphMode) {
+      const c = getCoords(e)
+      setHoverMeasure(c ? getMeasureIndexAtX(c.x) : null)
+      if (glyphEdit && c) { setGlyphEdit({ ...glyphEdit, curX: c.x, curY: c.y }); return }
+      // fall through so the placement ghost cursor keeps following the mouse
+    }
     const coords = getCoords(e)
     if (!coords) return
     const stave = whichStave(coords.y)
@@ -431,6 +499,14 @@ export function GrandStaffCanvas({
     const coords = getCoords(e)
     if (!coords) return
     if (isSelectMode) {
+      // Pressing on a notehead selects/drag-moves it; pressing empty staff rubber-bands.
+      const hit = noteHeadAtAny(coords.x, coords.y)
+      if (hit) {
+        const ids = selectedNoteIds?.has(hit.id) ? [...selectedNoteIds] : [hit.id]
+        if (!selectedNoteIds?.has(hit.id)) onSelectionChange?.(new Set([hit.id]))
+        setMoveDrag({ ids, hitId: hit.id, startY: coords.y, deltaSteps: 0 })
+        return
+      }
       isSelectingRef.current = true
       setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
       return
@@ -441,6 +517,21 @@ export function GrandStaffCanvas({
       pushTrail(coords.x, coords.y, true)
       markAt(coords.x, coords.y)
       return
+    }
+    if (isGlyphMode) {
+      // Grabbing an accidental/dot handle starts a move; otherwise fall through to placement.
+      for (const { part, glyphs } of allGlyphHandles()) {
+        const g = hitGlyphHandle(glyphs, coords.x, coords.y)
+        if (!g) continue
+        const measureId = part.measures.find(m => m.notes.some(n => n.id === g.noteId))?.id
+        if (measureId) {
+          setGlyphEdit({
+            partId: part.id, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind,
+            downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y,
+          })
+          return
+        }
+      }
     }
     if (!isTieMode) return
     // Editing a placed slur takes priority over starting a new one.
@@ -467,7 +558,32 @@ export function GrandStaffCanvas({
   }
 
   const handleMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+    // Commit a glyph (accidental/dot) handle drag. X is stored relative to the notehead
+    // anchor so the glyph stays pinned when other chord tones/accidentals are added.
+    if (glyphEdit) {
+      const coords = getCoords(e) ?? { x: glyphEdit.curX, y: glyphEdit.curY }
+      const note = (layout?.trebleNotes ?? []).find(n => n.id === glyphEdit.noteId)
+        ?? (layout?.bassNotes ?? []).find(n => n.id === glyphEdit.noteId)
+      const moved = coords.x !== glyphEdit.downX || coords.y !== glyphEdit.downY
+      setGlyphEdit(null)
+      suppressClickRef.current = true
+      if (note && moved) {
+        dispatch({
+          type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+          noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind,
+          ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+        })
+      }
+      return
+    }
     if (isSelectMode) {
+      if (moveDrag) {
+        // No drag = a plain click: narrow the selection to the clicked note.
+        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
+        else onSelectionChange?.(new Set([moveDrag.hitId]))
+        setMoveDrag(null)
+        return
+      }
       if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       return
     }
@@ -497,6 +613,8 @@ export function GrandStaffCanvas({
   }
 
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // A glyph-handle drag just finished — swallow the synthesized click so it doesn't place.
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
     if (isSelectMode || isTieMode || isDeleteMode) return
     const coords = getCoords(e)
     if (!coords) return
@@ -689,8 +807,10 @@ export function GrandStaffCanvas({
       onMouseMove={handleMouseMove}
       onMouseLeave={() => {
         setHoverInfo(null); setTieDrag(null); setHoverMeasure(null)
+        if (glyphEdit) setGlyphEdit(null)
         if (!insertSession) setInsertHover(null)
         endErase()
+        if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
         if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
     >
@@ -702,12 +822,13 @@ export function GrandStaffCanvas({
         {/* Violet highlights for selected notes */}
         {selectedNoteIds && layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {
           if (!selectedNoteIds.has(n.id)) return null
+          const dy = moveDrag && moveDrag.ids.includes(n.id) ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
           return (
             <div
               key={`sel-${n.id}`}
               className="absolute pointer-events-none rounded-full"
               style={{
-                left: n.x - 10, top: n.y - 10, width: 20, height: 20,
+                left: n.x - 10, top: n.y - 10 + dy, width: 20, height: 20,
                 background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18,
               }}
             />
@@ -844,6 +965,36 @@ export function GrandStaffCanvas({
                 />
               )
             })
+          }),
+        )}
+
+        {/* Accidental/dot adjust handles — only for glyphs in the hovered measure. The
+            glyph being dragged follows the cursor. */}
+        {isGlyphMode && allGlyphHandles().flatMap(({ glyphs, notes }) =>
+          glyphs.map(g => {
+            const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
+            const note = notes.find(n => n.id === g.noteId)
+            const hovered = note != null && hoverMeasure === note.measureIndex
+            if (!editing && !hovered) return null
+            const cx = editing ? glyphEdit!.curX : g.x
+            const cy = editing ? glyphEdit!.curY : g.y
+            return (
+              <div
+                key={g.noteId + g.kind + g.pitchIndex}
+                className="absolute rounded-full"
+                style={{
+                  left: cx - GLYPH_HANDLE_R / 2,
+                  top: cy - GLYPH_HANDLE_R / 2,
+                  width: GLYPH_HANDLE_R,
+                  height: GLYPH_HANDLE_R,
+                  background: editing ? 'rgba(139,92,246,0.9)' : 'rgba(139,92,246,0.45)',
+                  border: '1.5px solid white',
+                  boxShadow: '0 0 6px rgba(139,92,246,0.5)',
+                  cursor: 'grab',
+                  zIndex: 28,
+                }}
+              />
+            )
           }),
         )}
 

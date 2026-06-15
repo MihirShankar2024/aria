@@ -109,10 +109,14 @@ export function DurationToolbar({
 
         <div className="w-px h-5 bg-white/15" />
 
-        {/* Modifiers + accidentals — one group */}
+        {/* Rest mode — its own thing */}
+        <Toggle pressed={isRest} onPressedChange={onRestChange} title="Rest" className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
+
+        <div className="w-px h-5 bg-white/15" />
+
+        {/* Dot + accidentals — one group */}
         <div className="flex items-center gap-0.5">
           <Toggle pressed={isDotted} onPressedChange={onDottedChange} title="Dotted" className={TOGGLE_ITEM_CLASS}>·</Toggle>
-          <Toggle pressed={isRest} onPressedChange={onRestChange} title="Rest" className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
           <ToggleGroup
             type="single"
             value={selectedAccidental ?? ''}
@@ -126,9 +130,10 @@ export function DurationToolbar({
             ))}
           </ToggleGroup>
         </div>
+      </div>
 
-        <div className="w-px h-5 bg-white/15" />
-
+      {/* Modes bubble */}
+      <div className="inline-flex items-center gap-2 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         {/* Tie / slur */}
         <Toggle pressed={isTieMode} onPressedChange={onTieModeChange} title="Tie / slur — drag between two notes (T)" className={TOGGLE_ITEM_CLASS + ' text-base'}>
           ⌒

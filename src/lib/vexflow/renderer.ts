@@ -7,14 +7,25 @@ import {
   Formatter,
   Accidental as VexAccidental,
   Dot,
+  Modifier,
   Beam,
   StaveTie,
   StaveConnector,
+  MetricsDefaults,
 } from 'vexflow'
-import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part } from '../../types/score'
+import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset } from '../../types/score'
 import { measureCapacity, measureBeatCount } from '../beats'
 
 const NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
+
+// VexFlow's default accidental spacing is extremely tight (1px notehead gap, 3px between
+// columns), so dense chord clusters where every tone carries an accidental collide and
+// "bleed" into each other and the noteheads. Loosen it for legible, well-separated
+// columns — VexFlow already arranges accidentals into Gould-style zig-zag columns; this
+// just gives those columns room to breathe. Applied once at module load.
+MetricsDefaults.Accidental.noteheadAccidentalPadding = 3
+MetricsDefaults.Accidental.accidentalSpacing = 7
+MetricsDefaults.Accidental.leftPadding = 3
 
 function samePitch(a: Pitch, b: Pitch): boolean {
   return a.step === b.step && a.octave === b.octave && a.accidental === b.accidental
@@ -37,6 +48,12 @@ function extremeYTowardSlur(vn: StaveNote, direction: number): number {
   } catch {
     // No stem (e.g. whole note) — noteheads are the only extent.
   }
+  try {
+    // Include the full glyph bounds so accidentals (and dots) poking toward the slur
+    // are cleared, not just noteheads and stems.
+    const bb = vn.getBoundingBox()
+    if (bb) ys.push(bb.getY(), bb.getY() + bb.getH())
+  } catch { /* bounding box unavailable — extents above suffice */ }
   return direction === 1 ? Math.max(...ys) : Math.min(...ys)
 }
 
@@ -98,6 +115,69 @@ function glyphCenterX(vn: StaveNote): number {
   return vn.getAbsoluteX()
 }
 
+// Center of a note's primary notehead, deliberately excluding accidentals/dots so the
+// cursor and arrow-key snapping target the head itself (notePx is the bare notehead
+// width; getAbsoluteX is its left edge). Rests use glyphCenterX instead.
+function noteheadCenterX(vn: StaveNote): number {
+  try {
+    const m = vn.getMetrics()
+    return vn.getAbsoluteX() + (m.notePx ?? 0) / 2
+  } catch {
+    return vn.getAbsoluteX()
+  }
+}
+
+// Min clear gap (px) we guarantee between a note's right edge and the next note's
+// left-side accidentals — VexFlow's own minimum is too tight for dense clusters.
+const ACC_GAP = 6
+
+// Horizontal extents of a note's full glyph — left-side accidentals/displaced heads,
+// and right-side dots/displaced heads — relative to its notehead anchor (getAbsoluteX).
+// Valid only after the owning voice has been formatted. Mirrors VexFlow's own
+// xStart/xEnd computation in Note (modLeftPx + leftDisplacedHeadPx on the left, etc.).
+function noteExtents(vn: StaveNote): { accLeft: number; rightExt: number } {
+  try {
+    const m = vn.getMetrics()
+    return {
+      accLeft: (m.modLeftPx ?? 0) + (m.leftDisplacedHeadPx ?? 0),
+      rightExt: (m.notePx ?? 0) + (m.rightDisplacedHeadPx ?? 0) + (m.modRightPx ?? 0),
+    }
+  } catch {
+    return { accLeft: 0, rightExt: 0 }
+  }
+}
+
+// Note-area width that guarantees no adjacent pair's glyphs (incl. accidentals and
+// displaced noteheads) overlap, enforcing ACC_GAP between them plus a leading/trailing
+// allowance for the outer notes' own glyphs. Falls back to VexFlow's vexMin when richer.
+function accidentalAwareMinWidth(realNotes: StaveNote[], voice: Voice, vexMin: number): number {
+  if (realNotes.length === 0) return vexMin
+  try {
+    // getMetrics() requires a pre-formatted voice; format at the bare minimum first.
+    new Formatter().joinVoices([voice]).format([voice], vexMin)
+  } catch {
+    return vexMin
+  }
+  const ext = realNotes.map(noteExtents)
+  let floor = ext[0].accLeft
+  for (let i = 0; i < realNotes.length - 1; i++) {
+    floor += ext[i].rightExt + ACC_GAP + ext[i + 1].accLeft
+  }
+  floor += ext[ext.length - 1].rightExt
+  return Math.max(vexMin, Math.ceil(floor))
+}
+
+// Per-measure note-area sizing from a built voice: the hard minimum (accidental-aware,
+// the collision floor) and the blended-down "raw" preferred width. The MAX_NOTE_AREA cap
+// is lifted to the floor when accidental clearance demands more than 400px.
+function rawWidthFromVoice(realNotes: StaveNote[], voice: Voice): { min: number; raw: number } {
+  const vexMin = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
+  const min = accidentalAwareMinWidth(realNotes, voice, vexMin)
+  const cap = Math.max(MAX_NOTE_AREA, Math.ceil(min))
+  const preferred = snapUp(Math.min(Math.max(Math.ceil(min * SPACING_FACTOR), MIN_NOTE_AREA), cap), SNAP_STEP)
+  return { min, raw: Math.max(preferred, Math.ceil(min)) }
+}
+
 // Faint guide lines two positions above and below the staff, so high/low notes
 // are easy to aim at. Drawn directly on the VexFlow SVG context after the stave.
 function drawLedgerGuides(ctx: ReturnType<InstanceType<typeof Renderer>['getContext']>, stave: Stave): void {
@@ -122,12 +202,11 @@ function drawLedgerGuides(ctx: ReturnType<InstanceType<typeof Renderer>['getCont
 function computeColumnWidths(measures: Measure[], effTimeSigs: TimeSig[], clef: Clef = 'treble'): { raws: number[]; mins: number[] } {
   const mins: number[] = []
   const raws = measures.map((m, i) => {
-    const { voice } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1], clef)
+    const { realNotes, voice } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1], clef)
     if (!voice) { mins.push(0); return MIN_NOTE_AREA }
-    const min = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
+    const { min, raw } = rawWidthFromVoice(realNotes, voice)
     mins.push(min)
-    const preferred = snapUp(Math.min(Math.max(Math.ceil(min * SPACING_FACTOR), MIN_NOTE_AREA), MAX_NOTE_AREA), SNAP_STEP)
-    return Math.max(preferred, Math.ceil(min))
+    return raw
   })
   return { raws, mins }
 }
@@ -248,6 +327,55 @@ function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
   return vn
 }
 
+// Pin a manually-moved glyph to its notehead. offset.dx is the desired glyph-center X
+// relative to the notehead anchor (getAbsoluteX), so the position is independent of
+// VexFlow's accidental/dot column layout — adding notes/accidentals to the chord won't
+// drag an already-moved glyph. offset.dy is a vertical offset from the auto line (which
+// is itself stable, since a notehead's Y doesn't move when chord tones are added).
+function pinGlyph(vn: StaveNote, mod: VexAccidental | Dot, noteheadX: number, idx: number, offset: GlyphOffset): void {
+  const pos = mod.getPosition()
+  const isLeft = pos === Modifier.Position.LEFT
+  const width = mod.getWidth()
+  const start = vn.getModifierStartXY(pos, idx)
+  // Center X when our shift is zero: accidentals (LEFT) draw left of start, dots (RIGHT) right.
+  const baseCenterX = isLeft ? start.x - width / 2 : start.x + width / 2
+  const shift = (noteheadX + offset.dx) - baseCenterX
+  // Modifier.setXShift negates for LEFT-positioned glyphs; getModifierStartXY hard-anchors
+  // to getAbsoluteX, so this fully replaces the formatter's column shift.
+  mod.setXShift(isLeft ? -shift : shift)
+  mod.setYShift(mod.getYShift() + offset.dy)
+}
+
+// Apply stored per-pitch glyph offsets to a note's accidental/dot modifiers. Call after
+// Formatter.format() and before voice.draw() so the pin rides on top of auto placement.
+function applyGlyphOffsets(vn: StaveNote, note: Note): void {
+  const noteheadX = vn.getAbsoluteX()
+  for (const mod of vn.getModifiers()) {
+    const idx = mod.getIndex()
+    if (idx === undefined) continue
+    const pitch = note.pitches[idx]
+    if (!pitch) continue
+    if (mod instanceof VexAccidental) {
+      if (pitch.accidentalOffset) pinGlyph(vn, mod, noteheadX, idx, pitch.accidentalOffset)
+    } else if (mod instanceof Dot) {
+      if (pitch.dotOffset) pinGlyph(vn, mod, noteheadX, idx, pitch.dotOffset)
+    }
+  }
+}
+
+// Read the drawn center of each accidental/dot glyph for drag-handle placement. Call after
+// voice.draw() so bounding boxes reflect the rendered (and nudged) positions.
+function collectGlyphGeometry(vn: StaveNote, note: Note, out: GlyphGeometry[]): void {
+  for (const mod of vn.getModifiers()) {
+    const idx = mod.getIndex()
+    if (idx === undefined || note.pitches[idx] === undefined) continue
+    const kind = mod instanceof VexAccidental ? 'accidental' : mod instanceof Dot ? 'dot' : null
+    if (!kind) continue
+    const bb = mod.getBoundingBox()
+    out.push({ noteId: note.id, pitchIndex: idx, kind, x: bb.getX() + bb.getW() / 2, y: bb.getY() + bb.getH() / 2 })
+  }
+}
+
 interface BuiltMeasure {
   realNotes: StaveNote[]
   voice: Voice | null
@@ -287,8 +415,10 @@ export interface MeasureGeometry {
 export interface NoteGeometry {
   id: string
   type: 'note' | 'rest'
-  x: number            // notehead x in SVG px
+  x: number            // notehead anchor x in SVG px
   cx: number           // glyph visual center x in SVG px (for centering rest overlays)
+  leftX: number        // true left edge incl. accidentals/displaced heads (for cursor zone)
+  rightX: number       // true right edge incl. dots/displaced heads
   y: number            // notehead y in SVG px (primary/lowest pitch for chords)
   ys: number[]         // every notehead y (all pitches of a chord) for hit testing
   measureIndex: number
@@ -299,6 +429,16 @@ export interface TempoMarkGeometry {
   y: number
   tempo: number
   measureNumber: number
+}
+
+// Drawn position of a note's accidental or dot glyph, used to place drag handles
+// when adjusting it. Center point in SVG px (same space as NoteGeometry).
+export interface GlyphGeometry {
+  noteId: string
+  pitchIndex: number
+  kind: 'accidental' | 'dot'
+  x: number
+  y: number
 }
 
 // Drawn shape of a slur/tie, used to place drag handles when editing.
@@ -317,6 +457,7 @@ export interface StaffLayout {
   height: number
   measures: MeasureGeometry[]
   notes: NoteGeometry[]
+  glyphs: GlyphGeometry[]
   tempoMarks: TempoMarkGeometry[]
   ties: TieGeometry[]
 }
@@ -358,12 +499,11 @@ export function renderStaff({
   // Pass 1 — build voices and compute note-area widths.
   const built = measures.map((m, i) => buildMeasure(m, effTimeSigs[i], clef))
   const vexMins: number[] = []
-  const rawWidths = built.map(({ voice }) => {
+  const rawWidths = built.map(({ realNotes, voice }) => {
     if (!voice) { vexMins.push(0); return MIN_NOTE_AREA }
-    const min = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
+    const { min, raw } = rawWidthFromVoice(realNotes, voice)
     vexMins.push(min)
-    const preferred = snapUp(Math.min(Math.max(Math.ceil(min * SPACING_FACTOR), MIN_NOTE_AREA), MAX_NOTE_AREA), SNAP_STEP)
-    return Math.max(preferred, Math.ceil(min))
+    return raw
   })
 
   const maxWidth = Math.max(...rawWidths)
@@ -394,6 +534,7 @@ export function renderStaff({
   // Pass 2 — layout and draw.
   const geometry: MeasureGeometry[] = []
   const noteGeometry: NoteGeometry[] = []
+  const glyphGeometry: GlyphGeometry[] = []
   const tempoMarkGeometry: TempoMarkGeometry[] = []
   const vexById = new Map<string, StaveNote>()
   let x = LEFT_MARGIN
@@ -443,10 +584,15 @@ export function renderStaff({
 
     const { realNotes, voice } = built[idx]
     if (voice) {
+      // Give every note its stave before formatting so VexFlow's accidental column
+      // layout uses pixel-accurate line positions and clears displaced noteheads.
+      voice.getTickables().forEach(t => t.setStave(stave))
       const formatWidth = stave.getNoteEndX() - stave.getNoteStartX() - NOTE_PAD
       new Formatter().joinVoices([voice]).format([voice], Math.max(noteAreaWidths[idx], formatWidth))
 
       const beams = Beam.generateBeams(realNotes)
+      // Apply manual accidental/dot nudges on top of auto layout before drawing.
+      measure.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev) })
       voice.draw(ctx, stave)
       beams.forEach(b => b.setContext(ctx).draw())
 
@@ -455,15 +601,20 @@ export function renderStaff({
         vexById.set(ev.id, vn)
         // For chords, record the primary (lowest) notehead Y.
         const ys = vn.getYs()
+        const ax = vn.getAbsoluteX()
+        const ext = noteExtents(vn)
         noteGeometry.push({
           id: ev.id,
           type: ev.type,
-          x: vn.getAbsoluteX(),
-          cx: glyphCenterX(vn),
+          x: ax,
+          cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn),
+          leftX: ax - ext.accLeft,
+          rightX: ax + ext.rightExt,
           y: ys[0] ?? staveY,
           ys: ys.length ? [...ys] : [staveY],
           measureIndex: idx,
         })
+        if (ev.type === 'note') collectGlyphGeometry(vn, ev, glyphGeometry)
       })
     }
 
@@ -479,6 +630,7 @@ export function renderStaff({
     height: STAFF_HEIGHT,
     measures: geometry,
     notes: noteGeometry,
+    glyphs: glyphGeometry,
     tempoMarks: tempoMarkGeometry,
     ties: tieGeometry,
   }
@@ -511,6 +663,8 @@ export interface GrandStaffLayout {
   measures: MeasureGeometry[]
   trebleNotes: NoteGeometry[]
   bassNotes: NoteGeometry[]
+  trebleGlyphs: GlyphGeometry[]
+  bassGlyphs: GlyphGeometry[]
   tempoMarks: TempoMarkGeometry[]
   trebleTies: TieGeometry[]
   bassTies: TieGeometry[]
@@ -558,15 +712,10 @@ export function renderGrandStaff({
 
   // Compute per-measure note-area widths — take max of treble and bass so columns align.
   function computeRawWidths(built: BuiltMeasure[]): number[] {
-    const mins: number[] = []
-    const raws = built.map(({ voice }) => {
-      if (!voice) { mins.push(0); return MIN_NOTE_AREA }
-      const min = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
-      mins.push(min)
-      const preferred = snapUp(Math.min(Math.max(Math.ceil(min * SPACING_FACTOR), MIN_NOTE_AREA), MAX_NOTE_AREA), SNAP_STEP)
-      return Math.max(preferred, Math.ceil(min))
+    return built.map(({ realNotes, voice }) => {
+      if (!voice) return MIN_NOTE_AREA
+      return rawWidthFromVoice(realNotes, voice).raw
     })
-    return raws
   }
 
   const trebleRaw = computeRawWidths(trebleBuilt)
@@ -596,6 +745,8 @@ export function renderGrandStaff({
   const tempoMarkGeometry: TempoMarkGeometry[] = []
   const trebleNoteGeometry: NoteGeometry[] = []
   const bassNoteGeometry: NoteGeometry[] = []
+  const trebleGlyphGeometry: GlyphGeometry[] = []
+  const bassGlyphGeometry: GlyphGeometry[] = []
   const trebleVexById = new Map<string, StaveNote>()
   const bassVexById   = new Map<string, StaveNote>()
 
@@ -671,32 +822,42 @@ export function renderGrandStaff({
     // Draw treble notes
     const { realNotes: trebleReal, voice: trebleVoice } = trebleBuilt[idx] ?? { realNotes: [], voice: null }
     if (trebleVoice) {
+      trebleVoice.getTickables().forEach(t => t.setStave(trebleStave))
       const fw = trebleStave.getNoteEndX() - trebleStave.getNoteStartX() - NOTE_PAD
       new Formatter().joinVoices([trebleVoice]).format([trebleVoice], Math.max(noteAreaWidths[idx], fw))
       const beams = Beam.generateBeams(trebleReal)
+      trebleMeasures[idx]?.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(trebleReal[k], ev) })
       trebleVoice.draw(ctx, trebleStave)
       beams.forEach(b => b.setContext(ctx).draw())
       trebleMeasures[idx]?.notes.forEach((ev, k) => {
         const vn = trebleReal[k]
         trebleVexById.set(ev.id, vn)
         const tys = vn.getYs()
-        trebleNoteGeometry.push({ id: ev.id, type: ev.type, x: vn.getAbsoluteX(), cx: glyphCenterX(vn), y: tys[0] ?? GRAND_TREBLE_Y, ys: tys.length ? [...tys] : [GRAND_TREBLE_Y], measureIndex: idx })
+        const tax = vn.getAbsoluteX()
+        const text = noteExtents(vn)
+        trebleNoteGeometry.push({ id: ev.id, type: ev.type, x: tax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: tax - text.accLeft, rightX: tax + text.rightExt, y: tys[0] ?? GRAND_TREBLE_Y, ys: tys.length ? [...tys] : [GRAND_TREBLE_Y], measureIndex: idx })
+        if (ev.type === 'note') collectGlyphGeometry(vn, ev, trebleGlyphGeometry)
       })
     }
 
     // Draw bass notes
     const { realNotes: bassReal, voice: bassVoice } = bassBuilt[idx] ?? { realNotes: [], voice: null }
     if (bassVoice) {
+      bassVoice.getTickables().forEach(t => t.setStave(bassStave))
       const fw = bassStave.getNoteEndX() - bassStave.getNoteStartX() - NOTE_PAD
       new Formatter().joinVoices([bassVoice]).format([bassVoice], Math.max(noteAreaWidths[idx], fw))
       const beams = Beam.generateBeams(bassReal)
+      bassMeasures[idx]?.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(bassReal[k], ev) })
       bassVoice.draw(ctx, bassStave)
       beams.forEach(b => b.setContext(ctx).draw())
       bassMeasures[idx]?.notes.forEach((ev, k) => {
         const vn = bassReal[k]
         bassVexById.set(ev.id, vn)
         const bys = vn.getYs()
-        bassNoteGeometry.push({ id: ev.id, type: ev.type, x: vn.getAbsoluteX(), cx: glyphCenterX(vn), y: bys[0] ?? GRAND_BASS_Y, ys: bys.length ? [...bys] : [GRAND_BASS_Y], measureIndex: idx })
+        const bax = vn.getAbsoluteX()
+        const bext = noteExtents(vn)
+        bassNoteGeometry.push({ id: ev.id, type: ev.type, x: bax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: bax - bext.accLeft, rightX: bax + bext.rightExt, y: bys[0] ?? GRAND_BASS_Y, ys: bys.length ? [...bys] : [GRAND_BASS_Y], measureIndex: idx })
+        if (ev.type === 'note') collectGlyphGeometry(vn, ev, bassGlyphGeometry)
       })
     }
 
@@ -714,6 +875,8 @@ export function renderGrandStaff({
     measures: measureGeometry,
     trebleNotes: trebleNoteGeometry,
     bassNotes: bassNoteGeometry,
+    trebleGlyphs: trebleGlyphGeometry,
+    bassGlyphs: bassGlyphGeometry,
     tempoMarks: tempoMarkGeometry,
     trebleTies: trebleTieGeometry,
     bassTies: bassTieGeometry,
@@ -774,9 +937,14 @@ function drawTies(
       staveTie.getFirstYs = () => flatFirstYs
       staveTie.getLastYs  = () => flatLastYs
 
-      // Manual horizontal endpoint shifts.
+      // Pull the end inward past the end note's leading accidental so the incoming
+      // curve clears it instead of crossing over the glyph. Negligible heads ignored.
+      const endAcc      = noteExtents(last).accLeft
+      const endAccShift = endAcc > 2 ? endAcc : 0
+
+      // Manual horizontal endpoint shifts (additive on top of the accidental clearance).
       if (ov?.startDX) staveTie.renderOptions.firstXShift = ov.startDX
-      if (ov?.endDX)   staveTie.renderOptions.lastXShift  = ov.endDX
+      staveTie.renderOptions.lastXShift = (ov?.endDX ?? 0) - endAccShift
 
       const firstY = flatFirstYs[0] ?? 0
       const lastY  = flatLastYs[0]  ?? 0
@@ -808,7 +976,7 @@ function drawTies(
         id: tie.id,
         startX: firstX + (ov?.startDX ?? 0),
         startY: firstY,
-        endX: last.getAbsoluteX() + (ov?.endDX ?? 0),
+        endX: last.getAbsoluteX() + (ov?.endDX ?? 0) - endAccShift,
         endY: lastY,
         cp1,
         direction,

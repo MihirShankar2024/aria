@@ -5,9 +5,12 @@ import type { TieCurveOverride } from '../../types/score'
 // staff and grand staff canvases.
 
 export const SLUR_HANDLE_R = 10
-const APEX_OFFSET = 8         // handle sits this far past the curve's control depth
+// VexFlow StaveTie shifts endpoints by yShift along the slur direction, then draws a
+// quadratic arc whose visual peak sits at midY + direction * (yShift + 0.5 * cp1).
+const VEX_Y_SHIFT = 7
+const APEX_OFFSET = 8         // handle sits this far past the visual peak for grabbing
 const MIN_CP = 4
-const MAX_CP = 80
+const MAX_CP = 240
 
 export type SlurHandle = 'start' | 'end' | 'apex'
 
@@ -30,7 +33,7 @@ export function slurHandlePoints(geo: TieGeometry): Record<SlurHandle, Point> {
   return {
     start: { x: geo.startX, y: geo.startY },
     end:   { x: geo.endX,   y: geo.endY },
-    apex:  { x: midX, y: midY + geo.direction * (geo.cp1 + APEX_OFFSET) },
+    apex:  { x: midX, y: midY + geo.direction * (VEX_Y_SHIFT + 0.5 * geo.cp1 + APEX_OFFSET) },
   }
 }
 
@@ -68,10 +71,13 @@ export function slurEditPatch(
   if (edit.handle === 'end') {
     return { endDX: (current?.endDX ?? 0) + dx, endDY: (current?.endDY ?? 0) + dy }
   }
-  // apex
+  // apex — invert VexFlow's peak formula so the drawn curve reaches the dragged handle
   const midY = (edit.geo.startY + edit.geo.endY) / 2
   const offset = curY - midY
   const direction: 1 | -1 = offset >= 0 ? 1 : -1
-  const cp1 = Math.max(MIN_CP, Math.min(MAX_CP, Math.abs(offset) - APEX_OFFSET))
+  const cp1 = Math.max(
+    MIN_CP,
+    Math.min(MAX_CP, 2 * (Math.abs(offset) - VEX_Y_SHIFT - APEX_OFFSET)),
+  )
   return { direction, cp1, cp2: cp1 + 4 }
 }

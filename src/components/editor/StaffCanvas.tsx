@@ -227,6 +227,11 @@ export function StaffCanvas({
     if (!isInsertMode) { setInsertSession(null); setInsertHover(null) }
   }, [isInsertMode])
 
+  // Leaving tie mode abandons any in-progress slur drag or handle edit.
+  useEffect(() => {
+    if (!isTieMode) { setTieDrag(null); setSlurEdit(null) }
+  }, [isTieMode])
+
   // Entering select mode drops the edit cursor so it doesn't stay frozen on the staff.
   useEffect(() => {
     if (isSelectMode) { setHoverInfo(null); setKeyboardCursor(null) }

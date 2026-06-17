@@ -205,10 +205,10 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const note = measure?.notes.find(n => n.id === action.noteId && n.type === 'note')
         if (note && note.type === 'note') {
           // Don't add duplicate pitches.
-          const alreadyHas = note.pitches.some(
+          const existingIdx = note.pitches.findIndex(
             p => p.step === action.pitch.step && p.octave === action.pitch.octave && p.accidental === action.pitch.accidental,
           )
-          if (!alreadyHas) {
+          if (existingIdx === -1) {
             note.pitches = sortPitches([...note.pitches, action.pitch])
           }
         }

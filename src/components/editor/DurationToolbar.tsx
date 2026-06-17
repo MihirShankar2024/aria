@@ -1,4 +1,4 @@
-import { Trash2, Eraser, MousePointer2 } from 'lucide-react'
+import { Trash2, Eraser, MousePointer2, Brush, Crosshair } from 'lucide-react'
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { TimeSigPicker } from './TimeSigPicker'
@@ -45,10 +45,14 @@ interface DurationToolbarProps {
   onFillModeChange: (v: boolean) => void
   isDeleteMode: boolean
   onDeleteModeChange: (v: boolean) => void
+  isBroomMode: boolean
+  onBroomModeChange: (v: boolean) => void
   isInsertMode: boolean
   onInsertModeChange: (v: boolean) => void
   isSelectMode: boolean
   onSelectModeChange: (v: boolean) => void
+  isSharpshooterMode: boolean
+  onSharpshooterModeChange: (v: boolean) => void
   selectedNoteCount: number
   onDeleteSelected: () => void
   hasPendingRests: boolean
@@ -76,10 +80,14 @@ export function DurationToolbar({
   onFillModeChange,
   isDeleteMode,
   onDeleteModeChange,
+  isBroomMode,
+  onBroomModeChange,
   isInsertMode,
   onInsertModeChange,
   isSelectMode,
   onSelectModeChange,
+  isSharpshooterMode,
+  onSharpshooterModeChange,
   selectedNoteCount,
   onDeleteSelected,
   hasPendingRests,
@@ -178,6 +186,18 @@ export function DurationToolbar({
 
         <div className="w-px h-5 bg-white/15" />
 
+        {/* Sharpshooter — move slur/tie handles + accidental/dot glyph handles */}
+        <Toggle
+          pressed={isSharpshooterMode}
+          onPressedChange={onSharpshooterModeChange}
+          title="Sharpshooter — adjust slurs/ties, accidentals and dots (handle drag) (Tab)"
+          className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+        >
+          <Crosshair className="h-3.5 w-3.5" />
+        </Toggle>
+
+        <div className="w-px h-5 bg-white/15" />
+
         {/* Erase */}
         <div className="relative">
           <Toggle
@@ -191,13 +211,23 @@ export function DurationToolbar({
           {hasPendingRests && (
             <button
               onClick={onCollapseRests}
-              title="Remove rests — collapse the red rests (Tab)"
+              title="Remove rests — collapse the red rests (Shift+Tab)"
               className="absolute left-1/2 -translate-x-1/2 top-full mt-1 z-30 flex h-6 w-6 items-center justify-center rounded-md bg-red-500/30 text-red-200 hover:bg-red-500/50 ring-1 ring-red-400/50 animate-in fade-in"
             >
               <Eraser className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
+
+        {/* Broom — sweep away slurs, accidentals and dots */}
+        <Toggle
+          pressed={isBroomMode}
+          onPressedChange={onBroomModeChange}
+          title="Broom — drag over slurs, accidentals and dots to remove them (B)"
+          className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-amber-500/25 data-[state=on]:text-amber-300'}
+        >
+          <Brush className="h-3.5 w-3.5" />
+        </Toggle>
       </div>
 
       {/* Notation controls */}

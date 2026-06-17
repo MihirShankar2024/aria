@@ -6,35 +6,44 @@ import { computeTieSpans } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
-import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
+import { slurHandlePoints, slurArcPath, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
 import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
-import { applyRestErase } from '../../lib/rests'
+import { renderGhostNote, type GhostRender } from './ghostNote'
+import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
+import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
 import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const STAVE_Y = 48
 const DOT_R = 7
-const CHORD_PROXIMITY_X = 20  // px — base chord-stacking radius (quarter notes and longer)
+const CHORD_PROXIMITY_X = 20  // px — max chord-stacking radius for long notes
+// Accidental columns can project far left; count only part of that width for chord
+// targeting so the stack zone doesn't become too sticky.
+const ACCIDENTAL_ZONE_WEIGHT = 0.75
 // The chord-stacking radius scales down for shorter durations: densely packed
 // sixteenths sit close together, so a fixed 20px zone would cover the whole bar and
 // leave no room to register a fresh-note placement. Subtle, threshold-based scaling.
 function chordProximityForBeats(beats: number): number {
-  if (beats <= 0.25) return 8   // sixteenth
-  if (beats <= 0.5) return 12   // eighth
-  if (beats < 1) return 16      // dotted eighth (0.75)
-  return CHORD_PROXIMITY_X      // quarter and longer
+  if (beats <= 0.25) return 7   // sixteenth
+  if (beats <= 0.5) return 9    // eighth
+  if (beats < 1) return 12      // dotted eighth (0.75)
+  if (beats <= 1) return 15     // quarter
+  if (beats < 2) return 17      // dotted quarter (1.5)
+  return CHORD_PROXIMITY_X      // half and longer
 }
 // End-slot ghost preview: how far the next note would sit past the last one.
 const FALLBACK_PER_BEAT = 30  // px per quarter-beat when a measure has only one note to measure from
 const PREVIEW_MIN_GAP = 18    // px — keep the preview clear of the last notehead
 const BRUSH_R = 15            // px radius of the delete brush
 const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
+const NOTEHEAD_HIT_Y_TOL = 4  // px — keep half-step-above clicks from being mistaken as same head
 
 const STAVE_TOP_Y    = STAVE_Y + STAVE_TOP_OFFSET
 const STAVE_BOTTOM_Y = STAVE_TOP_Y + 4 * LINE_SPACING
 const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
+const PANEL_EDGE_DEADBAND_PX = 10  // keep cursor from latching at panel extremes
 
 interface StaffCanvasProps {
   partId: string
@@ -51,7 +60,9 @@ interface StaffCanvasProps {
   isTieMode: boolean
   isFillMode: boolean
   isDeleteMode: boolean
+  isBroomMode: boolean
   isInsertMode: boolean
+  isSharpshooterMode?: boolean
   initialTempo?: number
   tempoChanges?: { measureNumber: number; tempo: number }[]
   forcedStaveWidths?: number[]
@@ -89,7 +100,17 @@ interface TieDrag {
   fromY: number
   curX: number
   curY: number
+  // The note the dragging end is locked onto (always the nearest note), so the
+  // preview shows the slur snapped exactly where it will land.
+  lockId: string | null
+  lockX: number
+  lockY: number
 }
+
+// An auxiliary glyph (accidental/dot) or tie swept by the broom, removed on release.
+type BroomTarget =
+  | { kind: 'glyph'; key: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
+  | { kind: 'tie'; key: string; tieId: string; x: number; y: number }
 
 export function StaffCanvas({
   partId,
@@ -106,7 +127,9 @@ export function StaffCanvas({
   isTieMode,
   isFillMode,
   isDeleteMode,
+  isBroomMode,
   isInsertMode,
+  isSharpshooterMode = false,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -119,18 +142,22 @@ export function StaffCanvas({
   onTieComplete,
   onFillComplete,
   onInsertComplete,
-  onRestsCommitted,
   onPlaybackLayoutChange,
 }: StaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null)
   const [layout, setLayout] = useState<StaffLayout | null>(null)
+  // Grey "held note/rest" glyph that rides the cursor in placement mode. Rendered
+  // once with the real engine whenever the selected note params change, then moved
+  // under the cursor via SVG translate (no per-frame re-render).
+  const [ghost, setGhost] = useState<GhostRender | null>(null)
   const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
   const isSelectingRef = useRef(false)
-  // Drag-move of selected notes: started on a notehead in select mode. deltaSteps is
-  // the snapped vertical staff-position offset (down = positive) since the press.
-  const [moveDrag, setMoveDrag] = useState<{ ids: string[]; hitId: string; startY: number; deltaSteps: number } | null>(null)
+  // Drag-move of selected noteheads: started on a notehead in select mode. `keys` are
+  // the composite selection keys being moved; `hitKey` is the grabbed head. deltaSteps
+  // is the snapped vertical staff-position offset (down = positive) since the press.
+  const [moveDrag, setMoveDrag] = useState<{ keys: string[]; hitKey: string; startY: number; deltaSteps: number } | null>(null)
   const [tieDrag, setTieDrag] = useState<TieDrag | null>(null)
   const [slurEdit, setSlurEdit] = useState<SlurEdit | null>(null)
   const [glyphEdit, setGlyphEdit] = useState<GlyphEdit | null>(null)
@@ -182,6 +209,12 @@ export function StaffCanvas({
   const isSelectModeRef = useRef(isSelectMode)
   isSelectModeRef.current = isSelectMode
   const { trail, push: pushTrail } = useDeleteTrail(isDeleteMode)
+  const { trail: broomTrail, push: pushBroom } = useDeleteTrail(isBroomMode)
+  // Broom: auxiliary glyphs (accidentals/dots) and ties swept under the brush, removed
+  // on release. Ref is the synchronous source of truth; state mirrors it for rendering.
+  const broomRef = useRef<Map<string, BroomTarget>>(new Map())
+  const [broomMarks, setBroomMarks] = useState<BroomTarget[]>([])
+  const broomingRef = useRef(false)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -208,6 +241,26 @@ export function StaffCanvas({
     if (!layout || !onPlaybackLayoutChange) return
     onPlaybackLayoutChange({ measures: layout.measures, notes: layout.notes })
   }, [layout, onPlaybackLayoutChange])
+
+  // Re-render the grey cursor ghost only when the selected note params change.
+  // Suppressed in every non-placement mode (no held note to preview there).
+  useEffect(() => {
+    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode) {
+      setGhost(null)
+      return
+    }
+    const nextGhost = renderGhostNote({
+      duration: selectedDuration,
+      dotted: isDotted,
+      accidental: selectedAccidental,
+      isRest,
+      clef,
+      timeSig,
+      keySig,
+    })
+    setGhost(nextGhost)
+  }, [selectedDuration, isDotted, selectedAccidental, isRest, clef, timeSig, keySig,
+      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
 
   // After a reflow (e.g. first note in a bar, or adding a chord tone) a note's
   // visual center shifts. If the keyboard cursor is anchored to that note, snap its
@@ -274,6 +327,11 @@ export function StaffCanvas({
     if (!isDeleteMode) { markingRef.current = false; markedRef.current = new Set(); setMarkedIds(new Set()) }
   }, [isDeleteMode])
 
+  // Leaving broom mode abandons any in-progress sweep.
+  useEffect(() => {
+    if (!isBroomMode) { broomingRef.current = false; broomRef.current = new Map(); setBroomMarks([]) }
+  }, [isBroomMode])
+
   // Leaving insert mode abandons any in-progress insertion.
   useEffect(() => {
     if (!isInsertMode) { setInsertSession(null); setInsertHover(null) }
@@ -281,7 +339,7 @@ export function StaffCanvas({
 
   // Leaving tie mode abandons any in-progress slur drag or handle edit.
   useEffect(() => {
-    if (!isTieMode) { setTieDrag(null); setSlurEdit(null) }
+    if (!isTieMode) setTieDrag(null)
   }, [isTieMode])
 
   // Entering select mode drops the edit cursor so it doesn't stay frozen on the staff.
@@ -289,17 +347,12 @@ export function StaffCanvas({
     if (isSelectMode) { setHoverInfo(null); setKeyboardCursor(null) }
   }, [isSelectMode])
 
-  // "Glyph adjust" mode: while an accidental or dot tool is active (and no other mode
-  // owns the canvas), existing accidental/dot glyphs in the hovered measure expose drag
-  // handles. Placement still works on empty staff — drag-on-handle takes priority.
-  const isGlyphMode =
-    !isSelectMode && !isDeleteMode && !isFillMode && !isTieMode && !isInsertMode &&
-    (selectedAccidental !== null || isDotted)
-
-  // Leaving glyph mode abandons any in-progress glyph drag.
+  // Leaving sharpshooter mode abandons any in-progress handle drags.
   useEffect(() => {
-    if (!isGlyphMode) setGlyphEdit(null)
-  }, [isGlyphMode])
+    if (!isSharpshooterMode) { setGlyphEdit(null); setSlurEdit(null); return }
+    setHoverInfo(null)
+    setKeyboardCursor(null)
+  }, [isSharpshooterMode])
 
   // measureId for a note id (for committing a glyph offset).
   const measureIdForNote = (noteId: string): string | null =>
@@ -412,7 +465,12 @@ export function StaffCanvas({
           const snapY = staffStepToY(baseCursor.stepsDown, STAVE_Y)
           const placedId = placeAtRef.current(baseCursor.x, snapY, baseCursor.atEnd === true)
           if (placedId) {
-            if (placementAppendedRef.current) {
+            // Free mouse hover (not locked into a keyboard slot): just add the note and
+            // leave the cursor where it was — no teleport to the end slot or placed note.
+            const locked = keyboardCursorRef.current !== null
+            if (!locked) {
+              // do nothing — the hovering cursor stays put
+            } else if (placementAppendedRef.current) {
               // Appended a new note: hover the next open spot of that measure (the end
               // slot previews where the next note goes). If this filled the bar, the
               // reflow effect auto-advances to the next measure. Press Left to go back.
@@ -455,13 +513,21 @@ export function StaffCanvas({
     const scaled = Number.isFinite(maxDist)
     let best: NoteGeometry | null = null
     let bestDist = Infinity
+    let bestCenterDist = Infinity
     for (const n of layout.notes) {
       if (n.type !== 'note') continue
+      const weightedLeftX = n.x - (n.x - n.leftX) * ACCIDENTAL_ZONE_WEIGHT
       // Distance to the note's horizontal span (incl. accidentals), 0 when inside it,
       // so the chord-target zone covers the accidentals to the left of the notehead.
-      const d = x < n.leftX ? n.leftX - x : x > n.rightX ? x - n.rightX : 0
+      const d = x < weightedLeftX ? weightedLeftX - x : x > n.rightX ? x - n.rightX : 0
+      const centerDist = Math.abs(n.cx - x)
       const limit = scaled ? Math.min(maxDist, chordProximityFor(n.id)) : maxDist
-      if (d < limit && d < bestDist) { bestDist = d; best = n }
+      if (d >= limit) continue
+      if (d < bestDist || (d === bestDist && centerDist < bestCenterDist)) {
+        bestDist = d
+        bestCenterDist = centerDist
+        best = n
+      }
     }
     return best
   }
@@ -481,17 +547,19 @@ export function StaffCanvas({
 
   // Find the note whose notehead sits directly under (x, y) — a precise hit on the
   // glyph, not just the same column (used by the dot/accidental click-to-apply path).
-  const noteHeadAt = (x: number, y: number): NoteGeometry | null => {
+  const noteHeadAt = (x: number, y: number): { note: NoteGeometry; pitchIndex: number } | null => {
     if (!layout) return null
     const r2 = NOTEHEAD_HIT_R * NOTEHEAD_HIT_R
-    let best: NoteGeometry | null = null
+    let best: { note: NoteGeometry; pitchIndex: number } | null = null
     let bestDist = r2
     for (const n of layout.notes) {
       if (n.type !== 'note') continue
-      for (const ny of n.ys) {
-        const d = (n.x - x) * (n.x - x) + (ny - y) * (ny - y)
-        if (d <= bestDist) { bestDist = d; best = n }
-      }
+      n.ys.forEach((ny, i) => {
+        if (Math.abs(ny - y) > NOTEHEAD_HIT_Y_TOL) return
+        const hx = n.xs[i] ?? n.x
+        const d = (hx - x) * (hx - x) + (ny - y) * (ny - y)
+        if (d <= bestDist) { bestDist = d; best = { note: n, pitchIndex: i } }
+      })
     }
     return best
   }
@@ -499,7 +567,7 @@ export function StaffCanvas({
   // Apply the active modifier tool(s) — dot and/or accidental — to an existing note.
   // The accidental lands on the chord tone at the clicked staff position. onNotePlaced
   // then clears the tool selection (so it doesn't carry to the next placement).
-  const applyModifierToExistingNote = (target: NoteGeometry, clickY: number) => {
+  const applyModifierToExistingNote = (target: NoteGeometry, clickY: number, pitchIndex?: number) => {
     const measure = measures[target.measureIndex]
     if (!measure) return
     const ev = measure.notes.find(n => n.id === target.id)
@@ -507,12 +575,23 @@ export function StaffCanvas({
     const patch: Partial<Note> = {}
     if (isDotted) patch.dots = 1
     if (selectedAccidental !== null) {
-      const clicked = staffYToPitch(clickY, STAVE_Y, clef)
-      patch.pitches = ev.pitches.map(p =>
-        p.step === clicked.step && p.octave === clicked.octave
-          ? { ...p, accidental: selectedAccidental }
-          : p,
-      )
+      if (pitchIndex !== undefined && ev.pitches[pitchIndex]) {
+        patch.pitches = ev.pitches.map((p, i) =>
+          i === pitchIndex ? { ...p, accidental: selectedAccidental } : p,
+        )
+      } else {
+        const clicked = staffYToPitch(clickY, STAVE_Y, clef)
+        patch.pitches = ev.pitches.map(p =>
+          p.step === clicked.step && p.octave === clicked.octave
+            ? { ...p, accidental: selectedAccidental }
+            : p,
+        )
+      }
+    }
+    if (patch.pitches && patch.pitches.every((p, i) =>
+      p.step === ev.pitches[i].step && p.octave === ev.pitches[i].octave && p.accidental === ev.pitches[i].accidental,
+    )) {
+      delete patch.pitches
     }
     if (Object.keys(patch).length === 0) return
     pendingCenterRef.current = target.measureIndex
@@ -564,8 +643,64 @@ export function StaffCanvas({
     if (added) setMarkedIds(new Set(markedRef.current))
   }
 
-  // On release, turn marked notes into beat-correct in-place rests and report the
-  // resulting red rests up for the confirm-collapse step.
+  // Broom: mark only the auxiliary glyphs/ties actually under the brush at (x, y).
+  const broomAt = (x: number, y: number) => {
+    if (!layout) return
+    let added = false
+    for (const g of layout.glyphs) {
+      if (Math.hypot(g.x - x, g.y - y) > BRUSH_R) continue
+      const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}`
+      if (broomRef.current.has(key)) continue
+      broomRef.current.set(key, { kind: 'glyph', key, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, x: g.x, y: g.y })
+      added = true
+    }
+    for (const geo of layout.ties) {
+      const pts = slurHandlePoints(geo)
+      const near = (['start', 'end', 'apex'] as const).some(h => Math.hypot(pts[h].x - x, pts[h].y - y) <= BRUSH_R)
+      if (!near) continue
+      const key = `t:${geo.id}`
+      if (broomRef.current.has(key)) continue
+      broomRef.current.set(key, { kind: 'tie', key, tieId: geo.id, x: pts.apex.x, y: pts.apex.y })
+      added = true
+    }
+    if (added) setBroomMarks([...broomRef.current.values()])
+  }
+
+  // On release, remove every swept glyph (accidental → null / dot → 0) and tie.
+  const commitBroom = () => {
+    broomingRef.current = false
+    const targets = [...broomRef.current.values()]
+    broomRef.current = new Map()
+    setBroomMarks([])
+    if (targets.length === 0) return
+    // Group glyph removals per note so one note's accidental + dot collapse into a
+    // single patch built off its current pitches/dots.
+    const glyphsByNote = new Map<string, BroomTarget[]>()
+    for (const t of targets) {
+      if (t.kind !== 'glyph') continue
+      const arr = glyphsByNote.get(t.noteId) ?? []
+      arr.push(t); glyphsByNote.set(t.noteId, arr)
+    }
+    for (const [noteId, gs] of glyphsByNote) {
+      const measureId = measureIdForNote(noteId)
+      if (!measureId) continue
+      const note = measures.flatMap(m => m.notes).find(n => n.id === noteId)
+      if (!note || note.type !== 'note') continue
+      const patch: Partial<Note> = {}
+      if (gs.some(g => g.kind === 'glyph' && g.glyphKind === 'dot')) patch.dots = 0
+      const accIdx = new Set(gs.filter(g => g.kind === 'glyph' && g.glyphKind === 'accidental').map(g => (g as { pitchIndex: number }).pitchIndex))
+      if (accIdx.size > 0) {
+        patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+      }
+      if (Object.keys(patch).length) dispatch({ type: 'UPDATE_NOTE', partId, measureId, noteId, patch })
+    }
+    for (const t of targets) {
+      if (t.kind === 'tie') dispatch({ type: 'REMOVE_TIE', partId, tieId: t.tieId })
+    }
+  }
+
+  // On release, remove the marked notes entirely and shift the remainder left
+  // (no in-place rests), the same clean-delete path used by select + Delete.
   const commitMarks = () => {
     markingRef.current = false
     const marked = markedRef.current
@@ -580,22 +715,16 @@ export function StaffCanvas({
       byMeasure.set(n.measureIndex, set)
     }
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
-    const pending: PendingRest[] = []
     const removedIds: string[] = []
     for (const [mIdx, ids] of byMeasure) {
       const measure = measures[mIdx]
       if (!measure) continue
       for (const id of ids) if (measure.notes.find(n => n.id === id)?.type === 'note') removedIds.push(id)
-      // Re-normalizing re-IDs every rest, so fold this measure's already-pending red
-      // rests into the marked set to keep them highlighted across successive deletes.
-      for (const ev of measure.notes) if (pendingRestIds?.has(ev.id)) ids.add(ev.id)
-      const { notes, redRestIds } = applyRestErase(measure.notes, ids, measure.timeSig ?? timeSig)
+      const notes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), measure.timeSig ?? timeSig)
       edits.push({ partId, measureId: measure.id, notes })
-      if (redRestIds.length) pending.push({ partId, measureId: measure.id, restIds: redRestIds })
     }
     if (edits.length === 0) return
     dispatch({ type: 'APPLY_MEASURE_NOTES', edits, removedIds })
-    onRestsCommitted?.(pending)
   }
 
   const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
@@ -613,8 +742,15 @@ export function StaffCanvas({
     }
     const ids = new Set<string>()
     for (const n of layout.notes) {
-      if (n.x < minX || n.x > maxX) continue
-      if (n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+      if (n.type === 'rest') {
+        if (n.x >= minX && n.x <= maxX && n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+        continue
+      }
+      // Per notehead: select only the heads whose x/y fall inside the box.
+      n.ys.forEach((y, i) => {
+        const hx = n.xs[i] ?? n.x
+        if (hx >= minX && hx <= maxX && y >= minY && y <= maxY) ids.add(selKey(n.id, i))
+      })
     }
     onSelectionChange?.(ids)
   }
@@ -623,28 +759,30 @@ export function StaffCanvas({
   const snapDeltaSteps = (y: number, startY: number) =>
     Math.round((y - startY) / (LINE_SPACING / 2))
 
-  // Commit a drag-move: shift every selected note diatonically by the snapped delta
+  // Commit a drag-move: shift every selected notehead diatonically by the snapped delta
   // (dragging down lowers pitch) in a single undo-able edit. Selection is preserved.
-  const commitMove = (drag: { ids: string[]; deltaSteps: number }) => {
+  const commitMove = (drag: { keys: string[]; deltaSteps: number }) => {
     if (drag.deltaSteps === 0) return
-    const idset = new Set(drag.ids)
+    const byEvent = selectionByEvent(new Set(drag.keys))
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+    const newKeys: string[] = []
     for (const measure of measures) {
-      if (!measure.notes.some(n => n.type === 'note' && idset.has(n.id))) continue
-      const notes = measure.notes.map(ev =>
-        ev.type === 'note' && idset.has(ev.id)
-          ? { ...ev, pitches: ev.pitches.map(p => diatonicStep(p, -drag.deltaSteps)) }
-          : ev,
-      )
-      edits.push({ partId, measureId: measure.id, notes })
+      if (!measure.notes.some(n => byEvent.has(n.id))) continue
+      const res = moveSelectedPitches(measure.notes, byEvent, p => diatonicStep(p, -drag.deltaSteps))
+      edits.push({ partId, measureId: measure.id, notes: res.notes })
+      newKeys.push(...res.newKeys)
     }
-    if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+    if (edits.length) {
+      dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+      onSelectionChange?.(new Set(newKeys))  // re-key: heads kept selected at sorted indices
+    }
   }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isSelectMode) {
       const coords = getCoords(e)
       if (!coords) return
+      setHoverMeasure(getMeasureIndexAtX(coords.x))
       if (moveDrag) {
         const d = snapDeltaSteps(coords.y, moveDrag.startY)
         if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
@@ -660,6 +798,13 @@ export function StaffCanvas({
       if (markingRef.current) markAt(coords.x, coords.y)
       return
     }
+    if (isBroomMode) {
+      const coords = getCoords(e)
+      if (!coords) return
+      pushBroom(coords.x, coords.y, broomingRef.current)
+      if (broomingRef.current) broomAt(coords.x, coords.y)
+      return
+    }
     if (isFillMode) {
       const coords = getCoords(e)
       setHoverMeasure(coords ? getMeasureIndexAtX(coords.x) : null)
@@ -669,8 +814,20 @@ export function StaffCanvas({
       const coords = getCoords(e)
       if (!coords) { setHoverMeasure(null); return }
       setHoverMeasure(getMeasureIndexAtX(coords.x))
-      if (slurEdit) { setSlurEdit({ ...slurEdit, curX: coords.x, curY: coords.y }); return }
-      if (tieDrag) setTieDrag({ ...tieDrag, curX: coords.x, curY: coords.y })
+      if (tieDrag) {
+        // Always lock the dragging end onto the nearest note (excluding the source),
+        // so the grey preview snaps exactly where the slur will be created.
+        const target = nearestNoteAtX(coords.x)
+        const locked = target && target.id !== tieDrag.fromId ? target : null
+        setTieDrag({
+          ...tieDrag,
+          curX: coords.x,
+          curY: coords.y,
+          lockId: locked ? locked.id : null,
+          lockX: locked ? locked.x : coords.x,
+          lockY: locked ? locked.y : coords.y,
+        })
+      }
       return
     }
     if (isInsertMode) {
@@ -679,14 +836,21 @@ export function StaffCanvas({
       setInsertHover(coords ? gapAtX(getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
-    if (isGlyphMode) {
+    if (isSharpshooterMode) {
       const coords = getCoords(e)
       setHoverMeasure(coords ? getMeasureIndexAtX(coords.x) : null)
       if (glyphEdit && coords) { setGlyphEdit({ ...glyphEdit, curX: coords.x, curY: coords.y }); return }
-      // fall through so the placement ghost cursor keeps following the mouse
+      if (slurEdit && coords) { setSlurEdit({ ...slurEdit, curX: coords.x, curY: coords.y }); return }
+      return
     }
     const coords = getCoords(e)
     if (!coords) return
+    const panelHeight = containerRef.current?.clientHeight ?? e.currentTarget.clientHeight
+    if (coords.y <= PANEL_EDGE_DEADBAND_PX || coords.y >= panelHeight - PANEL_EDGE_DEADBAND_PX) {
+      setHoverInfo(null)
+      setKeyboardCursor(null)
+      return
+    }
     // Mouse moving resets any keyboard adjustment — mouse has priority again.
     setKeyboardCursor(null)
     const stepsDown = Math.round((coords.y - STAVE_TOP_Y) / (LINE_SPACING / 2))
@@ -710,10 +874,11 @@ export function StaffCanvas({
       // Pressing on a notehead selects/drag-moves it; pressing empty staff rubber-bands.
       const hit = noteHeadAt(coords.x, coords.y)
       if (hit) {
-        // Drag the whole current selection if the note is already in it, else grab just it.
-        const ids = selectedNoteIds?.has(hit.id) ? [...selectedNoteIds] : [hit.id]
-        if (!selectedNoteIds?.has(hit.id)) onSelectionChange?.(new Set([hit.id]))
-        setMoveDrag({ ids, hitId: hit.id, startY: coords.y, deltaSteps: 0 })
+        const hitKey = selKey(hit.note.id, hit.pitchIndex)
+        // Drag the whole current selection if this head is already in it, else grab just it.
+        const keys = selectedNoteIds?.has(hitKey) ? [...selectedNoteIds] : [hitKey]
+        if (!selectedNoteIds?.has(hitKey)) onSelectionChange?.(new Set([hitKey]))
+        setMoveDrag({ keys, hitKey, startY: coords.y, deltaSteps: 0 })
         return
       }
       isSelectingRef.current = true
@@ -727,8 +892,18 @@ export function StaffCanvas({
       markAt(coords.x, coords.y)
       return
     }
-    if (isGlyphMode) {
-      // Grabbing an accidental/dot handle starts a move; otherwise fall through to placement.
+    if (isBroomMode) {
+      broomingRef.current = true
+      pushBroom(coords.x, coords.y, true)
+      broomAt(coords.x, coords.y)
+      return
+    }
+    if (isSharpshooterMode) {
+      const slurHit = layout ? hitSlurHandle(layout.ties, coords.x, coords.y) : null
+      if (slurHit) {
+        setSlurEdit({ partId, ...slurHit, downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y })
+        return
+      }
       const g = layout ? hitGlyphHandle(layout.glyphs, coords.x, coords.y) : null
       const measureId = g ? measureIdForNote(g.noteId) : null
       if (g && measureId) {
@@ -740,15 +915,9 @@ export function StaffCanvas({
       }
     }
     if (!isTieMode) return
-    // Editing a placed slur takes priority over starting a new one.
-    const hit = layout ? hitSlurHandle(layout.ties, coords.x, coords.y) : null
-    if (hit) {
-      setSlurEdit({ partId, ...hit, downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y })
-      return
-    }
     const note = nearestNoteAtX(coords.x)
     if (!note) return
-    setTieDrag({ fromId: note.id, fromX: note.x, fromY: note.y, curX: coords.x, curY: coords.y })
+    setTieDrag({ fromId: note.id, fromX: note.x, fromY: note.y, curX: coords.x, curY: coords.y, lockId: null, lockX: coords.x, lockY: coords.y })
   }
 
   const endErase = () => {
@@ -776,20 +945,7 @@ export function StaffCanvas({
       }
       return
     }
-    if (isSelectMode) {
-      if (moveDrag) {
-        // No drag = a plain click: narrow the selection to the clicked note.
-        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
-        else onSelectionChange?.(new Set([moveDrag.hitId]))
-        setMoveDrag(null)
-        return
-      }
-      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
-      return
-    }
-    if (isDeleteMode) { endErase(); return }
-    if (!isTieMode) return
-    // Commit a slur handle drag.
+    // Commit a slur handle drag from sharpshooter mode.
     if (slurEdit) {
       const coords = getCoords(e) ?? { x: slurEdit.curX, y: slurEdit.curY }
       const current = ties.find(t => t.id === slurEdit.tieId)?.curve
@@ -798,6 +954,20 @@ export function StaffCanvas({
       dispatch({ type: 'UPDATE_TIE_CURVE', partId, tieId: slurEdit.tieId, curve: patch })
       return
     }
+    if (isSelectMode) {
+      if (moveDrag) {
+        // No drag = a plain click: narrow the selection to the clicked notehead.
+        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
+        else onSelectionChange?.(new Set([moveDrag.hitKey]))
+        setMoveDrag(null)
+        return
+      }
+      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      return
+    }
+    if (isDeleteMode) { endErase(); return }
+    if (isBroomMode) { if (broomingRef.current) commitBroom(); return }
+    if (!isTieMode) return
     if (!tieDrag) return
     const coords = getCoords(e)
     const target = coords ? nearestNoteAtX(coords.x) : null
@@ -818,18 +988,22 @@ export function StaffCanvas({
   const placeAt = (x: number, y: number, forceNew = false): string | null => {
     placementAppendedRef.current = false
     if (measures.length === 0) return null
+    const stepsDown = Math.round((y - STAVE_TOP_Y) / (LINE_SPACING / 2))
+    const snapY = staffStepToY(stepsDown, STAVE_Y)
     // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
     // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
     // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
     if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
-      const hit = noteHeadAt(x, y)
-      if (hit) { applyModifierToExistingNote(hit, y); return hit.id }
+      const hit = noteHeadAt(x, snapY)
+      if (hit) {
+        applyModifierToExistingNote(hit.note, snapY, hit.pitchIndex); return hit.note.id
+      }
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
       if (nearNote) {
         const measure = measures[nearNote.measureIndex]
         const ev = measure?.notes.find(n => n.id === nearNote.id)
-        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, y, STAVE_Y, clef)) {
-          applyModifierToExistingNote(nearNote, y)
+        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, snapY, STAVE_Y, clef)) {
+          applyModifierToExistingNote(nearNote, snapY)
           return nearNote.id
         }
       }
@@ -837,7 +1011,7 @@ export function StaffCanvas({
     if (!forceNew && !isRest) {
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
       if (nearNote) {
-        const pitch = staffYToPitch(y, STAVE_Y, clef)
+        const pitch = staffYToPitch(snapY, STAVE_Y, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
         const measure = measures[nearNote.measureIndex]
         if (measure) {
@@ -850,7 +1024,7 @@ export function StaffCanvas({
       }
       const nearRest = nearestRestAtX(x)
       if (nearRest) {
-        const pitch = staffYToPitch(y, STAVE_Y, clef)
+        const pitch = staffYToPitch(snapY, STAVE_Y, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
         const measure = measures[nearRest.measureIndex]
         if (measure) {
@@ -894,7 +1068,9 @@ export function StaffCanvas({
     const measure = measures[idx]
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, timeSig)) return null
+    if (!noteCanFit(measure, candidate, timeSig)) {
+      return null
+    }
     placementAppendedRef.current = true
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
@@ -902,7 +1078,7 @@ export function StaffCanvas({
       dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 } })
       onNotePlaced?.()
     } else {
-      const pitch = staffYToPitch(y, STAVE_Y, clef)
+      const pitch = staffYToPitch(snapY, STAVE_Y, clef)
       const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
       dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false } })
       onNotePlaced?.()
@@ -919,6 +1095,7 @@ export function StaffCanvas({
     if (suppressClickRef.current) { suppressClickRef.current = false; return }
     if (isSelectMode) return
     if (isDeleteMode) return
+    if (isBroomMode) return
     if (isFillMode) {
       const coords = getCoords(e)
       if (!coords) return
@@ -929,6 +1106,7 @@ export function StaffCanvas({
       return
     }
     if (isTieMode) return
+    if (isSharpshooterMode) return
 
     const coords = getCoords(e)
     if (!coords) return
@@ -1008,6 +1186,7 @@ export function StaffCanvas({
     }
   })()
 
+
   const measureOverlays = layout?.measures.map((g, i) => {
     const measure = measures[i]
     if (!measure) return null
@@ -1068,6 +1247,7 @@ export function StaffCanvas({
         if (glyphEdit) setGlyphEdit(null)
         if (!insertSession) setInsertHover(null)
         endErase()
+        if (broomingRef.current) commitBroom()
         if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
         if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
@@ -1078,26 +1258,64 @@ export function StaffCanvas({
         {measureOverlays}
         {tempoOverlays}
 
-        {/* Violet highlights for selected notes */}
-        {selectedNoteIds && layout?.notes.map(n => {
-          if (!selectedNoteIds.has(n.id)) return null
-          const dy = moveDrag && moveDrag.ids.includes(n.id) ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+        {/* Violet highlights for selected noteheads (per-pitch). */}
+        {selectedNoteIds && layout && (() => {
+          const byEvent = selectionByEvent(selectedNoteIds)
+          const moveByEvent = moveDrag ? selectionByEvent(new Set(moveDrag.keys)) : null
+          const moveDy = moveDrag ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+          return layout.notes.flatMap(n => {
+            const sel = byEvent.get(n.id)
+            if (!sel) return []
+            const dyFor = (i: number) =>
+              moveByEvent && isPitchSelected(moveByEvent, n.id, i) ? moveDy : 0
+            // Selected rest → highlight the whole glyph at its center.
+            if (n.type === 'rest' || sel === 'all') {
+              const topY = Math.min(...n.ys), botY = Math.max(...n.ys)
+              return [(
+                <div key={`sel-${n.id}`} className="absolute pointer-events-none"
+                  style={{ left: n.cx - 10, top: topY - 10 + dyFor(0), width: 20, height: (botY - topY) + 20,
+                    borderRadius: 10, background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18 }} />
+              )]
+            }
+            return [...sel].map(i => {
+              const hx = n.xs[i] ?? n.x, hy = n.ys[i]
+              return (
+                <div key={`sel-${n.id}-${i}`} className="absolute pointer-events-none"
+                  style={{ left: hx - 10, top: hy - 10 + dyFor(i), width: 20, height: 20,
+                    borderRadius: 10, background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18 }} />
+              )
+            })
+          })
+        })()}
+
+        {/* Grey ghost noteheads while dragging selected heads up/down — shows where the
+            heads will land (at their real displaced x) before they're committed. */}
+        {moveDrag && layout && (() => {
+          const byEvent = selectionByEvent(new Set(moveDrag.keys))
+          const dy = moveDrag.deltaSteps * (LINE_SPACING / 2)
           return (
-            <div
-              key={`sel-${n.id}`}
-              className="absolute pointer-events-none rounded-full"
-              style={{
-                left: n.x - 10,
-                top: n.y - 10 + dy,
-                width: 20,
-                height: 20,
-                background: 'rgba(139,92,246,0.30)',
-                boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)',
-                zIndex: 18,
-              }}
-            />
+            <svg
+              className="absolute pointer-events-none"
+              style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 19, overflow: 'visible' }}
+            >
+              {layout.notes.flatMap(n => {
+                if (n.type !== 'note') return []
+                return n.ys.flatMap((y, i) => {
+                  if (!isPitchSelected(byEvent, n.id, i)) return []
+                  const hx = n.xs[i] ?? n.x
+                  return [(
+                    <ellipse
+                      key={`drag-${n.id}-${i}`}
+                      cx={hx} cy={y + dy} rx={6} ry={4.5}
+                      transform={`rotate(-20 ${hx} ${y + dy})`}
+                      fill="rgba(120,120,120,0.55)"
+                    />
+                  )]
+                })
+              })}
+            </svg>
           )
-        })}
+        })()}
 
         {/* Rubber-band selection box */}
         {isSelectMode && selectionBox && (
@@ -1123,15 +1341,18 @@ export function StaffCanvas({
           const isMarked = markedIds.has(n.id)
           const isPending = pendingRestIds?.has(n.id)
           if (!isMarked && !isPending) return null
+          const topY = Math.min(...n.ys)
+          const botY = Math.max(...n.ys)
           return (
             <div
               key={`red-${n.id}`}
-              className="absolute pointer-events-none rounded-full"
+              className="absolute pointer-events-none"
               style={{
-                left: n.x - 10,
-                top: n.y - 10,
+                left: n.cx - 10,
+                top: topY - 10,
                 width: 20,
-                height: 20,
+                height: (botY - topY) + 20,
+                borderRadius: 10,
                 background: 'rgba(239,68,68,0.30)',
                 boxShadow: '0 0 10px 4px rgba(239,68,68,0.35)',
                 zIndex: 18,
@@ -1155,22 +1376,36 @@ export function StaffCanvas({
           />
         )}
 
-        {tieDrag && (
-          <svg
-            className="absolute pointer-events-none"
-            style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}
-          >
-            <line
-              x1={tieDrag.fromX} y1={tieDrag.fromY}
-              x2={tieDrag.curX} y2={tieDrag.curY}
-              stroke="rgba(139,92,246,0.8)" strokeWidth={2} strokeDasharray="4 3"
-            />
-            <circle cx={tieDrag.fromX} cy={tieDrag.fromY} r={4} fill="rgba(139,92,246,0.9)" />
-          </svg>
-        )}
+        {tieDrag && (() => {
+          // Both ends ride a notehead: the source, and the nearest note under the
+          // cursor (lockX/lockY). Draw the slur as a grey arc bulging up — the shape
+          // it will engrave to — instead of a raw straight line.
+          const x1 = tieDrag.fromX, y1 = tieDrag.fromY
+          const x2 = tieDrag.lockX, y2 = tieDrag.lockY
+          const mx = (x1 + x2) / 2
+          const my = Math.min(y1, y2) - 28
+          const locked = tieDrag.lockId !== null
+          return (
+            <svg
+              className="absolute pointer-events-none"
+              style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}
+            >
+              <path
+                d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`}
+                fill="none"
+                stroke="rgba(120,120,120,0.7)"
+                strokeWidth={2.5}
+                strokeLinecap="round"
+                strokeDasharray={locked ? undefined : '4 3'}
+              />
+              <circle cx={x1} cy={y1} r={4} fill="rgba(120,120,120,0.8)" />
+              <circle cx={x2} cy={y2} r={4} fill={locked ? 'rgba(120,120,120,0.8)' : 'rgba(120,120,120,0.4)'} />
+            </svg>
+          )
+        })()}
 
         {/* Replace-on-rest target: ring the rest the next click will overwrite. */}
-        {activeHover?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+        {activeHover?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
@@ -1186,7 +1421,7 @@ export function StaffCanvas({
         )}
 
         {/* Replace-on-note target (rest mode): ring the note the next click will overwrite. */}
-        {activeHover?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+        {activeHover?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
@@ -1201,29 +1436,62 @@ export function StaffCanvas({
           />
         )}
 
-        {activeHover && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
-          <div
-            className="absolute pointer-events-none rounded-full"
-            style={{
-              left: activeHover.x - DOT_R,
-              top: activeHover.snapY - DOT_R,
-              width: DOT_R * 2,
-              height: DOT_R * 2,
-              background: activeHover.isChordTarget
-                ? 'rgba(251,191,36,0.85)'
-                : 'rgba(139,92,246,0.75)',
-              boxShadow: activeHover.isChordTarget
-                ? '0 0 14px 7px rgba(251,191,36,0.30)'
-                : '0 0 14px 7px rgba(139,92,246,0.35)',
-              zIndex: 20,
-            }}
-          />
+        {activeHover && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
+          ghost ? (
+            <>
+              {/* Keep the normal cursor dot visible as the ghost-note anchor point. */}
+              <div
+                className="absolute pointer-events-none rounded-full"
+                style={{
+                  left: activeHover.x - DOT_R,
+                  top: activeHover.snapY - DOT_R,
+                  width: DOT_R * 2,
+                  height: DOT_R * 2,
+                  background: activeHover.isChordTarget
+                    ? 'rgba(251,191,36,0.85)'
+                    : 'rgba(139,92,246,0.75)',
+                  boxShadow: activeHover.isChordTarget
+                    ? '0 0 14px 7px rgba(251,191,36,0.30)'
+                    : '0 0 14px 7px rgba(139,92,246,0.35)',
+                  zIndex: 19,
+                }}
+              />
+              {/* Grey held-note glyph, notehead centered on the snapped cursor. */}
+              <svg
+                className="absolute pointer-events-none"
+                style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 20, overflow: 'visible' }}
+              >
+                <g
+                  transform={`translate(${activeHover.x - ghost.anchorX} ${activeHover.snapY - ghost.anchorY})`}
+                  opacity={0.4}
+                  dangerouslySetInnerHTML={{ __html: ghost.html }}
+                />
+              </svg>
+            </>
+          ) : (
+            <div
+              className="absolute pointer-events-none rounded-full"
+              style={{
+                left: activeHover.x - DOT_R,
+                top: activeHover.snapY - DOT_R,
+                width: DOT_R * 2,
+                height: DOT_R * 2,
+                background: activeHover.isChordTarget
+                  ? 'rgba(251,191,36,0.85)'
+                  : 'rgba(139,92,246,0.75)',
+                boxShadow: activeHover.isChordTarget
+                  ? '0 0 14px 7px rgba(251,191,36,0.30)'
+                  : '0 0 14px 7px rgba(139,92,246,0.35)',
+                zIndex: 20,
+              }}
+            />
+          )
         )}
 
         {/* Slur edit handles (tie mode) — only for ties whose measure(s) the cursor
             is over, so handles don't clutter unrelated measures. The tie being
             dragged stays visible regardless. */}
-        {isTieMode && layout?.ties.flatMap(geo => {
+        {isSharpshooterMode && layout?.ties.flatMap(geo => {
           const editing = slurEdit?.tieId === geo.id
           const startM = getMeasureIndexAtX(geo.startX)
           const endM = getMeasureIndexAtX(geo.endX)
@@ -1257,7 +1525,7 @@ export function StaffCanvas({
 
         {/* Accidental/dot adjust handles — only for glyphs in the hovered measure, so they
             don't clutter the rest of the staff. The glyph being dragged follows the cursor. */}
-        {isGlyphMode && layout?.glyphs.map(g => {
+        {isSharpshooterMode && layout?.glyphs.map(g => {
           const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
           const note = layout.notes.find(n => n.id === g.noteId)
           const hovered = note != null && hoverMeasure === note.measureIndex
@@ -1294,6 +1562,31 @@ export function StaffCanvas({
               const op = Math.max(0, 1 - age)
               const r = 2 + op * 7
               const rgb = p.pressed ? '239,68,68' : '148,163,184'
+              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
+            })}
+          </svg>
+        )}
+
+        {/* Broom brush trail (yellow while sweeping, grey when passive) + swept marks */}
+        {isBroomMode && (
+          <svg
+            className="absolute pointer-events-none"
+            style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 30, overflow: 'visible' }}
+          >
+            {broomMarks.map(t => {
+              if (t.kind === 'tie') {
+                const geo = layout?.ties.find(g => g.id === t.tieId)
+                if (!geo) return null
+                // Highlight the whole arc, not just its apex.
+                return <path key={t.key} d={slurArcPath(geo)} fill="none" stroke="rgba(251,191,36,0.85)" strokeWidth={9} strokeLinecap="round" />
+              }
+              return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill="rgba(251,191,36,0.35)" stroke="rgba(251,191,36,0.9)" strokeWidth={1.5} />
+            })}
+            {broomTrail.map((p, i) => {
+              const age = (performance.now() - p.born) / TRAIL_MS
+              const op = Math.max(0, 1 - age)
+              const r = 2 + op * 7
+              const rgb = p.pressed ? '251,191,36' : '148,163,184'
               return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
             })}
           </svg>

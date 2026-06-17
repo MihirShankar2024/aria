@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, X } from 'lucide-react'
-import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
+import { renderStaff, type StaffLayout, type NoteGeometry, STAFF_HEIGHT } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
 import { noteBeatDuration } from '../../lib/beats'
 import type { Measure, TimeSig, KeySig, Duration, Accidental, Clef, NoteEvent, Pitch } from '../../types/score'
@@ -9,13 +9,22 @@ const STAVE_Y = 48
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20
 const EPS = 0.001
+// How far the physical mouse must move before it reclaims the cursor from
+// keyboard (arrow-key) navigation. Below this, jitter is ignored.
+const MOUSE_TAKEOVER_PX = 6
 
 const STAVE_TOP_Y = STAVE_Y + STAVE_TOP_OFFSET
 
-// The rendered staff SVG is tall (lots of headroom); crop to a thin window centred
-// on the staff lines so the scratch staff reads as a compact insert strip.
-const WINDOW_H = 96
+// The rendered staff SVG has asymmetric headroom: ~96px above the top staff
+// line but only ~48px below the bottom line. Crop the extra top headroom so the
+// padding above the staff matches the padding below (48/48), which also lifts
+// the staff content up inside the overlay. The container is translated up by
+// CROP_TOP so the cropped region is hidden cleanly.
 const CROP_TOP = 48
+const WINDOW_H = STAFF_HEIGHT - CROP_TOP
+// How far above the caller-provided `top` to lift the overlay so the scratch
+// staff lines visually align with the main staff (= the SVG's top headroom).
+const STAFF_LINES_OFFSET = STAVE_Y
 
 interface InsertStaffProps {
   /** Position of the overlay (main-canvas coordinates). */
@@ -80,6 +89,12 @@ export function InsertStaff({
   const hoverInfoRef = useRef(hoverInfo)
   hoverInfoRef.current = hoverInfo
   const mouseInStaffRef = useRef(false)
+  // Last raw pointer position, and the pointer position captured when keyboard
+  // navigation last took over. Browsers can't move the OS cursor, so instead we
+  // ignore tiny mouse jitter while a keyboard cursor is active — control only
+  // returns to the mouse once it moves past MOUSE_TAKEOVER_PX from that anchor.
+  const mouseScreenRef = useRef({ x: 0, y: 0 })
+  const kbAnchorRef = useRef<{ x: number; y: number } | null>(null)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -135,7 +150,17 @@ export function InsertStaff({
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     const coords = getCoords(e)
     if (!coords) return
-    // Mouse moving resets any keyboard adjustment — mouse has priority again.
+    mouseScreenRef.current = { x: e.clientX, y: e.clientY }
+    // While a keyboard cursor is active, ignore small pointer jitter so the
+    // keyboard position isn't lost the instant the mouse twitches. Only once
+    // the pointer travels past the takeover threshold does the mouse reclaim it.
+    if (keyboardCursorRef.current && kbAnchorRef.current) {
+      const dx = e.clientX - kbAnchorRef.current.x
+      const dy = e.clientY - kbAnchorRef.current.y
+      if (Math.hypot(dx, dy) < MOUSE_TAKEOVER_PX) return
+    }
+    // Mouse moved deliberately — it reclaims priority over the keyboard cursor.
+    kbAnchorRef.current = null
     setKeyboardCursor(null)
     const stepsDown = Math.round((coords.y - STAVE_TOP_Y) / (LINE_SPACING / 2))
     const snapY = staffStepToY(stepsDown, STAVE_Y)
@@ -209,6 +234,10 @@ export function InsertStaff({
       })()
       if (!baseCursor) return
 
+      // Anchor the takeover threshold to wherever the mouse currently sits, so
+      // subsequent jitter is measured from here (not from a stale anchor).
+      kbAnchorRef.current = { ...mouseScreenRef.current }
+
       switch (e.key) {
         case 'ArrowUp':
           e.preventDefault()
@@ -266,14 +295,18 @@ export function InsertStaff({
   return (
     <div
       className="absolute flex items-center gap-1.5"
-      style={{ left, top, zIndex: 40 }}
+      // Lift the overlay so the rendered staff lines (which sit STAFF_LINES_OFFSET
+      // px down inside the full-height SVG) align with the main staff at `top`.
+      style={{ left, top: top - STAFF_LINES_OFFSET, zIndex: 40 }}
       // Keep clicks inside the overlay from falling through to the staff beneath.
       onClick={e => e.stopPropagation()}
       onMouseDown={e => e.stopPropagation()}
     >
       <div
         className="rounded-md overflow-hidden shadow-lg cursor-crosshair"
-        style={{ border: `2px solid ${accent}`, background: bg, height: WINDOW_H }}
+        // Solid white base (so high notes/ledger lines stay legible even over the
+        // dark purple app background) with the full/not-full tint layered on top.
+        style={{ border: `2px solid ${accent}`, background: `linear-gradient(${bg}, ${bg}), #ffffff`, height: WINDOW_H }}
       >
         <div
           className="relative inline-block"
@@ -281,7 +314,7 @@ export function InsertStaff({
           onClick={handleClick}
           onMouseMove={handleMouseMove}
           onMouseEnter={() => { mouseInStaffRef.current = true }}
-          onMouseLeave={() => { mouseInStaffRef.current = false; setHoverInfo(null); setKeyboardCursor(null) }}
+          onMouseLeave={() => { mouseInStaffRef.current = false; kbAnchorRef.current = null; setHoverInfo(null); setKeyboardCursor(null) }}
         >
           <div ref={containerRef} />
           {activeHover && (
@@ -306,14 +339,14 @@ export function InsertStaff({
           title="Insert"
           onClick={() => onCommit(scratch)}
           disabled={scratch.length === 0}
-          className="h-7 w-7 grid place-items-center rounded-md border border-violet-500/30 bg-violet-500/15 text-violet-600 hover:bg-violet-500/25 disabled:opacity-30 transition-colors"
+          className="h-8 w-8 grid place-items-center rounded-md bg-violet-600 text-white shadow-md ring-1 ring-black/10 hover:bg-violet-700 disabled:opacity-40 transition-colors"
         >
           <Check className="h-4 w-4" />
         </button>
         <button
           title="Cancel"
           onClick={onCancel}
-          className="h-7 w-7 grid place-items-center rounded-md border border-zinc-400/30 bg-zinc-500/10 text-zinc-500 hover:bg-zinc-500/20 transition-colors"
+          className="h-8 w-8 grid place-items-center rounded-md bg-white text-zinc-700 shadow-md ring-1 ring-black/10 hover:bg-zinc-100 transition-colors"
         >
           <X className="h-4 w-4" />
         </button>

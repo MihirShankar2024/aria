@@ -23,9 +23,12 @@ const NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
 // "bleed" into each other and the noteheads. Loosen it for legible, well-separated
 // columns — VexFlow already arranges accidentals into Gould-style zig-zag columns; this
 // just gives those columns room to breathe. Applied once at module load.
-MetricsDefaults.Accidental.noteheadAccidentalPadding = 3
+// H8 runtime logs confirm intra-chord accidental/head collisions in dense sharp
+// stacks. Increase default accidental column separation and head clearance.
+MetricsDefaults.Accidental.noteheadAccidentalPadding = 12
+// Keep inter-accidental spacing close to default; the issue is head clearance.
 MetricsDefaults.Accidental.accidentalSpacing = 7
-MetricsDefaults.Accidental.leftPadding = 3
+MetricsDefaults.Accidental.leftPadding = 6
 
 function samePitch(a: Pitch, b: Pitch): boolean {
   return a.step === b.step && a.octave === b.octave && a.accidental === b.accidental
@@ -127,9 +130,20 @@ function noteheadCenterX(vn: StaveNote): number {
   }
 }
 
+// Per-notehead anchor x for every pitch of a chord, aligned 1:1 with getYs().
+// Seconds are displaced by ~a notehead width, which getAbsoluteX() reflects — so this
+// captures the real side-by-side positions. Rests (no heads) fall back to the anchor.
+function noteHeadXs(vn: StaveNote, ax: number): number[] {
+  try {
+    const heads = vn.noteHeads
+    if (heads.length) return heads.map(h => h.getAbsoluteX())
+  } catch { /* fall back to anchor below */ }
+  return [ax]
+}
+
 // Min clear gap (px) we guarantee between a note's right edge and the next note's
 // left-side accidentals — VexFlow's own minimum is too tight for dense clusters.
-const ACC_GAP = 6
+const ACC_GAP = 8
 
 // Horizontal extents of a note's full glyph — left-side accidentals/displaced heads,
 // and right-side dots/displaced heads — relative to its notehead anchor (getAbsoluteX).
@@ -372,7 +386,39 @@ function collectGlyphGeometry(vn: StaveNote, note: Note, out: GlyphGeometry[]): 
     const kind = mod instanceof VexAccidental ? 'accidental' : mod instanceof Dot ? 'dot' : null
     if (!kind) continue
     const bb = mod.getBoundingBox()
-    out.push({ noteId: note.id, pitchIndex: idx, kind, x: bb.getX() + bb.getW() / 2, y: bb.getY() + bb.getH() / 2 })
+    out.push({ noteId: note.id, pitchIndex: idx, kind, x: bb.getX() + bb.getW() / 2, y: bb.getY() + bb.getH() / 2, w: bb.getW(), h: bb.getH() })
+  }
+}
+
+// Detect accidental glyphs that intrude into any notehead zone of the same chord.
+// This catches dense stacked-seconds cases where VexFlow's column packing can still
+// visually crowd or overlap displaced heads.
+function collectIntraChordAccidentalConflicts(
+  vn: StaveNote,
+  note: Note,
+  measureIndex: number,
+  out: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }>,
+): void {
+  const headXs = noteHeadXs(vn, vn.getAbsoluteX())
+  const headYs = vn.getYs()
+  for (const mod of vn.getModifiers()) {
+    if (!(mod instanceof VexAccidental)) continue
+    const pIdx = mod.getIndex()
+    if (pIdx === undefined || note.pitches[pIdx] === undefined) continue
+    const bb = mod.getBoundingBox()
+    const accRight = bb.getX() + bb.getW()
+    for (let i = 0; i < headXs.length; i++) {
+      const hx = headXs[i]
+      const hy = headYs[i]
+      // Only compare against heads on nearby staff rows.
+      if (Math.abs((bb.getY() + bb.getH() / 2) - hy) > 8) continue
+      // Approximate notehead left edge from its center anchor.
+      const headLeft = hx - 5
+      const overlapPx = accRight - headLeft
+      if (overlapPx > 0.5) {
+        out.push({ noteId: note.id, measureIndex, pitchIndex: pIdx, headIndex: i, overlapPx: Number(overlapPx.toFixed(2)) })
+      }
+    }
   }
 }
 
@@ -421,6 +467,7 @@ export interface NoteGeometry {
   rightX: number       // true right edge incl. dots/displaced heads
   y: number            // notehead y in SVG px (primary/lowest pitch for chords)
   ys: number[]         // every notehead y (all pitches of a chord) for hit testing
+  xs: number[]         // every notehead x (incl. displaced 2nds), aligned 1:1 with ys
   measureIndex: number
 }
 
@@ -439,6 +486,8 @@ export interface GlyphGeometry {
   kind: 'accidental' | 'dot'
   x: number
   y: number
+  w?: number
+  h?: number
 }
 
 // Drawn shape of a slur/tie, used to place drag handles when editing.
@@ -535,6 +584,7 @@ export function renderStaff({
   const geometry: MeasureGeometry[] = []
   const noteGeometry: NoteGeometry[] = []
   const glyphGeometry: GlyphGeometry[] = []
+  const intraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }> = []
   const tempoMarkGeometry: TempoMarkGeometry[] = []
   const vexById = new Map<string, StaveNote>()
   let x = LEFT_MARGIN
@@ -612,9 +662,13 @@ export function renderStaff({
           rightX: ax + ext.rightExt,
           y: ys[0] ?? staveY,
           ys: ys.length ? [...ys] : [staveY],
+          xs: noteHeadXs(vn, ax),
           measureIndex: idx,
         })
-        if (ev.type === 'note') collectGlyphGeometry(vn, ev, glyphGeometry)
+        if (ev.type === 'note') {
+          collectGlyphGeometry(vn, ev, glyphGeometry)
+          collectIntraChordAccidentalConflicts(vn, ev, idx, intraChordConflicts)
+        }
       })
     }
 
@@ -747,6 +801,8 @@ export function renderGrandStaff({
   const bassNoteGeometry: NoteGeometry[] = []
   const trebleGlyphGeometry: GlyphGeometry[] = []
   const bassGlyphGeometry: GlyphGeometry[] = []
+  const trebleIntraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }> = []
+  const bassIntraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }> = []
   const trebleVexById = new Map<string, StaveNote>()
   const bassVexById   = new Map<string, StaveNote>()
 
@@ -835,8 +891,11 @@ export function renderGrandStaff({
         const tys = vn.getYs()
         const tax = vn.getAbsoluteX()
         const text = noteExtents(vn)
-        trebleNoteGeometry.push({ id: ev.id, type: ev.type, x: tax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: tax - text.accLeft, rightX: tax + text.rightExt, y: tys[0] ?? GRAND_TREBLE_Y, ys: tys.length ? [...tys] : [GRAND_TREBLE_Y], measureIndex: idx })
-        if (ev.type === 'note') collectGlyphGeometry(vn, ev, trebleGlyphGeometry)
+        trebleNoteGeometry.push({ id: ev.id, type: ev.type, x: tax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: tax - text.accLeft, rightX: tax + text.rightExt, y: tys[0] ?? GRAND_TREBLE_Y, ys: tys.length ? [...tys] : [GRAND_TREBLE_Y], xs: noteHeadXs(vn, tax), measureIndex: idx })
+        if (ev.type === 'note') {
+          collectGlyphGeometry(vn, ev, trebleGlyphGeometry)
+          collectIntraChordAccidentalConflicts(vn, ev, idx, trebleIntraChordConflicts)
+        }
       })
     }
 
@@ -856,8 +915,11 @@ export function renderGrandStaff({
         const bys = vn.getYs()
         const bax = vn.getAbsoluteX()
         const bext = noteExtents(vn)
-        bassNoteGeometry.push({ id: ev.id, type: ev.type, x: bax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: bax - bext.accLeft, rightX: bax + bext.rightExt, y: bys[0] ?? GRAND_BASS_Y, ys: bys.length ? [...bys] : [GRAND_BASS_Y], measureIndex: idx })
-        if (ev.type === 'note') collectGlyphGeometry(vn, ev, bassGlyphGeometry)
+        bassNoteGeometry.push({ id: ev.id, type: ev.type, x: bax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: bax - bext.accLeft, rightX: bax + bext.rightExt, y: bys[0] ?? GRAND_BASS_Y, ys: bys.length ? [...bys] : [GRAND_BASS_Y], xs: noteHeadXs(vn, bax), measureIndex: idx })
+        if (ev.type === 'note') {
+          collectGlyphGeometry(vn, ev, bassGlyphGeometry)
+          collectIntraChordAccidentalConflicts(vn, ev, idx, bassIntraChordConflicts)
+        }
       })
     }
 
@@ -921,21 +983,55 @@ function drawTies(
         if (vn) vn.getStemDirection() === 1 ? stemsUp++ : stemsDown++
       }
       const direction = ov?.direction ?? (stemsUp >= stemsDown ? 1 : -1)
-      const staveTie  = new StaveTie({ firstNote: first, lastNote: last, firstIndexes: [0], lastIndexes: [0] })
+
+      // Partial-chord matching: tie only pitches present in BOTH chords (pitch-exact).
+      // Each match maps a notehead index in `first` to its index in `last`. Pitches map to
+      // StaveNote keys in pitch-array order (see buildVexNote), so an array index IS the
+      // notehead index. Slurs (different pitches) and any case lacking note data fall back
+      // to the single-endpoint [0]->[0] tie.
+      let firstIndexes: number[] = [0]
+      let lastIndexes:  number[] = [0]
+      if (fromNote && toNote) {
+        const matchFirst: number[] = []
+        const matchLast:  number[] = []
+        fromNote.pitches.forEach((fp, fi) => {
+          const li = toNote.pitches.findIndex(tp => samePitch(fp, tp))
+          if (li >= 0) { matchFirst.push(fi); matchLast.push(li) }
+        })
+        if (matchFirst.length > 0) { firstIndexes = matchFirst; lastIndexes = matchLast }
+      }
+
+      const staveTie  = new StaveTie({ firstNote: first, lastNote: last, firstIndexes, lastIndexes })
       staveTie.setDirection(direction)
 
       const pixelSpan   = Math.abs(last.getAbsoluteX() - first.getAbsoluteX())
       const spanBasedCp = isTie ? 6 : pixelSpan < 60 ? 8 : pixelSpan < 180 ? 14 : 22
       const tolerance   = pixelSpan < 60 ? -2 : pixelSpan < 180 ? 0 : 3
 
-      // Endpoint Ys: flattened auto value plus any manual vertical shift.
+      // Per-notehead endpoint Ys. flattenedEndpointYs returns the full notehead arrays for
+      // ties (untouched) and a flattened index-0 for slurs. StaveTie.renderTie indexes these
+      // by firstIndexes/lastIndexes, so each tied pitch arches from its own notehead.
       const { firstYs: baseFirstYs, lastYs: baseLastYs } = flattenedEndpointYs(first, last, !!isTie)
       const flatFirstYs = [...baseFirstYs]
       const flatLastYs  = [...baseLastYs]
-      if (ov?.startDY) flatFirstYs[0] = (flatFirstYs[0] ?? 0) + ov.startDY
-      if (ov?.endDY)   flatLastYs[0]  = (flatLastYs[0]  ?? 0) + ov.endDY
+      // Manual vertical shift nudges every tied notehead uniformly.
+      if (ov?.startDY) for (const i of firstIndexes) flatFirstYs[i] = (flatFirstYs[i] ?? 0) + ov.startDY
+      if (ov?.endDY)   for (const i of lastIndexes)  flatLastYs[i]  = (flatLastYs[i]  ?? 0) + ov.endDY
       staveTie.getFirstYs = () => flatFirstYs
       staveTie.getLastYs  = () => flatLastYs
+
+      // Representative endpoint for hit-testing/drag handles: the outermost tied notehead on
+      // the side the arch bulges toward (top notehead for an upward tie, bottom for downward).
+      const repPick = (idxs: number[], ys: number[]): number => {
+        let best = idxs[0]
+        for (const i of idxs) {
+          const yi = ys[i] ?? 0, yb = ys[best] ?? 0
+          if (direction === 1 ? yi > yb : yi < yb) best = i
+        }
+        return best
+      }
+      const repFirstIdx = repPick(firstIndexes, flatFirstYs)
+      const repLastIdx  = repPick(lastIndexes,  flatLastYs)
 
       // Pull the end inward past the end note's leading accidental so the incoming
       // curve clears it instead of crossing over the glyph. Negligible heads ignored.
@@ -946,8 +1042,8 @@ function drawTies(
       if (ov?.startDX) staveTie.renderOptions.firstXShift = ov.startDX
       staveTie.renderOptions.lastXShift = (ov?.endDX ?? 0) - endAccShift
 
-      const firstY = flatFirstYs[0] ?? 0
-      const lastY  = flatLastYs[0]  ?? 0
+      const firstY = flatFirstYs[repFirstIdx] ?? 0
+      const lastY  = flatLastYs[repLastIdx]   ?? 0
       const firstX = first.getAbsoluteX()
       const spanPx = (last.getAbsoluteX() - firstX) || 1
       let contentBasedCp = 0

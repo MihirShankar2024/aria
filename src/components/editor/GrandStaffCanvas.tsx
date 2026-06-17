@@ -3,37 +3,58 @@ import {
   renderGrandStaff,
   type GrandStaffLayout,
   type NoteGeometry,
+  type TieGeometry,
   GRAND_TREBLE_Y,
   GRAND_BASS_Y,
   GRAND_STAFF_HEIGHT,
 } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, whichGrandStaffStave, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats } from '../../lib/beats'
+import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration } from '../../lib/beats'
 import { computeTieSpans } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
-import { slurHandlePoints, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
+import { slurHandlePoints, slurArcPath, hitSlurHandle, slurEditPatch, SLUR_HANDLE_R, type SlurEdit } from './slurEditing'
 import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEditing'
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
-import { applyRestErase } from '../../lib/rests'
+import { renderGhostNote, type GhostRender } from './ghostNote'
+import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
+import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
 import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20
+// Accidental columns can project far left; count only part of that width for chord
+// targeting so the stack zone doesn't become too sticky.
+const ACCIDENTAL_ZONE_WEIGHT = 0.75
+function chordProximityForBeats(beats: number): number {
+  if (beats <= 0.25) return 7   // sixteenth
+  if (beats <= 0.5) return 9    // eighth
+  if (beats < 1) return 12      // dotted eighth (0.75)
+  if (beats <= 1) return 15     // quarter
+  if (beats < 2) return 17      // dotted quarter (1.5)
+  return CHORD_PROXIMITY_X      // half and longer
+}
 const BRUSH_R = 15
 const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
+const NOTEHEAD_HIT_Y_TOL = 4  // px — keep half-step-above clicks from being mistaken as same head
 
 const TREBLE_TOP_Y    = GRAND_TREBLE_Y + STAVE_TOP_OFFSET
 const TREBLE_BOTTOM_Y = TREBLE_TOP_Y + 4 * LINE_SPACING
 const BASS_TOP_Y      = GRAND_BASS_Y + STAVE_TOP_OFFSET
 const BASS_BOTTOM_Y   = BASS_TOP_Y + 4 * LINE_SPACING
 const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
+const PANEL_EDGE_DEADBAND_PX = 10  // keep cursor from latching at panel extremes
 
 interface HoverInfo { x: number; snapY: number; stave: 'treble' | 'bass'; isChordTarget: boolean; restTarget: { x: number; y: number } | null; noteTarget: { x: number; y: number } | null }
-interface TieDrag { partId: string; fromId: string; fromX: number; fromY: number; curX: number; curY: number }
+interface TieDrag { partId: string; fromId: string; fromX: number; fromY: number; curX: number; curY: number; lockId: string | null; lockX: number; lockY: number }
+
+// An auxiliary glyph (accidental/dot) or tie swept by the broom, removed on release.
+type BroomTarget =
+  | { kind: 'glyph'; key: string; partId: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
+  | { kind: 'tie'; key: string; partId: string; tieId: string; x: number; y: number }
 
 // A chosen insertion point on a specific stave.
 interface InsertSession {
@@ -41,6 +62,15 @@ interface InsertSession {
   measureIndex: number
   gapIndex: number
   anchorX: number
+}
+
+interface KeyboardCursor {
+  stepsDown: number
+  x: number
+  measureIndex: number
+  stave: 'treble' | 'bass'
+  anchorId?: string
+  atEnd?: boolean
 }
 
 interface GrandStaffCanvasProps {
@@ -56,7 +86,9 @@ interface GrandStaffCanvasProps {
   isTieMode: boolean
   isFillMode: boolean
   isDeleteMode: boolean
+  isBroomMode: boolean
   isInsertMode: boolean
+  isSharpshooterMode?: boolean
   initialTempo?: number
   tempoChanges?: { measureNumber: number; tempo: number }[]
   forcedStaveWidths?: number[]
@@ -86,7 +118,9 @@ export function GrandStaffCanvas({
   isTieMode,
   isFillMode,
   isDeleteMode,
+  isBroomMode,
   isInsertMode,
+  isSharpshooterMode = false,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -99,7 +133,6 @@ export function GrandStaffCanvas({
   onTieComplete,
   onFillComplete,
   onInsertComplete,
-  onRestsCommitted,
   onPlaybackLayoutChange,
 }: GrandStaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -120,13 +153,35 @@ export function GrandStaffCanvas({
   const isSelectingRef = useRef(false)
   // Drag-move of selected notes in select mode (started on a notehead). deltaSteps is
   // the snapped vertical staff-position offset (down = positive) since the press.
-  const [moveDrag, setMoveDrag] = useState<{ ids: string[]; hitId: string; startY: number; deltaSteps: number } | null>(null)
+  const [moveDrag, setMoveDrag] = useState<{ keys: string[]; hitKey: string; startY: number; deltaSteps: number } | null>(null)
+  // Grey "held note/rest" glyph that rides the cursor in placement mode.
+  const [ghost, setGhost] = useState<GhostRender | null>(null)
+  const [keyboardCursor, setKeyboardCursor] = useState<KeyboardCursor | null>(null)
+  const mouseInStaffRef = useRef(false)
+  const layoutRef = useRef<GrandStaffLayout | null>(null)
+  layoutRef.current = layout
+  const hoverInfoRef = useRef<HoverInfo | null>(null)
+  hoverInfoRef.current = hoverInfo
+  const isSelectModeRef = useRef(isSelectMode)
+  isSelectModeRef.current = isSelectMode
+  const keyboardCursorRef = useRef<KeyboardCursor | null>(keyboardCursor)
+  keyboardCursorRef.current = keyboardCursor
+  const trebleMeasuresRef = useRef(treblePart.measures)
+  trebleMeasuresRef.current = treblePart.measures
+  const bassMeasuresRef = useRef(bassPart.measures)
+  bassMeasuresRef.current = bassPart.measures
+  const timeSigRef = useRef(timeSig)
+  timeSigRef.current = timeSig
 
   const markingRef = useRef(false)
   const markedRef = useRef<Set<string>>(new Set())  // synchronous mirror of markedIds
   const clickCooldownRef = useRef(0)
   const pendingCenterRef = useRef<number | null>(null)
   const { trail, push: pushTrail } = useDeleteTrail(isDeleteMode)
+  const { trail: broomTrail, push: pushBroom } = useDeleteTrail(isBroomMode)
+  const broomRef = useRef<Map<string, BroomTarget>>(new Map())
+  const [broomMarks, setBroomMarks] = useState<BroomTarget[]>([])
+  const broomingRef = useRef(false)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -157,6 +212,26 @@ export function GrandStaffCanvas({
     })
   }, [layout, onPlaybackLayoutChange])
 
+  // Re-render the grey cursor ghost only when the selected note params change.
+  // Clef-independent glyph, so one render serves both staves.
+  useEffect(() => {
+    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode) {
+      setGhost(null)
+      return
+    }
+    const nextGhost = renderGhostNote({
+      duration: selectedDuration,
+      dotted: isDotted,
+      accidental: selectedAccidental,
+      isRest,
+      clef: 'treble',
+      timeSig,
+      keySig,
+    })
+    setGhost(nextGhost)
+  }, [selectedDuration, isDotted, selectedAccidental, isRest, timeSig, keySig,
+      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
+
   // Smoothly recenter the active measure once it drifts into the right quarter.
   useEffect(() => {
     const idx = pendingCenterRef.current
@@ -179,6 +254,11 @@ export function GrandStaffCanvas({
     if (!isDeleteMode) { markingRef.current = false; markedRef.current = new Set(); setMarkedIds(new Set()) }
   }, [isDeleteMode])
 
+  // Leaving broom mode abandons any in-progress sweep.
+  useEffect(() => {
+    if (!isBroomMode) { broomingRef.current = false; broomRef.current = new Map(); setBroomMarks([]) }
+  }, [isBroomMode])
+
   // Leaving insert mode abandons any in-progress insertion.
   useEffect(() => {
     if (!isInsertMode) { setInsertSession(null); setInsertHover(null) }
@@ -186,24 +266,42 @@ export function GrandStaffCanvas({
 
   // Leaving tie mode abandons any in-progress slur drag or handle edit.
   useEffect(() => {
-    if (!isTieMode) { setTieDrag(null); setSlurEdit(null) }
+    if (!isTieMode) setTieDrag(null)
   }, [isTieMode])
 
   // Entering select mode drops the edit cursor so it doesn't stay frozen on the staff.
   useEffect(() => {
     if (isSelectMode) setHoverInfo(null)
+    if (isSelectMode) setKeyboardCursor(null)
   }, [isSelectMode])
 
-  // "Glyph adjust" mode: while an accidental or dot tool is active (and no other mode owns
-  // the canvas), existing accidental/dot glyphs in the hovered measure expose drag handles.
-  const isGlyphMode =
-    !isSelectMode && !isDeleteMode && !isFillMode && !isTieMode && !isInsertMode &&
-    (selectedAccidental !== null || isDotted)
-
-  // Leaving glyph mode abandons any in-progress glyph drag.
+  // Leaving sharpshooter mode abandons any in-progress handle drags.
   useEffect(() => {
-    if (!isGlyphMode) setGlyphEdit(null)
-  }, [isGlyphMode])
+    if (!isSharpshooterMode) { setGlyphEdit(null); setSlurEdit(null); return }
+    setHoverInfo(null)
+    setKeyboardCursor(null)
+  }, [isSharpshooterMode])
+
+  useEffect(() => {
+    if (!layout) return
+    const kc = keyboardCursorRef.current
+    if (!kc) return
+    const staveNotes = kc.stave === 'treble' ? layout.trebleNotes : layout.bassNotes
+    if (kc.anchorId) {
+      const note = staveNotes.find(n => n.id === kc.anchorId)
+      if (!note) return
+      if (Math.abs(note.cx - kc.x) > 0.5 || note.measureIndex !== kc.measureIndex) {
+        setKeyboardCursor({ ...kc, x: note.cx, measureIndex: note.measureIndex })
+      }
+      return
+    }
+    if (kc.atEnd) {
+      const g = layout.measures[kc.measureIndex]
+      if (!g) return
+      const endX = g.x + g.width - 16
+      if (Math.abs(endX - kc.x) > 0.5) setKeyboardCursor({ ...kc, x: endX })
+    }
+  }, [layout])
 
   const commitInsert = (events: NoteEvent[]) => {
     if (insertSession) {
@@ -236,14 +334,30 @@ export function GrandStaffCanvas({
   // Determine which stave a Y coordinate belongs to.
   const whichStave = (y: number): 'treble' | 'bass' => whichGrandStaffStave(y, GRAND_TREBLE_Y, GRAND_BASS_Y)
 
+  // Per-note chord radius lookup: shorter durations get a tighter zone.
+  const noteBeatsById = new Map<string, number>()
+  for (const meas of treblePart.measures) for (const ev of meas.notes) noteBeatsById.set(ev.id, noteBeatDuration(ev))
+  for (const meas of bassPart.measures) for (const ev of meas.notes) noteBeatsById.set(ev.id, noteBeatDuration(ev))
+  const chordProximityFor = (id: string) => chordProximityForBeats(noteBeatsById.get(id) ?? 1)
+
   const nearestNoteAtX = (notes: NoteGeometry[], x: number, maxDist = Infinity): NoteGeometry | null => {
+    const scaled = Number.isFinite(maxDist)
     let best: NoteGeometry | null = null
-    let bestDist = maxDist
+    let bestDist = Infinity
+    let bestCenterDist = Infinity
     for (const n of notes) {
       if (n.type !== 'note') continue
+      const weightedLeftX = n.x - (n.x - n.leftX) * ACCIDENTAL_ZONE_WEIGHT
       // Distance to the note's horizontal span (incl. accidentals), 0 when inside it.
-      const d = x < n.leftX ? n.leftX - x : x > n.rightX ? x - n.rightX : 0
-      if (d < bestDist) { bestDist = d; best = n }
+      const d = x < weightedLeftX ? weightedLeftX - x : x > n.rightX ? x - n.rightX : 0
+      const centerDist = Math.abs(n.cx - x)
+      const limit = scaled ? Math.min(maxDist, chordProximityFor(n.id)) : maxDist
+      if (d >= limit) continue
+      if (d < bestDist || (d === bestDist && centerDist < bestCenterDist)) {
+        bestDist = d
+        bestCenterDist = centerDist
+        best = n
+      }
     }
     return best
   }
@@ -259,18 +373,27 @@ export function GrandStaffCanvas({
     return best
   }
 
+  const notesForStave = (stave: 'treble' | 'bass') =>
+    stave === 'treble' ? layout?.trebleNotes ?? [] : layout?.bassNotes ?? []
+  const measuresForStave = (stave: 'treble' | 'bass') =>
+    stave === 'treble' ? trebleMeasuresRef.current : bassMeasuresRef.current
+  const staveOriginY = (stave: 'treble' | 'bass') =>
+    stave === 'treble' ? GRAND_TREBLE_Y : GRAND_BASS_Y
+
   // Find the note whose notehead sits directly under (x, y) on a stave — a precise
   // hit on the glyph (used by the dot/accidental click-to-apply path).
-  const noteHeadAt = (notes: NoteGeometry[], x: number, y: number): NoteGeometry | null => {
+  const noteHeadAt = (notes: NoteGeometry[], x: number, y: number): { note: NoteGeometry; pitchIndex: number } | null => {
     const r2 = NOTEHEAD_HIT_R * NOTEHEAD_HIT_R
-    let best: NoteGeometry | null = null
+    let best: { note: NoteGeometry; pitchIndex: number } | null = null
     let bestDist = r2
     for (const n of notes) {
       if (n.type !== 'note') continue
-      for (const ny of n.ys) {
-        const d = (n.x - x) * (n.x - x) + (ny - y) * (ny - y)
-        if (d <= bestDist) { bestDist = d; best = n }
-      }
+      n.ys.forEach((ny, i) => {
+        if (Math.abs(ny - y) > NOTEHEAD_HIT_Y_TOL) return
+        const hx = n.xs[i] ?? n.x
+        const d = (hx - x) * (hx - x) + (ny - y) * (ny - y)
+        if (d <= bestDist) { bestDist = d; best = { note: n, pitchIndex: i } }
+      })
     }
     return best
   }
@@ -278,7 +401,7 @@ export function GrandStaffCanvas({
   // Apply the active modifier tool(s) — dot and/or accidental — to an existing note,
   // the accidental landing on the chord tone at the clicked staff position. onNotePlaced
   // then clears the tool selection so it doesn't carry to the next placement.
-  const applyModifierToExistingNote = (part: Part, staveY: number, clef: 'treble' | 'bass', target: NoteGeometry, clickY: number) => {
+  const applyModifierToExistingNote = (part: Part, staveY: number, clef: 'treble' | 'bass', target: NoteGeometry, clickY: number, pitchIndex?: number) => {
     const measure = part.measures[target.measureIndex]
     if (!measure) return
     const ev = measure.notes.find(n => n.id === target.id)
@@ -286,12 +409,23 @@ export function GrandStaffCanvas({
     const patch: Partial<Note> = {}
     if (isDotted) patch.dots = 1
     if (selectedAccidental !== null) {
-      const clicked = staffYToPitch(clickY, staveY, clef)
-      patch.pitches = ev.pitches.map(p =>
-        p.step === clicked.step && p.octave === clicked.octave
-          ? { ...p, accidental: selectedAccidental }
-          : p,
-      )
+      if (pitchIndex !== undefined && ev.pitches[pitchIndex]) {
+        patch.pitches = ev.pitches.map((p, i) =>
+          i === pitchIndex ? { ...p, accidental: selectedAccidental } : p,
+        )
+      } else {
+        const clicked = staffYToPitch(clickY, staveY, clef)
+        patch.pitches = ev.pitches.map(p =>
+          p.step === clicked.step && p.octave === clicked.octave
+            ? { ...p, accidental: selectedAccidental }
+            : p,
+        )
+      }
+    }
+    if (patch.pitches && patch.pitches.every((p, i) =>
+      p.step === ev.pitches[i].step && p.octave === ev.pitches[i].octave && p.accidental === ev.pitches[i].accidental,
+    )) {
+      delete patch.pitches
     }
     if (Object.keys(patch).length === 0) return
     pendingCenterRef.current = target.measureIndex
@@ -337,7 +471,6 @@ export function GrandStaffCanvas({
     setMarkedIds(new Set())
     if (marked.size === 0 || !layout) return
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
-    const pending: PendingRest[] = []
     const removedIds: string[] = []
     const lanes: [NoteGeometry[], Part][] = [
       [layout.trebleNotes, treblePart],
@@ -355,16 +488,13 @@ export function GrandStaffCanvas({
         const measure = part.measures[mIdx]
         if (!measure) continue
         for (const id of ids) if (measure.notes.find(n => n.id === id)?.type === 'note') removedIds.push(id)
-        // Keep already-pending red rests in this measure highlighted across deletes.
-        for (const ev of measure.notes) if (pendingRestIds?.has(ev.id)) ids.add(ev.id)
-        const { notes: newNotes, redRestIds } = applyRestErase(measure.notes, ids, measure.timeSig ?? timeSig)
+        // Remove marked notes entirely and shift the remainder left (no in-place rests).
+        const newNotes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), measure.timeSig ?? timeSig)
         edits.push({ partId: part.id, measureId: measure.id, notes: newNotes })
-        if (redRestIds.length) pending.push({ partId: part.id, measureId: measure.id, restIds: redRestIds })
       }
     }
     if (edits.length === 0) return
     dispatch({ type: 'APPLY_MEASURE_NOTES', edits, removedIds })
-    onRestsCommitted?.(pending)
   }
 
   const allTieHandles = (): { partId: string; ties: NonNullable<typeof layout>['trebleTies'] }[] =>
@@ -384,6 +514,66 @@ export function GrandStaffCanvas({
         ]
       : []
 
+  // Broom: mark only the auxiliary glyphs/ties actually under the brush at (x, y).
+  const broomAt = (x: number, y: number) => {
+    if (!layout) return
+    let added = false
+    for (const { part, glyphs } of allGlyphHandles()) {
+      for (const g of glyphs) {
+        if (Math.hypot(g.x - x, g.y - y) > BRUSH_R) continue
+        const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}`
+        if (broomRef.current.has(key)) continue
+        broomRef.current.set(key, { kind: 'glyph', key, partId: part.id, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, x: g.x, y: g.y })
+        added = true
+      }
+    }
+    for (const { partId, ties } of allTieHandles()) {
+      for (const geo of ties) {
+        const pts = slurHandlePoints(geo)
+        const near = (['start', 'end', 'apex'] as const).some(h => Math.hypot(pts[h].x - x, pts[h].y - y) <= BRUSH_R)
+        if (!near) continue
+        const key = `t:${geo.id}`
+        if (broomRef.current.has(key)) continue
+        broomRef.current.set(key, { kind: 'tie', key, partId, tieId: geo.id, x: pts.apex.x, y: pts.apex.y })
+        added = true
+      }
+    }
+    if (added) setBroomMarks([...broomRef.current.values()])
+  }
+
+  // On release, remove every swept glyph (accidental → null / dot → 0) and tie.
+  const commitBroom = () => {
+    broomingRef.current = false
+    const targets = [...broomRef.current.values()]
+    broomRef.current = new Map()
+    setBroomMarks([])
+    if (targets.length === 0) return
+    const parts = [treblePart, bassPart]
+    const glyphsByNote = new Map<string, BroomTarget[]>()
+    for (const t of targets) {
+      if (t.kind !== 'glyph') continue
+      const arr = glyphsByNote.get(t.noteId) ?? []
+      arr.push(t); glyphsByNote.set(t.noteId, arr)
+    }
+    for (const [noteId, gs] of glyphsByNote) {
+      const partId = gs[0].partId
+      const part = parts.find(p => p.id === partId)
+      const measure = part?.measures.find(m => m.notes.some(n => n.id === noteId))
+      const note = measure?.notes.find(n => n.id === noteId)
+      if (!part || !measure || !note || note.type !== 'note') continue
+      const patch: Partial<Note> = {}
+      if (gs.some(g => g.kind === 'glyph' && g.glyphKind === 'dot')) patch.dots = 0
+      const accIdx = new Set(gs.filter(g => g.kind === 'glyph' && g.glyphKind === 'accidental').map(g => (g as { pitchIndex: number }).pitchIndex))
+      if (accIdx.size > 0) {
+        patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+      }
+      if (Object.keys(patch).length) dispatch({ type: 'UPDATE_NOTE', partId, measureId: measure.id, noteId, patch })
+    }
+    for (const t of targets) {
+      if (t.kind === 'tie') dispatch({ type: 'REMOVE_TIE', partId: t.partId, tieId: t.tieId })
+    }
+  }
+
   const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
     isSelectingRef.current = false
     setSelectionBox(null)
@@ -399,45 +589,53 @@ export function GrandStaffCanvas({
     const ids = new Set<string>()
     for (const notes of [layout.trebleNotes, layout.bassNotes]) {
       for (const n of notes) {
-        if (n.x < minX || n.x > maxX) continue
-        if (n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+        if (n.type === 'rest') {
+          if (n.x >= minX && n.x <= maxX && n.ys.some(y => y >= minY && y <= maxY)) ids.add(n.id)
+          continue
+        }
+        n.ys.forEach((y, i) => {
+          const hx = n.xs[i] ?? n.x
+          if (hx >= minX && hx <= maxX && y >= minY && y <= maxY) ids.add(selKey(n.id, i))
+        })
       }
     }
     onSelectionChange?.(ids)
   }
 
   // A notehead hit on either stave (for click-select / drag-move in select mode).
-  const noteHeadAtAny = (x: number, y: number): NoteGeometry | null =>
+  const noteHeadAtAny = (x: number, y: number): { note: NoteGeometry; pitchIndex: number } | null =>
     noteHeadAt(layout?.trebleNotes ?? [], x, y) ?? noteHeadAt(layout?.bassNotes ?? [], x, y)
 
   // Snapped vertical staff-position delta (each line/space = one step), down = positive.
   const snapDeltaSteps = (y: number, startY: number) =>
     Math.round((y - startY) / (LINE_SPACING / 2))
 
-  // Commit a drag-move: shift every selected note diatonically by the snapped delta
+  // Commit a drag-move: shift every selected notehead diatonically by the snapped delta
   // (dragging down lowers pitch) across both parts, in one undo-able edit.
-  const commitMove = (drag: { ids: string[]; deltaSteps: number }) => {
+  const commitMove = (drag: { keys: string[]; deltaSteps: number }) => {
     if (drag.deltaSteps === 0) return
-    const idset = new Set(drag.ids)
+    const byEvent = selectionByEvent(new Set(drag.keys))
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+    const newKeys: string[] = []
     for (const part of [treblePart, bassPart]) {
       for (const measure of part.measures) {
-        if (!measure.notes.some(n => n.type === 'note' && idset.has(n.id))) continue
-        const notes = measure.notes.map(ev =>
-          ev.type === 'note' && idset.has(ev.id)
-            ? { ...ev, pitches: ev.pitches.map(p => diatonicStep(p, -drag.deltaSteps)) }
-            : ev,
-        )
-        edits.push({ partId: part.id, measureId: measure.id, notes })
+        if (!measure.notes.some(n => byEvent.has(n.id))) continue
+        const res = moveSelectedPitches(measure.notes, byEvent, p => diatonicStep(p, -drag.deltaSteps))
+        edits.push({ partId: part.id, measureId: measure.id, notes: res.notes })
+        newKeys.push(...res.newKeys)
       }
     }
-    if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+    if (edits.length) {
+      dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+      onSelectionChange?.(new Set(newKeys))  // re-key: heads kept selected at sorted indices
+    }
   }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isSelectMode) {
       const coords = getCoords(e)
       if (!coords) return
+      setHoverMeasure(getMeasureIndexAtX(coords.x))
       if (moveDrag) {
         const d = snapDeltaSteps(coords.y, moveDrag.startY)
         if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
@@ -453,6 +651,13 @@ export function GrandStaffCanvas({
       if (markingRef.current) markAt(coords.x, coords.y)
       return
     }
+    if (isBroomMode) {
+      const coords = getCoords(e)
+      if (!coords) return
+      pushBroom(coords.x, coords.y, broomingRef.current)
+      if (broomingRef.current) broomAt(coords.x, coords.y)
+      return
+    }
     if (isFillMode) {
       const coords = getCoords(e)
       setHoverMeasure(coords ? getMeasureIndexAtX(coords.x) : null)
@@ -462,8 +667,21 @@ export function GrandStaffCanvas({
       const coords = getCoords(e)
       if (!coords) { setHoverMeasure(null); return }
       setHoverMeasure(getMeasureIndexAtX(coords.x))
-      if (slurEdit) { setSlurEdit({ ...slurEdit, curX: coords.x, curY: coords.y }); return }
-      if (tieDrag) setTieDrag({ ...tieDrag, curX: coords.x, curY: coords.y })
+      if (tieDrag) {
+        // Lock the dragging end onto the nearest note on the source's stave, so the
+        // grey preview snaps exactly where the slur will land.
+        const srcNotes = tieDrag.partId === treblePart.id ? layout?.trebleNotes ?? [] : layout?.bassNotes ?? []
+        const target = nearestNoteAtX(srcNotes, coords.x)
+        const locked = target && target.id !== tieDrag.fromId ? target : null
+        setTieDrag({
+          ...tieDrag,
+          curX: coords.x,
+          curY: coords.y,
+          lockId: locked ? locked.id : null,
+          lockX: locked ? locked.x : coords.x,
+          lockY: locked ? locked.y : coords.y,
+        })
+      }
       return
     }
     if (isInsertMode) {
@@ -472,14 +690,22 @@ export function GrandStaffCanvas({
       setInsertHover(coords ? gapAtX(whichStave(coords.y), getMeasureIndexAtX(coords.x), coords.x) : null)
       return
     }
-    if (isGlyphMode) {
+    if (isSharpshooterMode) {
       const c = getCoords(e)
       setHoverMeasure(c ? getMeasureIndexAtX(c.x) : null)
       if (glyphEdit && c) { setGlyphEdit({ ...glyphEdit, curX: c.x, curY: c.y }); return }
-      // fall through so the placement ghost cursor keeps following the mouse
+      if (slurEdit && c) { setSlurEdit({ ...slurEdit, curX: c.x, curY: c.y }); return }
+      return
     }
     const coords = getCoords(e)
     if (!coords) return
+    const panelHeight = containerRef.current?.clientHeight ?? e.currentTarget.clientHeight
+    if (coords.y <= PANEL_EDGE_DEADBAND_PX || coords.y >= panelHeight - PANEL_EDGE_DEADBAND_PX) {
+      setHoverInfo(null)
+      setKeyboardCursor(null)
+      return
+    }
+    setKeyboardCursor(null)
     const stave = whichStave(coords.y)
     const staveY = stave === 'treble' ? GRAND_TREBLE_Y : GRAND_BASS_Y
     const stepsDown = Math.round((coords.y - (staveY + STAVE_TOP_OFFSET)) / (LINE_SPACING / 2))
@@ -502,9 +728,10 @@ export function GrandStaffCanvas({
       // Pressing on a notehead selects/drag-moves it; pressing empty staff rubber-bands.
       const hit = noteHeadAtAny(coords.x, coords.y)
       if (hit) {
-        const ids = selectedNoteIds?.has(hit.id) ? [...selectedNoteIds] : [hit.id]
-        if (!selectedNoteIds?.has(hit.id)) onSelectionChange?.(new Set([hit.id]))
-        setMoveDrag({ ids, hitId: hit.id, startY: coords.y, deltaSteps: 0 })
+        const hitKey = selKey(hit.note.id, hit.pitchIndex)
+        const keys = selectedNoteIds?.has(hitKey) ? [...selectedNoteIds] : [hitKey]
+        if (!selectedNoteIds?.has(hitKey)) onSelectionChange?.(new Set([hitKey]))
+        setMoveDrag({ keys, hitKey, startY: coords.y, deltaSteps: 0 })
         return
       }
       isSelectingRef.current = true
@@ -518,8 +745,20 @@ export function GrandStaffCanvas({
       markAt(coords.x, coords.y)
       return
     }
-    if (isGlyphMode) {
-      // Grabbing an accidental/dot handle starts a move; otherwise fall through to placement.
+    if (isBroomMode) {
+      broomingRef.current = true
+      pushBroom(coords.x, coords.y, true)
+      broomAt(coords.x, coords.y)
+      return
+    }
+    if (isSharpshooterMode) {
+      for (const { partId, ties } of allTieHandles()) {
+        const sh = hitSlurHandle(ties, coords.x, coords.y)
+        if (sh) {
+          setSlurEdit({ partId, ...sh, downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y })
+          return
+        }
+      }
       for (const { part, glyphs } of allGlyphHandles()) {
         const g = hitGlyphHandle(glyphs, coords.x, coords.y)
         if (!g) continue
@@ -534,20 +773,12 @@ export function GrandStaffCanvas({
       }
     }
     if (!isTieMode) return
-    // Editing a placed slur takes priority over starting a new one.
-    for (const { partId, ties } of allTieHandles()) {
-      const hit = hitSlurHandle(ties, coords.x, coords.y)
-      if (hit) {
-        setSlurEdit({ partId, ...hit, downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y })
-        return
-      }
-    }
     const stave = whichStave(coords.y)
     const notes = stave === 'treble' ? layout?.trebleNotes ?? [] : layout?.bassNotes ?? []
     const note = nearestNoteAtX(notes, coords.x)
     if (!note) return
     const partId = stave === 'treble' ? treblePart.id : bassPart.id
-    setTieDrag({ partId, fromId: note.id, fromX: note.x, fromY: note.y, curX: coords.x, curY: coords.y })
+    setTieDrag({ partId, fromId: note.id, fromX: note.x, fromY: note.y, curX: coords.x, curY: coords.y, lockId: null, lockX: coords.x, lockY: coords.y })
   }
 
   const endErase = () => {
@@ -576,19 +807,7 @@ export function GrandStaffCanvas({
       }
       return
     }
-    if (isSelectMode) {
-      if (moveDrag) {
-        // No drag = a plain click: narrow the selection to the clicked note.
-        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
-        else onSelectionChange?.(new Set([moveDrag.hitId]))
-        setMoveDrag(null)
-        return
-      }
-      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
-      return
-    }
-    if (isDeleteMode) { endErase(); return }
-    if (!isTieMode) return
+    // Commit a slur handle drag from sharpshooter mode.
     if (slurEdit) {
       const coords = getCoords(e) ?? { x: slurEdit.curX, y: slurEdit.curY }
       const part = slurEdit.partId === treblePart.id ? treblePart : bassPart
@@ -598,6 +817,20 @@ export function GrandStaffCanvas({
       dispatch({ type: 'UPDATE_TIE_CURVE', partId: slurEdit.partId, tieId: slurEdit.tieId, curve: patch })
       return
     }
+    if (isSelectMode) {
+      if (moveDrag) {
+        // No drag = a plain click: narrow the selection to the clicked notehead.
+        if (moveDrag.deltaSteps !== 0) commitMove(moveDrag)
+        else onSelectionChange?.(new Set([moveDrag.hitKey]))
+        setMoveDrag(null)
+        return
+      }
+      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      return
+    }
+    if (isDeleteMode) { endErase(); return }
+    if (isBroomMode) { if (broomingRef.current) commitBroom(); return }
+    if (!isTieMode) return
     if (!tieDrag) return
     const coords = getCoords(e)
     const stave = coords ? whichStave(coords.y) : null
@@ -612,59 +845,37 @@ export function GrandStaffCanvas({
     onTieComplete?.()
   }
 
-  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    // A glyph-handle drag just finished — swallow the synthesized click so it doesn't place.
-    if (suppressClickRef.current) { suppressClickRef.current = false; return }
-    if (isSelectMode || isTieMode || isDeleteMode) return
-    const coords = getCoords(e)
-    if (!coords) return
-    const stave = whichStave(coords.y)
+  const placeAt = (x: number, y: number, forceNew = false) => {
+    if (isSharpshooterMode) return
+    const stave = whichStave(y)
     const staveY = stave === 'treble' ? GRAND_TREBLE_Y : GRAND_BASS_Y
     const part = stave === 'treble' ? treblePart : bassPart
     const notes = stave === 'treble' ? layout?.trebleNotes ?? [] : layout?.bassNotes ?? []
-    const idx = getMeasureIndexAtX(coords.x)
-
-    if (isFillMode) {
-      const measure = part.measures[idx]
-      if (!measure) return
-      dispatch({ type: 'FILL_MEASURE_RESTS', partId: part.id, measureId: measure.id })
-      onFillComplete?.()
-      return
-    }
-
-    // Insert mode: clicking a gap locks it and opens the scratch staff.
-    if (isInsertMode) {
-      if (insertSession) return  // already building — use ✓ / ✗
-      const session = gapAtX(stave, idx, coords.x)
-      const sPart = stave === 'treble' ? treblePart : bassPart
-      if (session && sPart.measures[session.measureIndex]) { setInsertSession(session); setInsertHover(null) }
-      return
-    }
-
+    const idx = getMeasureIndexAtX(x)
     const clef = stave === 'treble' ? 'treble' : 'bass'
+    const snapY = staffStepToY(
+      Math.round((y - (staveY + STAVE_TOP_OFFSET)) / (LINE_SPACING / 2)),
+      staveY,
+    )
 
-    // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
-    // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
-    // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
-    if (!isRest && (isDotted || selectedAccidental !== null)) {
-      const hit = noteHeadAt(notes, coords.x, coords.y)
-      if (hit) { applyModifierToExistingNote(part, staveY, clef, hit, coords.y); return }
-      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
+      const hit = noteHeadAt(notes, x, snapY)
+      if (hit) { applyModifierToExistingNote(part, staveY, clef, hit.note, snapY, hit.pitchIndex); return }
+      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
       if (nearNote) {
         const measure = part.measures[nearNote.measureIndex]
         const ev = measure?.notes.find(n => n.id === nearNote.id)
-        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, coords.y, staveY, clef)) {
-          applyModifierToExistingNote(part, staveY, clef, nearNote, coords.y)
+        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, snapY, staveY, clef)) {
+          applyModifierToExistingNote(part, staveY, clef, nearNote, snapY)
           return
         }
       }
     }
 
-    // Chord add
-    if (!isRest) {
-      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+    if (!forceNew && !isRest) {
+      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
       if (nearNote) {
-        const pitch = staffYToPitch(coords.y, staveY, stave === 'treble' ? 'treble' : 'bass')
+        const pitch = staffYToPitch(snapY, staveY, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
         const measure = part.measures[nearNote.measureIndex]
         if (measure) {
@@ -674,11 +885,9 @@ export function GrandStaffCanvas({
         }
         return
       }
-
-      // Replace-on-rest: click within CHORD_PROXIMITY_X of a rest → swap it for a note.
-      const nearRest = nearestRestAtX(notes, coords.x)
+      const nearRest = nearestRestAtX(notes, x)
       if (nearRest) {
-        const pitch = staffYToPitch(coords.y, staveY, stave === 'treble' ? 'treble' : 'bass')
+        const pitch = staffYToPitch(snapY, staveY, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
         const measure = part.measures[nearRest.measureIndex]
         if (measure) {
@@ -694,10 +903,8 @@ export function GrandStaffCanvas({
         }
         return
       }
-    } else {
-      // Rest mode: clicking an existing note replaces it with a rest — mirror of
-      // replacing a rest with a note above.
-      const nearNote = nearestNoteAtX(notes, coords.x, CHORD_PROXIMITY_X)
+    } else if (!forceNew) {
+      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
       if (nearNote) {
         const measure = part.measures[nearNote.measureIndex]
         if (measure) {
@@ -729,24 +936,191 @@ export function GrandStaffCanvas({
         rest: { id: crypto.randomUUID(), type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
       })
       onNotePlaced?.()
-    } else {
-      const pitch = staffYToPitch(coords.y, staveY, clef)
-      const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-      dispatch({
-        type: 'ADD_NOTE',
-        partId: part.id,
-        measureId: measure.id,
-        note: {
-          id: crypto.randomUUID(),
-          type: 'note',
-          pitches: [finalPitch],
-          duration: selectedDuration,
-          dots: isDotted ? 1 : 0,
-          tied: false,
-        },
-      })
-      onNotePlaced?.()
+      return
     }
+
+    const pitch = staffYToPitch(snapY, staveY, clef)
+    const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+    dispatch({
+      type: 'ADD_NOTE',
+      partId: part.id,
+      measureId: measure.id,
+      note: {
+        id: crypto.randomUUID(),
+        type: 'note',
+        pitches: [finalPitch],
+        duration: selectedDuration,
+        dots: isDotted ? 1 : 0,
+        tied: false,
+      },
+    })
+    onNotePlaced?.()
+  }
+
+  const previewNextSlotX = (stave: 'treble' | 'bass', mIdx: number): number => {
+    if (!layout) return keyboardCursor?.x ?? 0
+    const g = layout.measures[mIdx]
+    if (!g) return keyboardCursor?.x ?? 0
+    const endSlotX = g.x + g.width - 16
+    const notes = notesForStave(stave).filter(n => n.measureIndex === mIdx).sort((a, b) => a.cx - b.cx)
+    if (notes.length === 0) return g.x + 16
+    const events = measuresForStave(stave)[mIdx]?.notes ?? []
+    const eventById = new Map(events.map(ev => [ev.id, ev]))
+    const last = notes[notes.length - 1]
+    const lastEvent = eventById.get(last.id)
+    const lastBeats = lastEvent ? noteBeatDuration(lastEvent) : 1
+    let gap = 30 * lastBeats
+    if (notes.length >= 2) {
+      const first = notes[0]
+      let beatsToLast = 0
+      for (let i = 0; i < notes.length - 1; i++) {
+        const ev = eventById.get(notes[i].id)
+        beatsToLast += ev ? noteBeatDuration(ev) : 1
+      }
+      const perBeat = beatsToLast > 0 ? (last.cx - first.cx) / beatsToLast : 30
+      gap = perBeat * lastBeats
+    }
+    return Math.min(Math.max(last.cx + gap, last.cx + 18), endSlotX)
+  }
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!mouseInStaffRef.current) return
+      if (isSelectModeRef.current || isSharpshooterMode) return
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
+
+      const currentLayout = layoutRef.current
+      const hover = hoverInfoRef.current
+      const baseCursor = (() => {
+        if (keyboardCursorRef.current) return keyboardCursorRef.current
+        if (!hover || !currentLayout) return null
+        const baseY = staveOriginY(hover.stave) + STAVE_TOP_OFFSET
+        const stepsDown = Math.round((hover.snapY - baseY) / (LINE_SPACING / 2))
+        const mIdx = getMeasureIndexAtX(hover.x)
+        return { stepsDown, x: hover.x, measureIndex: mIdx, stave: hover.stave } as KeyboardCursor
+      })()
+      if (!baseCursor) return
+
+      switch (e.key) {
+        case 'ArrowUp':
+          e.preventDefault()
+          setKeyboardCursor({ ...baseCursor, stepsDown: baseCursor.stepsDown - 1 })
+          break
+        case 'ArrowDown':
+          e.preventDefault()
+          setKeyboardCursor({ ...baseCursor, stepsDown: baseCursor.stepsDown + 1 })
+          break
+        case 'ArrowLeft': {
+          e.preventDefault()
+          if (!currentLayout) break
+          const staveNotes = baseCursor.stave === 'treble' ? currentLayout.trebleNotes : currentLayout.bassNotes
+          const notesInM = staveNotes
+            .filter(n => n.measureIndex === baseCursor.measureIndex)
+            .sort((a, b) => a.x - b.x)
+          const prev = [...notesInM].reverse().find(n => n.cx < baseCursor.x - 1)
+          if (prev) {
+            setKeyboardCursor({ ...baseCursor, x: prev.cx, anchorId: prev.id, atEnd: false })
+            break
+          }
+          const prevG = currentLayout.measures[baseCursor.measureIndex - 1]
+          if (prevG) {
+            const prevNotes = staveNotes
+              .filter(n => n.measureIndex === baseCursor.measureIndex - 1)
+              .sort((a, b) => a.cx - b.cx)
+            const last = prevNotes[prevNotes.length - 1]
+            const targetX = last ? last.cx : prevG.x + prevG.width - 16
+            setKeyboardCursor({
+              ...baseCursor,
+              x: targetX,
+              measureIndex: baseCursor.measureIndex - 1,
+              anchorId: last?.id,
+              atEnd: !last,
+            })
+          }
+          break
+        }
+        case 'ArrowRight': {
+          e.preventDefault()
+          if (!currentLayout) break
+          const mIdx = baseCursor.measureIndex
+          const g = currentLayout.measures[mIdx]
+          const staveNotes = baseCursor.stave === 'treble' ? currentLayout.trebleNotes : currentLayout.bassNotes
+          const notesInM = staveNotes
+            .filter(n => n.measureIndex === mIdx)
+            .sort((a, b) => a.x - b.x)
+          const next = notesInM.find(n => n.cx > baseCursor.x + 1)
+          if (next) {
+            setKeyboardCursor({ ...baseCursor, x: next.cx, anchorId: next.id, atEnd: false })
+            break
+          }
+          const measureHere = measuresForStave(baseCursor.stave)[mIdx]
+          const full = measureHere ? isMeasureFull(measureHere, timeSigRef.current) : false
+          const endSlotX = g ? g.x + g.width - 16 : baseCursor.x
+          if (!full && !baseCursor.atEnd) {
+            setKeyboardCursor({ ...baseCursor, x: endSlotX, anchorId: undefined, atEnd: true })
+            break
+          }
+          const nextG = currentLayout.measures[mIdx + 1]
+          if (nextG) {
+            const nextNotes = staveNotes
+              .filter(n => n.measureIndex === mIdx + 1)
+              .sort((a, b) => a.cx - b.cx)
+            const first = nextNotes[0]
+            setKeyboardCursor({
+              ...baseCursor,
+              x: first ? first.cx : nextG.x + 16,
+              measureIndex: mIdx + 1,
+              anchorId: first?.id,
+              atEnd: false,
+            })
+          }
+          break
+        }
+        case 'Enter': {
+          e.preventDefault()
+          const snapY = staffStepToY(baseCursor.stepsDown, staveOriginY(baseCursor.stave))
+          placeAt(baseCursor.x, snapY, baseCursor.atEnd === true)
+          if (keyboardCursorRef.current) {
+            if (baseCursor.atEnd) setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+            else setKeyboardCursor({ ...baseCursor, anchorId: undefined })
+          }
+          break
+        }
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [isSharpshooterMode])
+
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // A glyph-handle drag just finished — swallow the synthesized click so it doesn't place.
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
+    if (isSelectMode || isTieMode || isDeleteMode || isBroomMode || isSharpshooterMode) return
+    const coords = getCoords(e)
+    if (!coords) return
+    const stave = whichStave(coords.y)
+    const part = stave === 'treble' ? treblePart : bassPart
+    const idx = getMeasureIndexAtX(coords.x)
+
+    if (isFillMode) {
+      const measure = part.measures[idx]
+      if (!measure) return
+      dispatch({ type: 'FILL_MEASURE_RESTS', partId: part.id, measureId: measure.id })
+      onFillComplete?.()
+      return
+    }
+
+    // Insert mode: clicking a gap locks it and opens the scratch staff.
+    if (isInsertMode) {
+      if (insertSession) return  // already building — use ✓ / ✗
+      const session = gapAtX(stave, idx, coords.x)
+      const sPart = stave === 'treble' ? treblePart : bassPart
+      if (session && sPart.measures[session.measureIndex]) { setInsertSession(session); setInsertHover(null) }
+      return
+    }
+
+    placeAt(coords.x, coords.y)
   }
 
   // Validity overlays for both staves
@@ -791,6 +1165,33 @@ export function GrandStaffCanvas({
     </div>
   ))
 
+  const activeHover: HoverInfo | null = (() => {
+    if (!keyboardCursor) return hoverInfo
+    const snapY = staffStepToY(keyboardCursor.stepsDown, staveOriginY(keyboardCursor.stave))
+    if (keyboardCursor.atEnd) {
+      return {
+        x: previewNextSlotX(keyboardCursor.stave, keyboardCursor.measureIndex),
+        snapY,
+        stave: keyboardCursor.stave,
+        isChordTarget: false,
+        restTarget: null,
+        noteTarget: null,
+      }
+    }
+    const notes = notesForStave(keyboardCursor.stave)
+    const nearNote = nearestNoteAtX(notes, keyboardCursor.x, CHORD_PROXIMITY_X)
+    const nearRest = nearNote ? null : nearestRestAtX(notes, keyboardCursor.x)
+    return {
+      x: keyboardCursor.x,
+      snapY,
+      stave: keyboardCursor.stave,
+      isChordTarget: !isRest && !!nearNote,
+      restTarget: !isRest && nearRest ? { x: nearRest.cx, y: nearRest.y } : null,
+      noteTarget: isRest && nearNote ? { x: nearNote.cx, y: nearNote.y } : null,
+    }
+  })()
+
+
   return (
     <div className="relative">
     <div
@@ -805,11 +1206,14 @@ export function GrandStaffCanvas({
       onMouseDown={handleMouseDown}
       onMouseUp={handleMouseUp}
       onMouseMove={handleMouseMove}
+      onMouseEnter={() => { mouseInStaffRef.current = true }}
       onMouseLeave={() => {
-        setHoverInfo(null); setTieDrag(null); setHoverMeasure(null)
+        mouseInStaffRef.current = false
+        setHoverInfo(null); setTieDrag(null); setHoverMeasure(null); setKeyboardCursor(null)
         if (glyphEdit) setGlyphEdit(null)
         if (!insertSession) setInsertHover(null)
         endErase()
+        if (broomingRef.current) commitBroom()
         if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
         if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
@@ -819,21 +1223,59 @@ export function GrandStaffCanvas({
         {measureOverlays}
         {tempoOverlays}
 
-        {/* Violet highlights for selected notes */}
-        {selectedNoteIds && layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {
-          if (!selectedNoteIds.has(n.id)) return null
-          const dy = moveDrag && moveDrag.ids.includes(n.id) ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+        {/* Violet highlights for selected noteheads (per-pitch). */}
+        {selectedNoteIds && layout && (() => {
+          const byEvent = selectionByEvent(selectedNoteIds)
+          const moveByEvent = moveDrag ? selectionByEvent(new Set(moveDrag.keys)) : null
+          const moveDy = moveDrag ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+          return [...layout.trebleNotes, ...layout.bassNotes].flatMap(n => {
+            const sel = byEvent.get(n.id)
+            if (!sel) return []
+            const dyFor = (i: number) =>
+              moveByEvent && isPitchSelected(moveByEvent, n.id, i) ? moveDy : 0
+            if (n.type === 'rest' || sel === 'all') {
+              const topY = Math.min(...n.ys), botY = Math.max(...n.ys)
+              return [(
+                <div key={`sel-${n.id}`} className="absolute pointer-events-none"
+                  style={{ left: n.cx - 10, top: topY - 10 + dyFor(0), width: 20, height: (botY - topY) + 20, borderRadius: 10,
+                    background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18 }} />
+              )]
+            }
+            return [...sel].map(i => {
+              const hx = n.xs[i] ?? n.x, hy = n.ys[i]
+              return (
+                <div key={`sel-${n.id}-${i}`} className="absolute pointer-events-none"
+                  style={{ left: hx - 10, top: hy - 10 + dyFor(i), width: 20, height: 20, borderRadius: 10,
+                    background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18 }} />
+              )
+            })
+          })
+        })()}
+
+        {/* Grey ghost noteheads while dragging selected heads up/down (real displaced x). */}
+        {moveDrag && layout && (() => {
+          const byEvent = selectionByEvent(new Set(moveDrag.keys))
+          const dy = moveDrag.deltaSteps * (LINE_SPACING / 2)
           return (
-            <div
-              key={`sel-${n.id}`}
-              className="absolute pointer-events-none rounded-full"
-              style={{
-                left: n.x - 10, top: n.y - 10 + dy, width: 20, height: 20,
-                background: 'rgba(139,92,246,0.30)', boxShadow: '0 0 10px 4px rgba(139,92,246,0.35)', zIndex: 18,
-              }}
-            />
+            <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 19, overflow: 'visible' }}>
+              {[...layout.trebleNotes, ...layout.bassNotes].flatMap(n => {
+                if (n.type !== 'note') return []
+                return n.ys.flatMap((y, i) => {
+                  if (!isPitchSelected(byEvent, n.id, i)) return []
+                  const hx = n.xs[i] ?? n.x
+                  return [(
+                    <ellipse
+                      key={`drag-${n.id}-${i}`}
+                      cx={hx} cy={y + dy} rx={6} ry={4.5}
+                      transform={`rotate(-20 ${hx} ${y + dy})`}
+                      fill="rgba(120,120,120,0.55)"
+                    />
+                  )]
+                })
+              })}
+            </svg>
           )
-        })}
+        })()}
 
         {/* Rubber-band selection box */}
         {isSelectMode && selectionBox && (
@@ -854,12 +1296,14 @@ export function GrandStaffCanvas({
         {/* Red highlights: marked-for-delete (during drag) and pending rests (after release) */}
         {layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {
           if (!markedIds.has(n.id) && !pendingRestIds?.has(n.id)) return null
+          const topY = Math.min(...n.ys)
+          const botY = Math.max(...n.ys)
           return (
             <div
               key={`red-${n.id}`}
-              className="absolute pointer-events-none rounded-full"
+              className="absolute pointer-events-none"
               style={{
-                left: n.x - 10, top: n.y - 10, width: 20, height: 20,
+                left: n.cx - 10, top: topY - 10, width: 20, height: (botY - topY) + 20, borderRadius: 10,
                 background: 'rgba(239,68,68,0.30)', boxShadow: '0 0 10px 4px rgba(239,68,68,0.35)', zIndex: 18,
               }}
             />
@@ -877,20 +1321,35 @@ export function GrandStaffCanvas({
           )
         })}
 
-        {tieDrag && (
-          <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}>
-            <line x1={tieDrag.fromX} y1={tieDrag.fromY} x2={tieDrag.curX} y2={tieDrag.curY} stroke="rgba(139,92,246,0.8)" strokeWidth={2} strokeDasharray="4 3" />
-            <circle cx={tieDrag.fromX} cy={tieDrag.fromY} r={4} fill="rgba(139,92,246,0.9)" />
-          </svg>
-        )}
+        {tieDrag && (() => {
+          // Both ends ride a notehead: the source, and the nearest note under the
+          // cursor (lockX/lockY). Draw the slur as a grey arc — the shape it will
+          // engrave to — rather than a straight line.
+          const x1 = tieDrag.fromX, y1 = tieDrag.fromY
+          const x2 = tieDrag.lockX, y2 = tieDrag.lockY
+          const mx = (x1 + x2) / 2
+          const my = Math.min(y1, y2) - 28
+          const locked = tieDrag.lockId !== null
+          return (
+            <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}>
+              <path
+                d={`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`}
+                fill="none" stroke="rgba(120,120,120,0.7)" strokeWidth={2.5} strokeLinecap="round"
+                strokeDasharray={locked ? undefined : '4 3'}
+              />
+              <circle cx={x1} cy={y1} r={4} fill="rgba(120,120,120,0.8)" />
+              <circle cx={x2} cy={y2} r={4} fill={locked ? 'rgba(120,120,120,0.8)' : 'rgba(120,120,120,0.4)'} />
+            </svg>
+          )
+        })()}
 
         {/* Replace-on-note target (rest mode): ring the note the next click will overwrite. */}
-        {hoverInfo?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+        {activeHover?.noteTarget && isRest && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
-              left: hoverInfo.noteTarget.x - 12,
-              top: hoverInfo.noteTarget.y - 16,
+              left: activeHover.noteTarget.x - 12,
+              top: activeHover.noteTarget.y - 16,
               width: 24,
               height: 32,
               border: '1.5px solid rgba(139,92,246,0.7)',
@@ -901,12 +1360,12 @@ export function GrandStaffCanvas({
         )}
 
         {/* Replace-on-rest target: ring the rest the next click will overwrite. */}
-        {hoverInfo?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
+        {activeHover?.restTarget && !isRest && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
           <div
             className="absolute pointer-events-none rounded-md"
             style={{
-              left: hoverInfo.restTarget.x - 12,
-              top: hoverInfo.restTarget.y - 16,
+              left: activeHover.restTarget.x - 12,
+              top: activeHover.restTarget.y - 16,
               width: 24,
               height: 32,
               border: '1.5px solid rgba(139,92,246,0.7)',
@@ -916,25 +1375,58 @@ export function GrandStaffCanvas({
           />
         )}
 
-        {hoverInfo && !isRest && !isTieMode && !isDeleteMode && !isInsertMode && !isSelectMode && (
-          <div
-            className="absolute pointer-events-none rounded-full"
-            style={{
-              left: hoverInfo.x - DOT_R,
-              top: hoverInfo.snapY - DOT_R,
-              width: DOT_R * 2,
-              height: DOT_R * 2,
-              background: hoverInfo.isChordTarget ? 'rgba(251,191,36,0.85)' : 'rgba(139,92,246,0.75)',
-              boxShadow: hoverInfo.isChordTarget ? '0 0 14px 7px rgba(251,191,36,0.30)' : '0 0 14px 7px rgba(139,92,246,0.35)',
-              zIndex: 20,
-            }}
-          />
+        {activeHover && !isTieMode && !isDeleteMode && !isBroomMode && !isInsertMode && !isSelectMode && !isSharpshooterMode && (
+          ghost ? (
+            <>
+              {/* Keep the normal cursor dot visible as the ghost-note anchor point. */}
+              <div
+                className="absolute pointer-events-none rounded-full"
+                style={{
+                  left: activeHover.x - DOT_R,
+                  top: activeHover.snapY - DOT_R,
+                  width: DOT_R * 2,
+                  height: DOT_R * 2,
+                  background: activeHover.isChordTarget
+                    ? 'rgba(251,191,36,0.85)'
+                    : 'rgba(139,92,246,0.75)',
+                  boxShadow: activeHover.isChordTarget
+                    ? '0 0 14px 7px rgba(251,191,36,0.30)'
+                    : '0 0 14px 7px rgba(139,92,246,0.35)',
+                  zIndex: 19,
+                }}
+              />
+              {/* Grey held-note glyph, notehead centered on the snapped cursor. */}
+              <svg
+                className="absolute pointer-events-none"
+                style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 20, overflow: 'visible' }}
+              >
+                <g
+                  transform={`translate(${activeHover.x - ghost.anchorX} ${activeHover.snapY - ghost.anchorY})`}
+                  opacity={0.4}
+                  dangerouslySetInnerHTML={{ __html: ghost.html }}
+                />
+              </svg>
+            </>
+          ) : !isRest && (
+            <div
+              className="absolute pointer-events-none rounded-full"
+              style={{
+                left: activeHover.x - DOT_R,
+                top: activeHover.snapY - DOT_R,
+                width: DOT_R * 2,
+                height: DOT_R * 2,
+                background: activeHover.isChordTarget ? 'rgba(251,191,36,0.85)' : 'rgba(139,92,246,0.75)',
+                boxShadow: activeHover.isChordTarget ? '0 0 14px 7px rgba(251,191,36,0.30)' : '0 0 14px 7px rgba(139,92,246,0.35)',
+                zIndex: 20,
+              }}
+            />
+          )
         )}
 
         {/* Slur edit handles (tie mode) — only for ties whose measure(s) the cursor
             is over, so handles don't clutter unrelated measures. The tie being
             dragged stays visible regardless. */}
-        {isTieMode && allTieHandles().flatMap(({ ties }) =>
+        {isSharpshooterMode && allTieHandles().flatMap(({ ties }) =>
           ties.flatMap(geo => {
             const editing = slurEdit?.tieId === geo.id
             const startM = getMeasureIndexAtX(geo.startX)
@@ -970,7 +1462,7 @@ export function GrandStaffCanvas({
 
         {/* Accidental/dot adjust handles — only for glyphs in the hovered measure. The
             glyph being dragged follows the cursor. */}
-        {isGlyphMode && allGlyphHandles().flatMap(({ glyphs, notes }) =>
+        {isSharpshooterMode && allGlyphHandles().flatMap(({ glyphs, notes }) =>
           glyphs.map(g => {
             const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
             const note = notes.find(n => n.id === g.noteId)
@@ -1006,6 +1498,32 @@ export function GrandStaffCanvas({
               const op = Math.max(0, 1 - age)
               const r = 2 + op * 7
               const rgb = p.pressed ? '239,68,68' : '148,163,184'
+              return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
+            })}
+          </svg>
+        )}
+
+        {/* Broom brush trail (yellow while sweeping, grey when passive) + swept marks */}
+        {isBroomMode && (
+          <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 30, overflow: 'visible' }}>
+            {(() => {
+              const tieGeoById = new Map<string, TieGeometry>()
+              for (const { ties } of allTieHandles()) for (const g of ties) tieGeoById.set(g.id, g)
+              return broomMarks.map(t => {
+                if (t.kind === 'tie') {
+                  const geo = tieGeoById.get(t.tieId)
+                  if (!geo) return null
+                  // Highlight the whole arc, not just its apex.
+                  return <path key={t.key} d={slurArcPath(geo)} fill="none" stroke="rgba(251,191,36,0.85)" strokeWidth={9} strokeLinecap="round" />
+                }
+                return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill="rgba(251,191,36,0.35)" stroke="rgba(251,191,36,0.9)" strokeWidth={1.5} />
+              })
+            })()}
+            {broomTrail.map((p, i) => {
+              const age = (performance.now() - p.born) / TRAIL_MS
+              const op = Math.max(0, 1 - age)
+              const r = 2 + op * 7
+              const rgb = p.pressed ? '251,191,36' : '148,163,184'
               return <circle key={`${p.born}-${i}`} cx={p.x} cy={p.y} r={r} fill={`rgba(${rgb},${op * 0.5})`} />
             })}
           </svg>

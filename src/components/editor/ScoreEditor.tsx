@@ -14,6 +14,7 @@ import { PlaybackBar } from '../playback/PlaybackBar'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { transposeChromatic } from '../../lib/transposition/transpose'
+import { selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
 import type { PendingRest } from './useDeleteTrail'
 import type { Part, Duration, Accidental, NoteEvent, Tie } from '../../types/score'
 
@@ -56,8 +57,10 @@ export function ScoreEditor() {
   const [isTieMode, setIsTieMode] = useState(false)
   const [isFillMode, setIsFillMode] = useState(false)
   const [isDeleteMode, setIsDeleteMode] = useState(false)
+  const [isBroomMode, setIsBroomMode] = useState(false)
   const [isInsertMode, setIsInsertMode] = useState(false)
   const [isSelectMode, setIsSelectMode] = useState(false)
+  const [isSharpshooterMode, setIsSharpshooterMode] = useState(false)
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
   const [pendingRests, setPendingRests] = useState<PendingRest[] | null>(null)
   const scrollSync = useScrollSync()
@@ -65,8 +68,20 @@ export function ScoreEditor() {
 
   const handlePlay = useCallback((sc: typeof score, selectedNoteIds?: Set<string>) => {
     if (status === 'stopped') scrollToStartIfNeeded(scrollSync)
-    play(sc, selectedNoteIds)
+    // Selection carries composite per-notehead keys; playback filters by event id, so
+    // collapse to the set of selected event ids (partial chords play as the whole event).
+    const eventIds = selectedNoteIds && selectedNoteIds.size > 0
+      ? new Set([...selectedNoteIds].map(k => parseSelKey(k).id))
+      : selectedNoteIds
+    play(sc, eventIds)
   }, [status, play, scrollSync])
+
+  // Accidentals are note-only — choosing one means the user intends a note, so drop
+  // out of rest mode. (Dots stay valid for rests, so they don't toggle rest off.)
+  const handleAccidentalChange = (a: Accidental) => {
+    setSelectedAccidental(a)
+    if (a !== null) setIsRest(false)
+  }
 
   // Refs so the (rarely re-subscribed) keydown handler reads current values.
   const pendingRef = useRef<PendingRest[] | null>(null)
@@ -121,16 +136,20 @@ export function ScoreEditor() {
         e.preventDefault()
         setIsSelectMode(prev => {
           const v = !prev
-          if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false) }
+          if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false) }
           if (!v) setSelectedNoteIds(new Set())
           return v
         })
         return
       }
-      // Tab confirm-collapses the pending red rests left behind by deletes.
+      // Tab toggles Sharpshooter mode. Shift+Tab keeps quick collapse for pending rests.
       if (e.key === 'Tab') {
         e.preventDefault()
-        if (pendingRef.current) collapsePending()
+        if (e.shiftKey) {
+          if (pendingRef.current) collapsePending()
+          return
+        }
+        enterSharpshooterMode(prev => !prev)
         return
       }
       switch (e.key) {
@@ -144,10 +163,11 @@ export function ScoreEditor() {
           e.preventDefault()
           setIsRest(prev => !prev)
           break
-        case 'f': setSelectedAccidental(prev => prev === 'flat' ? null : 'flat'); break
-        case 's': setSelectedAccidental(prev => prev === 'sharp' ? null : 'sharp'); break
-        case 'n': setSelectedAccidental(prev => prev === 'natural' ? null : 'natural'); break
+        case 'f': setSelectedAccidental(prev => { const next = prev === 'flat' ? null : 'flat'; if (next) setIsRest(false); return next }); break
+        case 's': setSelectedAccidental(prev => { const next = prev === 'sharp' ? null : 'sharp'; if (next) setIsRest(false); return next }); break
+        case 'n': setSelectedAccidental(prev => { const next = prev === 'natural' ? null : 'natural'; if (next) setIsRest(false); return next }); break
         case 't': enterTieMode(prev => !prev); break
+        case 'b': enterBroomMode(prev => !prev); break
         case 'i': enterInsertMode(prev => !prev); break
         case 'ArrowUp':
         case 'ArrowDown': {
@@ -158,20 +178,21 @@ export function ScoreEditor() {
           e.preventDefault()
           const semis = (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 12 : 1)
           const sc = scoreRef.current
-          const ids = selectedNoteIdsRef.current
+          const byEvent = selectionByEvent(selectedNoteIdsRef.current)
           const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+          const newKeys: string[] = []
           for (const part of sc.parts) {
             for (const measure of part.measures) {
-              if (!measure.notes.some(n => n.type === 'note' && ids.has(n.id))) continue
-              const notes = measure.notes.map(ev =>
-                ev.type === 'note' && ids.has(ev.id)
-                  ? { ...ev, pitches: ev.pitches.map(p => transposeChromatic(p, semis)) }
-                  : ev,
-              )
-              edits.push({ partId: part.id, measureId: measure.id, notes })
+              if (!measure.notes.some(n => byEvent.has(n.id))) continue
+              const res = moveSelectedPitches(measure.notes, byEvent, p => transposeChromatic(p, semis))
+              edits.push({ partId: part.id, measureId: measure.id, notes: res.notes })
+              newKeys.push(...res.newKeys)
             }
           }
-          if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+          if (edits.length) {
+            dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+            setSelectedNoteIds(new Set(newKeys))  // re-key after sort so heads stay selected
+          }
           break
         }
         case 'Escape':
@@ -179,11 +200,13 @@ export function ScoreEditor() {
             if (selectedNoteIdsRef.current.size > 0) setSelectedNoteIds(new Set())
             else enterSelectMode(false)
           } else {
-            // Exit any active tool mode (tie / fill / delete / insert).
+            // Exit any active tool mode (tie / fill / delete / broom / insert / sharpshooter).
             setIsTieMode(false)
             setIsFillMode(false)
             setIsDeleteMode(false)
+            setIsBroomMode(false)
             setIsInsertMode(false)
+            setIsSharpshooterMode(false)
           }
           break
         case 'Backspace':
@@ -192,14 +215,14 @@ export function ScoreEditor() {
           if (isSelectModeRef.current && selectedNoteIdsRef.current.size > 0) {
             // Delete using current score ref to avoid stale closure
             const sc = scoreRef.current
-            const ids = selectedNoteIdsRef.current
+            const byEvent = selectionByEvent(selectedNoteIdsRef.current)
             const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
             for (const part of sc.parts) {
               for (const measure of part.measures) {
-                if (!measure.notes.some(n => ids.has(n.id))) continue
-                // Remove selected notes entirely and shift the rest left
-                // (no in-place rests), like collapsePending.
-                const notes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), measure.timeSig ?? sc.globalTimeSig)
+                if (!measure.notes.some(n => byEvent.has(n.id))) continue
+                // Remove selected noteheads (emptied chords drop out), then shift the rest
+                // left (no in-place rests), like collapsePending.
+                const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), measure.timeSig ?? sc.globalTimeSig)
                 edits.push({ partId: part.id, measureId: measure.id, notes })
               }
             }
@@ -223,47 +246,62 @@ export function ScoreEditor() {
   const enterTieMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsTieMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterFillMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsFillMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterDeleteMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsDeleteMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsInsertMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      return v
+    })
+  }
+  const enterBroomMode = (next: boolean | ((p: boolean) => boolean)) => {
+    setIsBroomMode(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterInsertMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsInsertMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterSelectMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsSelectMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false) }
       if (!v) setSelectedNoteIds(new Set())
+      return v
+    })
+  }
+  const enterSharpshooterMode = (next: boolean | ((p: boolean) => boolean)) => {
+    setIsSharpshooterMode(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const deleteSelectedNotes = () => {
     if (selectedNoteIds.size === 0) return
+    const byEvent = selectionByEvent(selectedNoteIds)
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
     for (const part of score.parts) {
       for (const measure of part.measures) {
-        if (!measure.notes.some(n => selectedNoteIds.has(n.id))) continue
-        // Remove selected notes entirely and shift the rest left (no in-place rests).
-        const notes = normalizeMeasureRests(measure.notes.filter(n => !selectedNoteIds.has(n.id)), measure.timeSig ?? score.globalTimeSig)
+        if (!measure.notes.some(n => byEvent.has(n.id))) continue
+        // Remove selected noteheads (emptied chords drop out) and shift the rest left.
+        const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), measure.timeSig ?? score.globalTimeSig)
         edits.push({ partId: part.id, measureId: measure.id, notes })
       }
     }
@@ -311,8 +349,10 @@ export function ScoreEditor() {
     isTieMode,
     isFillMode,
     isDeleteMode,
+    isBroomMode,
     isInsertMode,
     isSelectMode,
+    isSharpshooterMode,
     selectedNoteIds,
     onSelectionChange: setSelectedNoteIds,
     initialTempo: score.tempo,
@@ -366,17 +406,21 @@ export function ScoreEditor() {
           isRest={isRest}
           onRestChange={setIsRest}
           selectedAccidental={selectedAccidental}
-          onAccidentalChange={setSelectedAccidental}
+          onAccidentalChange={handleAccidentalChange}
           isTieMode={isTieMode}
           onTieModeChange={enterTieMode}
           isFillMode={isFillMode}
           onFillModeChange={enterFillMode}
           isDeleteMode={isDeleteMode}
           onDeleteModeChange={enterDeleteMode}
+          isBroomMode={isBroomMode}
+          onBroomModeChange={enterBroomMode}
           isInsertMode={isInsertMode}
           onInsertModeChange={enterInsertMode}
           isSelectMode={isSelectMode}
           onSelectModeChange={enterSelectMode}
+          isSharpshooterMode={isSharpshooterMode}
+          onSharpshooterModeChange={enterSharpshooterMode}
           selectedNoteCount={selectedNoteIds.size}
           onDeleteSelected={deleteSelectedNotes}
           hasPendingRests={!!pendingRests}

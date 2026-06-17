@@ -37,6 +37,16 @@ export function slurHandlePoints(geo: TieGeometry): Record<SlurHandle, Point> {
   }
 }
 
+// SVG path for the slur/tie's drawn arc. Mirrors VexFlow's quadratic: the visual
+// peak sits at midY + direction*(VEX_Y_SHIFT + 0.5*cp1), so the quadratic control
+// point (peak = 0.5*mid + 0.5*cp) is midY + direction*(2*VEX_Y_SHIFT + cp1).
+export function slurArcPath(geo: TieGeometry): string {
+  const midX = (geo.startX + geo.endX) / 2
+  const midY = (geo.startY + geo.endY) / 2
+  const cpY = midY + geo.direction * (2 * VEX_Y_SHIFT + geo.cp1)
+  return `M ${geo.startX} ${geo.startY} Q ${midX} ${cpY} ${geo.endX} ${geo.endY}`
+}
+
 // Nearest handle to a point, if within grab radius. Apex wins ties so the arch is
 // easy to grab even when it overlaps an endpoint on short slurs.
 export function hitSlurHandle(

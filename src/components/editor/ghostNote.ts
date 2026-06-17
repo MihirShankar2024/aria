@@ -42,7 +42,7 @@ export function renderGhostNote(opts: GhostNoteOpts): GhostRender | null {
   const { duration, dotted, accidental, isRest, clef, timeSig, keySig } = opts
   // Neutral mid-staff pitch — pitch is irrelevant to the glyph shape, and the
   // caller re-centers the notehead on the cursor anyway.
-  const finalPitch: Pitch = { step: 'B', octave: clef === 'bass' ? 3 : 4, accidental }
+  const finalPitch: Pitch = { id: 'ghost-pitch', step: 'B', octave: clef === 'bass' ? 3 : 4, accidental }
   const ev: NoteEvent = isRest
     ? { id: 'ghost', type: 'rest', duration, dots: dotted ? 1 : 0 }
     : { id: 'ghost', type: 'note', pitches: [finalPitch], duration, dots: dotted ? 1 : 0, tied: false }

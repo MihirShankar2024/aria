@@ -49,7 +49,8 @@ export function mapSelectedPitches(
     if (ev.type !== 'note') return ev
     const sel = byEvent.get(ev.id)
     if (!sel) return ev
-    return { ...ev, pitches: ev.pitches.map((p, i) => (sel === 'all' || sel.has(i) ? fn(p) : p)) }
+    // Keep the source notehead id on the transformed pitch so ties/slurs follow the head.
+    return { ...ev, pitches: ev.pitches.map((p, i) => (sel === 'all' || sel.has(i) ? { ...fn(p), id: p.id } : p)) }
   })
 }
 
@@ -74,7 +75,8 @@ export function moveSelectedPitches(
     if (ev.type !== 'note') { newKeys.push(ev.id); return ev }  // selected rest stays selected
     const tagged = ev.pitches.map((p, i) => {
       const selected = sel === 'all' || sel.has(i)
-      return { pitch: selected ? fn(p) : p, selected }
+      // Keep the source notehead id on the transformed pitch so ties/slurs follow the head.
+      return { pitch: selected ? { ...fn(p), id: p.id } : p, selected }
     })
     tagged.sort((a, b) => pitchRank(a.pitch) - pitchRank(b.pitch))
     tagged.forEach((t, i) => { if (t.selected) newKeys.push(selKey(ev.id, i)) })

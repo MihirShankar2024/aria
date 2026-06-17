@@ -45,13 +45,6 @@ function eventDurationSeconds(event: NoteEvent, tempo: number): number {
   return beats * (event.dots > 0 ? 1.5 : 1) * (60 / tempo)
 }
 
-// Compare by *resolved* MIDI rather than written accidentals: a note tied
-// across a barline may drop its accidental yet sound the same pitch.
-function midisEqual(a: number[], b: number[]): boolean {
-  if (a.length !== b.length) return false
-  return a.every((m, i) => m === b[i])
-}
-
 // Returns the effective tempo at a given measure number.
 function getEffectiveTempo(score: Score, measureNumber: number): number {
   let tempo = score.tempo
@@ -100,8 +93,10 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
 
     // A tie continuation note (the `to`) inherits the sounding pitch of its
     // `from`, even across a barline where the accidental isn't re-written.
+    // Keyed by note id (ties are per-notehead now; accidental carry is matched below by
+    // pitch identity, so a slur to a different pitch still won't inherit anything).
     const tieFromOf = new Map<string, string>()
-    for (const tie of part.ties ?? []) tieFromOf.set(tie.to, tie.from)
+    for (const tie of part.ties ?? []) tieFromOf.set(tie.to.note, tie.from.note)
     // note id → resolved accidental offset per `${step}${octave}`. We carry the
     // *accidental* across a tie, keyed by pitch identity, so only a genuine tie
     // (same letter + octave) inherits it — a slur to a different pitch does not.
@@ -159,32 +154,49 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
       }
     }
 
-    // Apply tie rules: extend first note's duration across tied spans of identical pitch.
-    const extendedDuration = new Map<string, number>()
-    const skipped = new Set<string>()
-
-    for (const tie of part.ties ?? []) {
-      const fromIdx = scheduled.findIndex(s => s.note.id === tie.from)
-      const toIdx   = scheduled.findIndex(s => s.note.id === tie.to)
-      if (fromIdx === -1 || toIdx === -1 || fromIdx >= toIdx) continue
-
-      const spanned  = scheduled.slice(fromIdx, toIdx + 1)
-      const fromNote = spanned[0]
-
-      if (!spanned.every(s => midisEqual(s.midis, fromNote.midis))) continue
-
-      const combined = spanned.reduce((sum, s) => sum + s.duration, 0)
-      extendedDuration.set(fromNote.note.id, combined)
-      for (const s of spanned.slice(1)) skipped.add(s.note.id)
+    // ── Per-notehead tie sustain ──────────────────────────────────────────────
+    // Every notehead is its own voice. A genuine tie (the two heads resolve to the same
+    // sounding pitch) extends the earlier head's duration over its continuation and
+    // suppresses the continuation's re-attack; this chains (C–C–C). Slurs (different
+    // pitch) and untied heads play normally. Each head has at most one incoming and one
+    // outgoing tie (reducer dedups by head), so the tie graph is a set of simple chains.
+    interface Voice { noteId: string; midi: number; noteName: string; time: number; duration: number }
+    const headKey = (noteId: string, pitchId: string) => `${noteId}|${pitchId}`
+    const voiceByHead = new Map<string, Voice>()
+    for (const s of scheduled) {
+      s.note.pitches.forEach((p, i) => {
+        const midi = s.midis[i]
+        voiceByHead.set(headKey(s.note.id, p.id), {
+          noteId: s.note.id, midi,
+          noteName: Tone.Frequency(midi, 'midi').toNote(),
+          time: s.time, duration: s.duration,
+        })
+      })
     }
 
-    // Schedule on the transport (not via `+time`) so pause/resume halt and
-    // continue playback in lock-step. Trigger all pitches in a chord at once.
-    for (const { note, time, duration, midis } of scheduled) {
-      if (skipped.has(note.id)) continue
-      const dur = extendedDuration.get(note.id) ?? duration
-      const notes = midis.map(m => Tone.Frequency(m, 'midi').toNote())
-      transport.schedule(t => sampler.triggerAttackRelease(notes, dur, t), time)
+    // Link genuine ties head→head, and mark continuations so they aren't re-attacked.
+    const nextHead = new Map<string, string>()
+    const isContinuation = new Set<string>()
+    for (const tie of part.ties ?? []) {
+      const fromKey = headKey(tie.from.note, tie.from.pitch)
+      const toKey   = headKey(tie.to.note, tie.to.pitch)
+      const a = voiceByHead.get(fromKey)
+      const b = voiceByHead.get(toKey)
+      if (!a || !b || a.midi !== b.midi) continue  // missing head, or a slur → no merge
+      nextHead.set(fromKey, toKey)
+      isContinuation.add(toKey)
+    }
+
+    // Schedule one voice per head on the transport (not via `+time`) so pause/resume
+    // halt and continue in lock-step. Chain starts absorb their continuations' durations.
+    for (const [key, voice] of voiceByHead) {
+      if (isContinuation.has(key)) continue       // sounded as part of an earlier head
+      let dur = voice.duration
+      for (let cur = nextHead.get(key); cur; cur = nextHead.get(cur)) {
+        dur += voiceByHead.get(cur)!.duration
+      }
+      const { noteName, time } = voice
+      transport.schedule(t => sampler.triggerAttackRelease(noteName, dur, t), time)
     }
 
     totalTime = Math.max(totalTime, absTime)

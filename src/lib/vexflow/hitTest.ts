@@ -1,4 +1,5 @@
 import type { Pitch, Clef } from '../../types/score'
+import { newPitchId } from '../pitch'
 
 // VexFlow Stave internals: new Stave(x, y, width) places the TOP LINE at
 // y + spaceAboveStaffLn * lineSpacing = y + 4*12 = y + 48
@@ -48,6 +49,7 @@ export function staffYToPitch(
   const stepsDown = Math.round((clickY - topLineY) / (lineSpacing / 2))
   const { step, octave } = clef === 'bass' ? bassDiatonicStep(stepsDown) : trebleDiatonicStep(stepsDown)
   return {
+    id: newPitchId(),
     step: step as Pitch['step'],
     octave: Math.max(0, Math.min(8, octave)),
     accidental: null,

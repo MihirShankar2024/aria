@@ -28,7 +28,8 @@ function pitchToMidi(pitch: Pitch): number {
 }
 
 function transposePitch(pitch: Pitch, semitones: number): Pitch {
-  return midiToPitch(pitchToMidi(pitch) + semitones)
+  // Preserve the source notehead id so ties/slurs attached to it follow the transpose.
+  return { ...midiToPitch(pitchToMidi(pitch) + semitones), id: pitch.id }
 }
 
 // Convert a concert-pitch note to the written pitch for a transposing instrument.

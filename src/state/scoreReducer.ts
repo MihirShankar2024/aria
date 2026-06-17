@@ -34,6 +34,20 @@ function pitchArraysEqual(a: Pitch[], b: Pitch[]): boolean {
   return a.every((p, i) => p.step === b[i].step && p.octave === b[i].octave && p.accidental === b[i].accidental)
 }
 
+// Head identity key for a tie endpoint: event id + stable Pitch.id.
+const headKey = (noteId: string, pitchId: string) => `${noteId}|${pitchId}`
+
+// Drop ties whose endpoint notehead no longer exists (note or specific pitch removed).
+// Run after any mutation that can delete a note or a chord tone.
+function pruneUnresolvedTies(part: Part): void {
+  if (!part.ties || part.ties.length === 0) return
+  const heads = new Set<string>()
+  for (const m of part.measures)
+    for (const ev of m.notes)
+      if (ev.type === 'note') for (const p of ev.pitches) heads.add(headKey(ev.id, p.id))
+  part.ties = part.ties.filter(t => heads.has(headKey(t.from.note, t.from.pitch)) && heads.has(headKey(t.to.note, t.to.pitch)))
+}
+
 // Sort pitches low-to-high by (octave, step index).
 const STEP_ORDER = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 }
 function sortPitches(pitches: Pitch[]): Pitch[] {
@@ -119,7 +133,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
           // Drop ties whose endpoint was just removed (no note left to draw to).
           if (part.ties) {
-            part.ties = part.ties.filter(t => t.from !== action.noteId && t.to !== action.noteId)
+            part.ties = part.ties.filter(t => t.from.note !== action.noteId && t.to.note !== action.noteId)
           }
         }
         break
@@ -128,9 +142,13 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const part = draft.parts.find(p => p.id === action.partId)
         if (part && action.ties.length > 0) {
           part.ties ??= []
-          // A new span replaces any existing tie sharing an endpoint (avoids tangled overlaps).
-          const endpoints = new Set(action.ties.flatMap(t => [t.from, t.to]))
-          part.ties = part.ties.filter(t => !endpoints.has(t.from) && !endpoints.has(t.to))
+          // A new tie replaces any existing tie sharing an endpoint *notehead* (avoids two
+          // curves leaving the same head). Other heads of the same chord keep their ties,
+          // so multiple ties may fan out from one chord.
+          const heads = new Set(action.ties.flatMap(t => [headKey(t.from.note, t.from.pitch), headKey(t.to.note, t.to.pitch)]))
+          part.ties = part.ties.filter(
+            t => !heads.has(headKey(t.from.note, t.from.pitch)) && !heads.has(headKey(t.to.note, t.to.pitch)),
+          )
           part.ties.push(...action.ties)
         }
         break
@@ -163,18 +181,18 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         break
       }
       case 'APPLY_MEASURE_NOTES': {
+        const touchedParts = new Set<string>()
         for (const edit of action.edits) {
           const measure = draft.parts
             .find(p => p.id === edit.partId)
             ?.measures.find(m => m.id === edit.measureId)
-          if (measure) measure.notes = edit.notes
+          if (measure) { measure.notes = edit.notes; touchedParts.add(edit.partId) }
         }
-        // Drop ties whose endpoint note was removed.
-        if (action.removedIds && action.removedIds.length > 0) {
-          const removed = new Set(action.removedIds)
-          for (const part of draft.parts) {
-            if (part.ties) part.ties = part.ties.filter(t => !removed.has(t.from) && !removed.has(t.to))
-          }
+        // Drop ties whose endpoint notehead no longer exists — covers whole-note removal
+        // and per-pitch deletion (a chord tone stripped while the note remains).
+        for (const partId of touchedParts) {
+          const part = draft.parts.find(p => p.id === partId)
+          if (part) pruneUnresolvedTies(part)
         }
         break
       }
@@ -204,11 +222,13 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           ?.measures.find(m => m.id === action.measureId)
         const note = measure?.notes.find(n => n.id === action.noteId && n.type === 'note')
         if (note && note.type === 'note') {
-          // Don't add duplicate pitches.
-          const existingIdx = note.pitches.findIndex(
-            p => p.step === action.pitch.step && p.octave === action.pitch.octave && p.accidental === action.pitch.accidental,
+          // A chord can't hold two noteheads on the same staff line/space, so reject any
+          // pitch whose step+octave already occupies that position — whether an exact
+          // duplicate (C♮ + C♮) or an enharmonic clash (C♮ + C♯, which is engraved as C + D♭).
+          const occupied = note.pitches.some(
+            p => p.step === action.pitch.step && p.octave === action.pitch.octave,
           )
-          if (existingIdx === -1) {
+          if (!occupied) {
             note.pitches = sortPitches([...note.pitches, action.pitch])
           }
         }
@@ -226,10 +246,9 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           if (note.pitches.length === 0) {
             measure.notes = measure.notes.filter(n => n.id !== action.noteId)
             measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
-            if (part.ties) {
-              part.ties = part.ties.filter(t => t.from !== action.noteId && t.to !== action.noteId)
-            }
           }
+          // Drop ties on the removed head (whole note or just this chord tone).
+          pruneUnresolvedTies(part)
         }
         break
       }
@@ -248,7 +267,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           part.measures = part.measures.filter(m => m.id !== action.measureId)
           if (removed && part.ties) {
             const goneIds = new Set(removed.notes.map(n => n.id))
-            part.ties = part.ties.filter(t => !goneIds.has(t.from) && !goneIds.has(t.to))
+            part.ties = part.ties.filter(t => !goneIds.has(t.from.note) && !goneIds.has(t.to.note))
           }
         }
         break

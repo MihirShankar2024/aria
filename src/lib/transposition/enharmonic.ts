@@ -11,11 +11,11 @@ export function chooseSpelling(midi: number, keySig: KeySig): Pitch {
   if (preferFlats && pitch.accidental === 'sharp') {
     // Enharmonic equivalents: C#=Db, D#=Eb, F#=Gb, G#=Ab, A#=Bb
     const enharmonics: Record<string, Pitch> = {
-      'C#': { step: 'D', octave: pitch.octave, accidental: 'flat' },
-      'D#': { step: 'E', octave: pitch.octave, accidental: 'flat' },
-      'F#': { step: 'G', octave: pitch.octave, accidental: 'flat' },
-      'G#': { step: 'A', octave: pitch.octave, accidental: 'flat' },
-      'A#': { step: 'B', octave: pitch.octave, accidental: 'flat' },
+      'C#': { ...pitch, step: 'D', accidental: 'flat' },
+      'D#': { ...pitch, step: 'E', accidental: 'flat' },
+      'F#': { ...pitch, step: 'G', accidental: 'flat' },
+      'G#': { ...pitch, step: 'A', accidental: 'flat' },
+      'A#': { ...pitch, step: 'B', accidental: 'flat' },
     }
     const key = `${pitch.step}#`
     return enharmonics[key] ?? pitch

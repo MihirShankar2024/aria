@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
 import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration } from '../../lib/beats'
-import { computeTieSpans } from '../../lib/ties'
+import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
@@ -19,6 +19,10 @@ import type { ScoreAction } from '../../state/actions'
 const STAVE_Y = 48
 const DOT_R = 7
 const CHORD_PROXIMITY_X = 20  // px — max chord-stacking radius for long notes
+// A flagged note's reported notehead center (cx) sits a hair right of the drawn
+// notehead because notePx includes the flag, so a ghost/cursor snapped onto an
+// 8th/16th lands too far right. Nudge it back left to re-center over the head.
+const FLAGGED_TARGET_X_OFFSET = -5
 // Accidental columns can project far left; count only part of that width for chord
 // targeting so the stack zone doesn't become too sticky.
 const ACCIDENTAL_ZONE_WEIGHT = 0.75
@@ -39,6 +43,7 @@ const PREVIEW_MIN_GAP = 18    // px — keep the preview clear of the last noteh
 const BRUSH_R = 15            // px radius of the delete brush
 const NOTEHEAD_HIT_R = 12     // px — precise click radius on a notehead (apply dot/accidental)
 const NOTEHEAD_HIT_Y_TOL = 4  // px — keep half-step-above clicks from being mistaken as same head
+const PLACE_DRAG_TOLERANCE_PX = 4  // px — press-and-release within this counts as a tap (places a note)
 
 const STAVE_TOP_Y    = STAVE_Y + STAVE_TOP_OFFSET
 const STAVE_BOTTOM_Y = STAVE_TOP_Y + 4 * LINE_SPACING
@@ -96,13 +101,15 @@ interface HoverInfo {
 
 interface TieDrag {
   fromId: string
+  fromPitchId: string
   fromX: number
   fromY: number
   curX: number
   curY: number
-  // The note the dragging end is locked onto (always the nearest note), so the
+  // The notehead the dragging end is locked onto (always the nearest head), so the
   // preview shows the slur snapped exactly where it will land.
   lockId: string | null
+  lockPitchId: string | null
   lockX: number
   lockY: number
 }
@@ -165,6 +172,9 @@ export function StaffCanvas({
   // Set when a glyph-handle drag is committed on mouseup, so the trailing click doesn't
   // also place a note.
   const suppressClickRef = useRef(false)
+  // Mousedown coords in default note-entry mode. Placement fires on mouseup (drag-tolerant)
+  // rather than the native click, which a browser swallows when a trackpad press drifts.
+  const placeDownRef = useRef<{ x: number; y: number } | null>(null)
   const [markedIds, setMarkedIds] = useState<Set<string>>(new Set())
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
@@ -208,6 +218,9 @@ export function StaffCanvas({
   const mouseInStaffRef = useRef(false)
   const isSelectModeRef = useRef(isSelectMode)
   isSelectModeRef.current = isSelectMode
+  // Default note-entry mode: no special tool active. Placement is driven by mousedown→mouseup.
+  const isPlaceMode = !isSelectMode && !isDeleteMode && !isBroomMode && !isTieMode
+    && !isSharpshooterMode && !isFillMode && !isInsertMode
   const { trail, push: pushTrail } = useDeleteTrail(isDeleteMode)
   const { trail: broomTrail, push: pushBroom } = useDeleteTrail(isBroomMode)
   // Broom: auxiliary glyphs (accidentals/dots) and ties swept under the brush, removed
@@ -545,6 +558,16 @@ export function StaffCanvas({
     return best
   }
 
+  // Leftward nudge to re-center a snapped ghost/cursor when the target note under it
+  // is flagged (8th/16th), whose reported center sits a hair right of the drawn head.
+  const flaggedTargetOffset = (target: NoteGeometry | null) => {
+    if (!target) return 0
+    const ev = measures[target.measureIndex]?.notes.find(n => n.id === target.id)
+    return ev?.type === 'note' && (ev.duration === 'eighth' || ev.duration === 'sixteenth')
+      ? FLAGGED_TARGET_X_OFFSET
+      : 0
+  }
+
   // Find the note whose notehead sits directly under (x, y) — a precise hit on the
   // glyph, not just the same column (used by the dot/accidental click-to-apply path).
   const noteHeadAt = (x: number, y: number): { note: NoteGeometry; pitchIndex: number } | null => {
@@ -562,6 +585,22 @@ export function StaffCanvas({
       })
     }
     return best
+  }
+
+  // Forgiving notehead pick for tie endpoints: snap to the nearest note column (by x),
+  // then the head in that column whose y is closest to the cursor. Returns the head's
+  // event id, stable Pitch.id, and drawn position. Unlike noteHeadAt this doesn't require
+  // a precise glyph hit, so a tie still lands when the cursor is roughly over the head.
+  const nearestHeadAt = (x: number, y: number): { noteId: string; pitchId: string; x: number; y: number } | null => {
+    const note = nearestNoteAtX(x)
+    if (!note || note.type !== 'note' || note.ys.length === 0) return null
+    let bi = 0, bd = Infinity
+    note.ys.forEach((ny, i) => { const d = Math.abs(ny - y); if (d < bd) { bd = d; bi = i } })
+    const ev = measures[note.measureIndex]?.notes.find(n => n.id === note.id)
+    if (!ev || ev.type !== 'note') return null
+    const pitch = ev.pitches[bi]
+    if (!pitch) return null
+    return { noteId: note.id, pitchId: pitch.id, x: note.xs[bi] ?? note.x, y: note.ys[bi] ?? note.y }
   }
 
   // Apply the active modifier tool(s) — dot and/or accidental — to an existing note.
@@ -815,15 +854,17 @@ export function StaffCanvas({
       if (!coords) { setHoverMeasure(null); return }
       setHoverMeasure(getMeasureIndexAtX(coords.x))
       if (tieDrag) {
-        // Always lock the dragging end onto the nearest note (excluding the source),
-        // so the grey preview snaps exactly where the slur will be created.
-        const target = nearestNoteAtX(coords.x)
-        const locked = target && target.id !== tieDrag.fromId ? target : null
+        // Always lock the dragging end onto the nearest notehead (excluding the source
+        // head), so the grey preview snaps exactly where the slur will be created.
+        const target = nearestHeadAt(coords.x, coords.y)
+        const sameHead = target && target.noteId === tieDrag.fromId && target.pitchId === tieDrag.fromPitchId
+        const locked = target && !sameHead ? target : null
         setTieDrag({
           ...tieDrag,
           curX: coords.x,
           curY: coords.y,
-          lockId: locked ? locked.id : null,
+          lockId: locked ? locked.noteId : null,
+          lockPitchId: locked ? locked.pitchId : null,
           lockX: locked ? locked.x : coords.x,
           lockY: locked ? locked.y : coords.y,
         })
@@ -914,10 +955,14 @@ export function StaffCanvas({
         return
       }
     }
+    if (isPlaceMode) { placeDownRef.current = coords; return }
     if (!isTieMode) return
-    const note = nearestNoteAtX(coords.x)
-    if (!note) return
-    setTieDrag({ fromId: note.id, fromX: note.x, fromY: note.y, curX: coords.x, curY: coords.y, lockId: null, lockX: coords.x, lockY: coords.y })
+    const head = nearestHeadAt(coords.x, coords.y)
+    if (!head) return
+    setTieDrag({
+      fromId: head.noteId, fromPitchId: head.pitchId, fromX: head.x, fromY: head.y,
+      curX: coords.x, curY: coords.y, lockId: null, lockPitchId: null, lockX: coords.x, lockY: coords.y,
+    })
   }
 
   const endErase = () => {
@@ -967,15 +1012,29 @@ export function StaffCanvas({
     }
     if (isDeleteMode) { endErase(); return }
     if (isBroomMode) { if (broomingRef.current) commitBroom(); return }
+    if (isPlaceMode) {
+      // A press that didn't drift past the tolerance is a tap: place at the release point.
+      // Driving this off mouseup (not the native click) survives trackpad presses that drag
+      // a few px and would otherwise have the click swallowed by the browser.
+      const down = placeDownRef.current
+      placeDownRef.current = null
+      const coords = getCoords(e)
+      if (down && coords
+        && Math.abs(coords.x - down.x) <= PLACE_DRAG_TOLERANCE_PX
+        && Math.abs(coords.y - down.y) <= PLACE_DRAG_TOLERANCE_PX) {
+        placeAt(coords.x, coords.y)
+      }
+      return
+    }
     if (!isTieMode) return
     if (!tieDrag) return
     const coords = getCoords(e)
-    const target = coords ? nearestNoteAtX(coords.x) : null
+    const target = coords ? nearestHeadAt(coords.x, coords.y) : null
     setTieDrag(null)
-    if (!target || target.id === tieDrag.fromId) return
-    const newTies = computeTieSpans(measures, tieDrag.fromId, target.id)
-    if (newTies.length === 0) return
-    dispatch({ type: 'ADD_TIES', partId, ties: newTies })
+    if (!target) return
+    const tie = buildTie(measures, tieDrag.fromId, tieDrag.fromPitchId, target.noteId, target.pitchId)
+    if (!tie) return
+    dispatch({ type: 'ADD_TIES', partId, ties: [tie] })
     onTieComplete?.()
   }
 
@@ -1014,11 +1073,28 @@ export function StaffCanvas({
         const pitch = staffYToPitch(snapY, STAVE_Y, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
         const measure = measures[nearNote.measureIndex]
-        if (measure) {
+        const targetEv = measure?.notes.find(n => n.id === nearNote.id)
+        if (measure && targetEv?.type === 'note') {
           pendingCenterRef.current = nearNote.measureIndex
-          dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
+          // Same rhythm → the click means "add this tone to the chord". The reducer rejects
+          // same-line clashes (e.g. C♮ + C♯). A different duration is a distinct rhythmic
+          // event, not a chord tone, so place it as a new note right after the target — the
+          // two then sit side by side (e.g. a held half note beside a moving quarter).
+          if (targetEv.duration === selectedDuration && targetEv.dots === (isDotted ? 1 : 0)) {
+            dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
+            onNotePlaced?.()
+            return nearNote.id
+          }
+          const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
+          if (!noteCanFit(measure, candidate, timeSig)) return null
+          const newId = crypto.randomUUID()
+          const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
+          dispatch({
+            type: 'INSERT_EVENTS', partId, measureId: measure.id, index: insertIdx,
+            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false }],
+          })
           onNotePlaced?.()
-          return nearNote.id
+          return newId
         }
         return null
       }
@@ -1119,7 +1195,7 @@ export function StaffCanvas({
       return
     }
 
-    placeAt(coords.x, coords.y)
+    // Default note placement is handled on mouseup (drag-tolerant) — see handleMouseUp.
   }
 
   // For the end-slot cursor, compute where the *next* note would actually begin so
@@ -1178,7 +1254,7 @@ export function StaffCanvas({
     const nearNote = nearestNoteAtX(keyboardCursor.x, CHORD_PROXIMITY_X)
     const nearRest = nearNote ? null : nearestRestAtX(keyboardCursor.x)
     return {
-      x: keyboardCursor.x,
+      x: keyboardCursor.x + (!isRest && nearNote ? flaggedTargetOffset(nearNote) : 0),
       snapY,
       isChordTarget: !isRest && !!nearNote,
       restTarget: !isRest && nearRest ? { x: nearRest.cx, y: nearRest.y } : null,

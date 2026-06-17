@@ -14,6 +14,7 @@ export interface GlyphOffset {
 }
 
 export interface Pitch {
+  id: string         // stable per-notehead id; survives chord re-sort and transpose
   step: NoteName
   octave: number
   accidental: Accidental
@@ -78,10 +79,18 @@ export interface TieCurveOverride {
   endDY?: number
 }
 
+/** One endpoint of a tie/slur: a specific notehead, identified by its event id and the
+ *  stable `Pitch.id` within that event. Resolving by pitch id (not array index) lets the
+ *  curve follow the notehead across chord re-sorts and transposes. */
+export interface TieEnd {
+  note: string   // event (note) id
+  pitch: string  // Pitch.id of the connected notehead
+}
+
 export interface Tie {
   id: string
-  from: string   // note id, earlier in document order
-  to: string     // note id, later in document order
+  from: TieEnd   // notehead earlier in document order
+  to: TieEnd     // notehead later in document order
   curve?: TieCurveOverride  // manual drag adjustments, if any
 }
 

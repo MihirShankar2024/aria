@@ -15,6 +15,7 @@ import {
 } from 'vexflow'
 import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset } from '../../types/score'
 import { measureCapacity, measureBeatCount } from '../beats'
+import { newPitchId } from '../pitch'
 
 const NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
 
@@ -32,11 +33,6 @@ MetricsDefaults.Accidental.leftPadding = 6
 
 function samePitch(a: Pitch, b: Pitch): boolean {
   return a.step === b.step && a.octave === b.octave && a.accidental === b.accidental
-}
-
-function pitchArraysEqual(a: Pitch[], b: Pitch[]): boolean {
-  if (a.length !== b.length) return false
-  return a.every((p, i) => samePitch(p, b[i]))
 }
 
 // Furthest Y of a note toward a slur's bulge, counting the stem/beam — not just
@@ -69,18 +65,20 @@ function flattenedEndpointYs(
   first: StaveNote,
   last: StaveNote,
   isTie: boolean,
+  fromIdx: number,
+  toIdx: number,
 ): { firstYs: number[]; lastYs: number[] } {
   const firstYs = first.getYs()
   const lastYs = last.getYs()
   if (isTie) return { firstYs, lastYs }
-  const fY = firstYs[0]
-  const lY = lastYs[0]
+  const fY = firstYs[fromIdx]
+  const lY = lastYs[toIdx]
   if (fY === undefined || lY === undefined || fY === lY) return { firstYs, lastYs }
   const mid = (fY + lY) / 2
   const newFirst = [...firstYs]
   const newLast = [...lastYs]
-  newFirst[0] = fY + (mid - fY) * SLUR_ENDPOINT_FLATTEN
-  newLast[0] = lY + (mid - lY) * SLUR_ENDPOINT_FLATTEN
+  newFirst[fromIdx] = fY + (mid - fY) * SLUR_ENDPOINT_FLATTEN
+  newLast[toIdx] = lY + (mid - lY) * SLUR_ENDPOINT_FLATTEN
   return { firstYs: newFirst, lastYs: newLast }
 }
 
@@ -280,7 +278,7 @@ export function midiToPitch(midi: number): Pitch {
   const chromatic = [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6]
   const accidentals: Array<'sharp' | null> = [null, 'sharp', null, 'sharp', null, null, 'sharp', null, 'sharp', null, 'sharp', null]
   const step = NOTE_NAMES[chromatic[semitone]] as Pitch['step']
-  return { step, octave, accidental: accidentals[semitone] }
+  return { id: newPitchId(), step, octave, accidental: accidentals[semitone] }
 }
 
 function pitchToVexKey(pitch: Pitch): string {
@@ -320,7 +318,10 @@ function buildGhostNotes(remainingBeats: number): GhostNote[] {
 
 function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
   if (event.type === 'rest') {
-    const vn = new StaveNote({ keys: ['b/4'], duration: durationToVex(event.duration, event.dots) + 'r', clef })
+    // Center the rest on the clef's middle line: treble→b/4, bass→d/3, alto→c/4.
+    // Using a single key for all clefs would float bass/alto rests off the staff.
+    const restKey = clef === 'bass' ? 'd/3' : clef === 'alto' ? 'c/4' : 'b/4'
+    const vn = new StaveNote({ keys: [restKey], duration: durationToVex(event.duration, event.dots) + 'r', clef })
     if (event.dots > 0) Dot.buildAndAttach([vn], { all: true })
     return vn
   }
@@ -964,16 +965,27 @@ function drawTies(
   }
 
   for (const tie of ties) {
-    const first = vexById.get(tie.from)
-    const last  = vexById.get(tie.to)
+    const first = vexById.get(tie.from.note)
+    const last  = vexById.get(tie.to.note)
     if (!first || !last) continue
     try {
       const ov       = tie.curve
-      const fromNote = noteByIdFlat.get(tie.from)
-      const toNote   = noteByIdFlat.get(tie.to)
-      const isTie    = fromNote && toNote && pitchArraysEqual(fromNote.pitches, toNote.pitches)
-      const iFrom    = eventIdToIdx.get(tie.from) ?? -1
-      const iTo      = eventIdToIdx.get(tie.to)   ?? -1
+      const fromNote = noteByIdFlat.get(tie.from.note)
+      const toNote   = noteByIdFlat.get(tie.to.note)
+      // Resolve each endpoint to a single notehead index via its stable Pitch.id. Pitches
+      // map to StaveNote keys in pitch-array order (see buildVexNote), so the array index
+      // IS the notehead index. Skip the tie if either head no longer exists (e.g. deleted).
+      const fromIdx = fromNote?.pitches.findIndex(p => p.id === tie.from.pitch) ?? -1
+      const toIdx   = toNote?.pitches.findIndex(p => p.id === tie.to.pitch)   ?? -1
+      if (fromIdx < 0 || toIdx < 0) continue
+      const firstIndexes = [fromIdx]
+      const lastIndexes  = [toIdx]
+
+      // Tie vs. slur: a tie when the two connected heads share a pitch (same sounding
+      // note sustained), otherwise a slur (legato between different pitches).
+      const isTie = !!fromNote && !!toNote && samePitch(fromNote.pitches[fromIdx], toNote.pitches[toIdx])
+      const iFrom    = eventIdToIdx.get(tie.from.note) ?? -1
+      const iTo      = eventIdToIdx.get(tie.to.note)   ?? -1
       const lo = Math.min(iFrom, iTo)
       const hi = Math.max(iFrom, iTo)
 
@@ -983,23 +995,6 @@ function drawTies(
         if (vn) vn.getStemDirection() === 1 ? stemsUp++ : stemsDown++
       }
       const direction = ov?.direction ?? (stemsUp >= stemsDown ? 1 : -1)
-
-      // Partial-chord matching: tie only pitches present in BOTH chords (pitch-exact).
-      // Each match maps a notehead index in `first` to its index in `last`. Pitches map to
-      // StaveNote keys in pitch-array order (see buildVexNote), so an array index IS the
-      // notehead index. Slurs (different pitches) and any case lacking note data fall back
-      // to the single-endpoint [0]->[0] tie.
-      let firstIndexes: number[] = [0]
-      let lastIndexes:  number[] = [0]
-      if (fromNote && toNote) {
-        const matchFirst: number[] = []
-        const matchLast:  number[] = []
-        fromNote.pitches.forEach((fp, fi) => {
-          const li = toNote.pitches.findIndex(tp => samePitch(fp, tp))
-          if (li >= 0) { matchFirst.push(fi); matchLast.push(li) }
-        })
-        if (matchFirst.length > 0) { firstIndexes = matchFirst; lastIndexes = matchLast }
-      }
 
       const staveTie  = new StaveTie({ firstNote: first, lastNote: last, firstIndexes, lastIndexes })
       staveTie.setDirection(direction)
@@ -1011,7 +1006,7 @@ function drawTies(
       // Per-notehead endpoint Ys. flattenedEndpointYs returns the full notehead arrays for
       // ties (untouched) and a flattened index-0 for slurs. StaveTie.renderTie indexes these
       // by firstIndexes/lastIndexes, so each tied pitch arches from its own notehead.
-      const { firstYs: baseFirstYs, lastYs: baseLastYs } = flattenedEndpointYs(first, last, !!isTie)
+      const { firstYs: baseFirstYs, lastYs: baseLastYs } = flattenedEndpointYs(first, last, !!isTie, fromIdx, toIdx)
       const flatFirstYs = [...baseFirstYs]
       const flatLastYs  = [...baseLastYs]
       // Manual vertical shift nudges every tied notehead uniformly.

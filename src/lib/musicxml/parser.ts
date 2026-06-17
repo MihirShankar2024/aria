@@ -1,4 +1,5 @@
 import type { Score, Part, Measure, NoteEvent, Note, Rest, Pitch, Duration, Accidental, TimeSig, KeySig } from '../../types/score'
+import { newPitchId } from '../pitch'
 
 function parseTimeSig(el: Element): TimeSig | undefined {
   const beats = el.querySelector('time > beats')?.textContent
@@ -34,7 +35,7 @@ function parseNote(el: Element): NoteEvent {
   const note: Note = {
     id: crypto.randomUUID(),
     type: 'note',
-    pitches: [{ step, octave, accidental }],
+    pitches: [{ id: newPitchId(), step, octave, accidental }],
     duration,
     dots,
     tied,

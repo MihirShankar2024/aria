@@ -152,8 +152,10 @@ function notateGap(
   return []
 }
 
+// Rests are created with voice 1; callers that build a specific voice (the reducer's
+// per-voice normalization) re-stamp the voice on the result.
 function makeRest(duration: Duration, dots: number): Rest {
-  return { id: crypto.randomUUID(), type: 'rest', duration, dots }
+  return { id: crypto.randomUUID(), type: 'rest', duration, dots, voice: 1 }
 }
 
 /**

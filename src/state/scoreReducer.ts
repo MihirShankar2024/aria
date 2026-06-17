@@ -1,12 +1,47 @@
 import { produce } from 'immer'
-import type { Score, Part, Measure, TimeSig, Pitch } from '../types/score'
+import type { Score, Part, Measure, TimeSig, Pitch, NoteEvent, VoiceNumber } from '../types/score'
 import type { ScoreAction } from './actions'
 import { normalizeMeasureRests, fillMeasureWithRests } from '../lib/rests'
-import { measureBeatCount, measureCapacity, noteBeatDuration } from '../lib/beats'
+import { measureBeatCount, measureCapacity, noteBeatDuration, effectiveTimeSigAt } from '../lib/beats'
 import { INSTRUMENT_DB } from '../lib/instruments'
+
+const VOICES: readonly VoiceNumber[] = [1, 2]
 
 function createDefaultMeasure(number: number): Measure {
   return { id: crypto.randomUUID(), number, notes: [] }
+}
+
+// Rest canonicalization walks a single linear timeline, so it must run per voice —
+// otherwise it would merge/mis-group rests from two interleaved voices. Each voice's
+// events are normalized independently and the result is re-stamped with its voice
+// (rests created inside `normalizeMeasureRests` default to voice 1). The flat array
+// comes back grouped voice-1-then-voice-2; renderer/ties don't depend on cross-voice
+// order, and within-voice order is preserved.
+function normalizeByVoice(notes: NoteEvent[], ts: TimeSig): NoteEvent[] {
+  const out: NoteEvent[] = []
+  for (const v of VOICES) {
+    const ofVoice = notes.filter(n => n.voice === v)
+    if (ofVoice.length === 0) continue
+    for (const ev of normalizeMeasureRests(ofVoice, ts)) {
+      out.push(ev.voice === v ? ev : { ...ev, voice: v })
+    }
+  }
+  return out
+}
+
+// Pad each occupied voice's trailing gap with rests (the tool a user runs to complete
+// a red voice). An empty measure fills voice 1.
+function fillByVoice(notes: NoteEvent[], ts: TimeSig): NoteEvent[] {
+  const occupied = VOICES.filter(v => notes.some(n => n.voice === v))
+  const targets = occupied.length ? occupied : [1 as VoiceNumber]
+  const out: NoteEvent[] = []
+  for (const v of targets) {
+    const ofVoice = notes.filter(n => n.voice === v)
+    for (const ev of fillMeasureWithRests(ofVoice, ts)) {
+      out.push(ev.voice === v ? ev : { ...ev, voice: v })
+    }
+  }
+  return out
 }
 
 export function createDefaultScore(): Score {
@@ -66,7 +101,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
           measure.notes.push(action.note)
-          measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
         }
         break
       }
@@ -76,7 +111,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
           measure.notes.push(action.rest)
-          measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
         }
         break
       }
@@ -88,11 +123,11 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (measure && idx !== -1) {
           const rest = measure.notes[idx]
           const ts = effectiveTimeSig(draft, measure)
-          // Reject only if swapping in the (longer) note would overflow the measure.
-          const newTotal = measureBeatCount(measure) - noteBeatDuration(rest) + noteBeatDuration(action.note)
+          // Reject only if swapping in the (longer) note would overflow the rest's own voice.
+          const newTotal = measureBeatCount(measure, rest.voice) - noteBeatDuration(rest) + noteBeatDuration(action.note)
           if (newTotal <= measureCapacity(ts) + 0.001) {
             measure.notes[idx] = action.note
-            measure.notes = normalizeMeasureRests(measure.notes, ts)
+            measure.notes = normalizeByVoice(measure.notes, ts)
           }
         }
         break
@@ -105,11 +140,11 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (measure && idx !== -1) {
           const old = measure.notes[idx]
           const ts = effectiveTimeSig(draft, measure)
-          // Reject only if the swapped-in event would overflow the measure.
-          const newTotal = measureBeatCount(measure) - noteBeatDuration(old) + noteBeatDuration(action.event)
+          // Reject only if the swapped-in event would overflow the old event's own voice.
+          const newTotal = measureBeatCount(measure, old.voice) - noteBeatDuration(old) + noteBeatDuration(action.event)
           if (newTotal <= measureCapacity(ts) + 0.001) {
             measure.notes[idx] = action.event
-            measure.notes = normalizeMeasureRests(measure.notes, ts)
+            measure.notes = normalizeByVoice(measure.notes, ts)
           }
         }
         break
@@ -121,7 +156,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (measure && action.events.length > 0) {
           const at = Math.max(0, Math.min(action.index, measure.notes.length))
           measure.notes.splice(at, 0, ...action.events)
-          measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
         }
         break
       }
@@ -130,7 +165,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const measure = part?.measures.find(m => m.id === action.measureId)
         if (part && measure) {
           measure.notes = measure.notes.filter(n => n.id !== action.noteId)
-          measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
           // Drop ties whose endpoint was just removed (no note left to draw to).
           if (part.ties) {
             part.ties = part.ties.filter(t => t.from.note !== action.noteId && t.to.note !== action.noteId)
@@ -142,12 +177,17 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const part = draft.parts.find(p => p.id === action.partId)
         if (part && action.ties.length > 0) {
           part.ties ??= []
-          // A new tie replaces any existing tie sharing an endpoint *notehead* (avoids two
-          // curves leaving the same head). Other heads of the same chord keep their ties,
-          // so multiple ties may fan out from one chord.
-          const heads = new Set(action.ties.flatMap(t => [headKey(t.from.note, t.from.pitch), headKey(t.to.note, t.to.pitch)]))
+          // Dedup by *directed slot*, not just by head: a new tie evicts an existing tie
+          // only when it occupies the same role on the same head — its `from` head leaves
+          // forward, or its `to` head arrives from behind. This still prevents two curves
+          // leaving (or two entering) one head, while letting a single head carry one
+          // incoming tie (as `to`) and one outgoing tie (as `from`) — the long-tie chain
+          // A→B then B→C. Other heads of the same chord keep their ties, so multiple ties
+          // may still fan out from one chord.
+          const newFromHeads = new Set(action.ties.map(t => headKey(t.from.note, t.from.pitch)))
+          const newToHeads   = new Set(action.ties.map(t => headKey(t.to.note, t.to.pitch)))
           part.ties = part.ties.filter(
-            t => !heads.has(headKey(t.from.note, t.from.pitch)) && !heads.has(headKey(t.to.note, t.to.pitch)),
+            t => !newFromHeads.has(headKey(t.from.note, t.from.pitch)) && !newToHeads.has(headKey(t.to.note, t.to.pitch)),
           )
           part.ties.push(...action.ties)
         }
@@ -201,7 +241,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           .find(p => p.id === action.partId)
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
-          measure.notes = fillMeasureWithRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = fillByVoice(measure.notes, effectiveTimeSig(draft, measure))
         }
         break
       }
@@ -212,7 +252,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const note = measure?.notes.find(n => n.id === action.noteId)
         if (measure && note) {
           Object.assign(note, action.patch)
-          measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
         }
         break
       }
@@ -245,7 +285,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           // If all pitches removed, delete the note entirely.
           if (note.pitches.length === 0) {
             measure.notes = measure.notes.filter(n => n.id !== action.noteId)
-            measure.notes = normalizeMeasureRests(measure.notes, effectiveTimeSig(draft, measure))
+            measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
           }
           // Drop ties on the removed head (whole note or just this chord tone).
           pruneUnresolvedTies(part)
@@ -257,6 +297,15 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (part) {
           const nextNum = (part.measures.at(-1)?.number ?? 0) + 1
           part.measures.push(createDefaultMeasure(nextNum))
+        }
+        break
+      }
+      case 'ADD_MEASURES': {
+        // Append `count` measures to every part so all tracks stay barline-aligned.
+        const count = Math.max(1, Math.floor(action.count))
+        for (const part of draft.parts) {
+          let nextNum = (part.measures.at(-1)?.number ?? 0) + 1
+          for (let i = 0; i < count; i++) part.measures.push(createDefaultMeasure(nextNum++))
         }
         break
       }
@@ -395,5 +444,11 @@ function getMeasureCount(score: Score): number {
 }
 
 function effectiveTimeSig(score: Score, measure: Measure): TimeSig {
+  // A time-sig change propagates forward until the next change, so a measure without
+  // its own override inherits from the most recent one in its part (else the global sig).
+  for (const part of score.parts) {
+    const idx = part.measures.indexOf(measure)
+    if (idx !== -1) return effectiveTimeSigAt(part.measures, idx, score.globalTimeSig)
+  }
   return measure.timeSig ?? score.globalTimeSig
 }

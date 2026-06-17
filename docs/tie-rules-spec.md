@@ -434,29 +434,22 @@ The resulting notation should make the beat structure immediately visible to a t
 
 ---
 
-## Slur Direction
+## Slur/Tie Direction
 
-### Single Voice
+Auto-placement decides the side (above/below) in a fixed **priority order** — the first rule that applies wins. Implemented in `src/lib/vexflow/curvePlacement.ts` (`autoDirection`); a manual override on `tie.curve.direction` always supersedes it.
 
-Default slur direction follows stem direction:
+1. **Voice** (two voices on one staff): upper voice → always **above**, lower voice → always **below**. Voice separation takes precedence over everything below.
+2. **Chord position**: the curve follows the connected notehead — the **top** head of a chord arches **above**, the **bottom** head **below**. (Interior heads fall through to the stem rule.) This is what makes stacked chord-ties separate cleanly.
+3. **Stem direction** (single voice): the curve goes **opposite the stems** (i.e. on the notehead side), so it never crosses a stem.
 
-| Stem direction | Slur placement |
+| Stem direction | Curve placement |
 |---------------|----------------|
-| Stems up      | Slur **above** notes |
-| Stems down    | Slur **below** notes |
+| Stems up      | Curve **below** notes |
+| Stems down    | Curve **above** notes |
 
-**Reason:** avoids collision with stems.
-
-**Mixed stem directions:** use the direction that places the slur furthest from the note stems. Goal: avoid stem collisions, avoid notehead collisions, maximize readability.
-
-### Two Voices on One Staff
-
-| Voice   | Slur placement |
-|---------|---------------|
-| Upper voice | Always **above** |
-| Lower voice | Always **below** |
-
-Voice separation takes precedence over stem direction.
+   **Reason:** the curve attaches near the noteheads and stays clear of the stems. **Mixed stems:** majority vote; only notes that actually have a stem vote.
+4. **Whole notes / no stems:** standard practice keys off staff position — **above** when the head is at or above the middle line, **below** otherwise.
+5. **Fallback:** above.
 
 ---
 
@@ -466,6 +459,21 @@ A slur should curve **toward** the notes it connects:
 
 - **Slur above notes:** concavity points downward `╭────╮`
 - **Slur below notes:** concavity points upward `╰────╯`
+
+---
+
+## Slur Domain (Covered Notes)
+
+A slur is a **phrase**, not a two-note connector: it logically spans every note **of its own voice** between the endpoints, even when the user only clicks the first and last. Placement (direction, contour height, collision) is computed over that covered set, so the arch clears the whole phrase and a *different* voice never pushes it around.
+
+- `coveredNotes = notes in start.voice between start and end, inclusive`
+- A **tie** (same pitch) connects only its two heads — `coveredNotes = [start, end]`, no intermediate spanning.
+- A **cross-voice slur** (`start.voice ≠ end.voice`) can't infer intermediates — `coveredNotes = [start, end]`; rely on endpoint geometry only.
+
+### Tie vs. slur classification
+A connection is a **tie** only when the endpoints share a pitch **and** there is no intervening note of the same voice. The instant a different note sits between two same-pitch heads it becomes a phrase (legato) **slur** — it must arc over/under that note and be spaced as a slur, not flattened like a sustain. Different endpoint pitches are always a slur.
+
+Covered notes are *derived at render time* (not stored), so they stay correct as notes are added/edited. Implemented in `drawTies()` (renderer) feeding `computeCurvePlacement()`.
 
 ---
 
@@ -536,22 +544,34 @@ Articulation stays closest to the note; slur moves farther away.
 
 ## Implementation Heuristic
 
+VexFlow sign convention used by the renderer: `direction === 1` → curve bulges **down/below**;
+`direction === -1` → **up/above**.
+
 ```
-1. Determine slur direction:
-   - Single voice: opposite of stem direction
-     (stem up → direction = -1/below; stem down → direction = +1/above)
-   - Multiple voices: upper voice = above (+1), lower voice = below (-1)
+1. Determine direction (priority order, first match wins) — autoDirection():
+   - Voice:  upper voice → above (-1); lower voice → below (+1)
+   - Phrase contour (multi-note slur, ≥3 covered notes): arc toward the side the
+             interior melody pushes past the endpoint line — over a peak (above),
+             under a valley (below). Skipped when near-linear (defer to stem).
+   - Chord:  top head → above (-1); bottom head → below (+1)
+   - Stem:   opposite the stems — stem up → below (+1); stem down → above (-1)
+             (mixed: majority of notes that have a stem)
+   - Whole notes / no stem: head at/above middle line → above (-1), else below (+1)
+   - Fallback: above (-1)
+   A manual tie.curve.direction override supersedes all of the above.
 
 2. Find first and last notehead positions (getAbsoluteX()).
 
 3. Create cubic Bézier curve via VexFlow StaveTie:
    - Set endpoint Y offset: ~0.5 staff spaces from noteheads
    - Set arch height via renderOptions.cp1 / cp2:
-       pixel span < 60px  → cp ≈ 10  (1 staff space)
-       pixel span < 180px → cp ≈ 18  (1.5–2 spaces)
-       pixel span ≥ 180px → cp ≈ 28  (2.5–3 spaces)
+       ties: cp ≈ 6 (compact, ~tieHeight = slurHeight * 0.6)
+       slur, pixel span < 60px  → cp ≈ 10  (1 staff space)
+       slur, pixel span < 180px → cp ≈ 18  (1.5–2 spaces)
+       slur, pixel span ≥ 180px → cp ≈ 28  (2.5–3 spaces)
 
-4. Increase cp values further if beam/accidental/articulation collision detected.
+4. Increase cp values further if a beam/accidental/intermediate-note collision is detected
+   (content-based clearance over notes between the endpoints).
 
-5. Ensure slur never intersects: notes, stems, beams, articulations, dynamics.
+5. Ensure the curve never intersects: notes, stems, beams, articulations, dynamics.
 ```

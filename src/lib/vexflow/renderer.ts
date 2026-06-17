@@ -9,13 +9,15 @@ import {
   Dot,
   Modifier,
   Beam,
+  Stem,
   StaveTie,
   StaveConnector,
   MetricsDefaults,
 } from 'vexflow'
-import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset } from '../../types/score'
-import { measureCapacity, measureBeatCount } from '../beats'
+import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber } from '../../types/score'
+import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt } from '../beats'
 import { newPitchId } from '../pitch'
+import { computeCurvePlacement } from './curvePlacement'
 
 const NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
 
@@ -33,27 +35,6 @@ MetricsDefaults.Accidental.leftPadding = 6
 
 function samePitch(a: Pitch, b: Pitch): boolean {
   return a.step === b.step && a.octave === b.octave && a.accidental === b.accidental
-}
-
-// Furthest Y of a note toward a slur's bulge, counting the stem/beam — not just
-// the notehead. direction === 1 → slur bulges downward (larger y); -1 → upward
-// (smaller y). This lets the slur clear stems that point into its path instead
-// of only clearing noteheads.
-function extremeYTowardSlur(vn: StaveNote, direction: number): number {
-  const ys = [...vn.getYs()]
-  try {
-    const ext = vn.getStemExtents()
-    if (ext) ys.push(ext.topY, ext.baseY)
-  } catch {
-    // No stem (e.g. whole note) — noteheads are the only extent.
-  }
-  try {
-    // Include the full glyph bounds so accidentals (and dots) poking toward the slur
-    // are cleared, not just noteheads and stems.
-    const bb = vn.getBoundingBox()
-    if (bb) ys.push(bb.getY(), bb.getY() + bb.getH())
-  } catch { /* bounding box unavailable — extents above suffice */ }
-  return direction === 1 ? Math.max(...ys) : Math.min(...ys)
 }
 
 // A slur between two different pitches anchored exactly at each notehead reads too
@@ -162,11 +143,11 @@ function noteExtents(vn: StaveNote): { accLeft: number; rightExt: number } {
 // Note-area width that guarantees no adjacent pair's glyphs (incl. accidentals and
 // displaced noteheads) overlap, enforcing ACC_GAP between them plus a leading/trailing
 // allowance for the outer notes' own glyphs. Falls back to VexFlow's vexMin when richer.
-function accidentalAwareMinWidth(realNotes: StaveNote[], voice: Voice, vexMin: number): number {
+function accidentalAwareMinWidth(realNotes: StaveNote[], voices: Voice[], vexMin: number): number {
   if (realNotes.length === 0) return vexMin
   try {
-    // getMetrics() requires a pre-formatted voice; format at the bare minimum first.
-    new Formatter().joinVoices([voice]).format([voice], vexMin)
+    // getMetrics() requires pre-formatted voices; format at the bare minimum first.
+    new Formatter().joinVoices(voices).format(voices, vexMin)
   } catch {
     return vexMin
   }
@@ -182,9 +163,9 @@ function accidentalAwareMinWidth(realNotes: StaveNote[], voice: Voice, vexMin: n
 // Per-measure note-area sizing from a built voice: the hard minimum (accidental-aware,
 // the collision floor) and the blended-down "raw" preferred width. The MAX_NOTE_AREA cap
 // is lifted to the floor when accidental clearance demands more than 400px.
-function rawWidthFromVoice(realNotes: StaveNote[], voice: Voice): { min: number; raw: number } {
-  const vexMin = new Formatter().joinVoices([voice]).preCalculateMinTotalWidth([voice])
-  const min = accidentalAwareMinWidth(realNotes, voice, vexMin)
+function rawWidthFromVoice(realNotes: StaveNote[], voices: Voice[]): { min: number; raw: number } {
+  const vexMin = new Formatter().joinVoices(voices).preCalculateMinTotalWidth(voices)
+  const min = accidentalAwareMinWidth(realNotes, voices, vexMin)
   const cap = Math.max(MAX_NOTE_AREA, Math.ceil(min))
   const preferred = snapUp(Math.min(Math.max(Math.ceil(min * SPACING_FACTOR), MIN_NOTE_AREA), cap), SNAP_STEP)
   return { min, raw: Math.max(preferred, Math.ceil(min)) }
@@ -214,9 +195,9 @@ function drawLedgerGuides(ctx: ReturnType<InstanceType<typeof Renderer>['getCont
 function computeColumnWidths(measures: Measure[], effTimeSigs: TimeSig[], clef: Clef = 'treble'): { raws: number[]; mins: number[] } {
   const mins: number[] = []
   const raws = measures.map((m, i) => {
-    const { realNotes, voice } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1], clef)
-    if (!voice) { mins.push(0); return MIN_NOTE_AREA }
-    const { min, raw } = rawWidthFromVoice(realNotes, voice)
+    const { realNotes, voices } = buildMeasure(m, effTimeSigs[i] ?? effTimeSigs[effTimeSigs.length - 1], clef)
+    if (voices.length === 0) { mins.push(0); return MIN_NOTE_AREA }
+    const { min, raw } = rawWidthFromVoice(realNotes, voices)
     mins.push(min)
     return raw
   })
@@ -424,27 +405,102 @@ function collectIntraChordAccidentalConflicts(
 }
 
 interface BuiltMeasure {
-  realNotes: StaveNote[]
-  voice: Voice | null
+  realNotes: StaveNote[]          // every real note across voices, concatenated v1-then-v2
+  events: NoteEvent[]             // source events, parallel 1:1 with realNotes
+  voices: Voice[]                 // one VexFlow Voice per occupied voice
+  voiceRealNotes: StaveNote[][]   // real notes per voice, parallel to `voices` (for beams)
+  voiceNumbers: VoiceNumber[]     // voice number per entry in `voices`
 }
+
+const EMPTY_BUILT: BuiltMeasure = { realNotes: [], events: [], voices: [], voiceRealNotes: [], voiceNumbers: [] }
 
 function buildMeasure(measure: Measure, timeSig: TimeSig, clef: Clef = 'treble'): BuiltMeasure {
-  if (measure.notes.length === 0) return { realNotes: [], voice: null }
+  if (measure.notes.length === 0) return EMPTY_BUILT
 
-  const realNotes = measure.notes.map(ev => buildVexNote(ev, clef))
-  const ghosts = buildGhostNotes(measureCapacity(timeSig) - measureBeatCount(measure))
-  const voice = new Voice({ numBeats: timeSig.beats, beatValue: timeSig.beatType })
-    .setStrict(false)
-    .addTickables([...realNotes, ...ghosts])
-  return { realNotes, voice }
+  const voiceNumbers = occupiedVoices(measure)
+  const multi = voiceNumbers.length > 1
+  const realNotes: StaveNote[] = []
+  const events: NoteEvent[] = []
+  const voices: Voice[] = []
+  const voiceRealNotes: StaveNote[][] = []
+
+  for (const v of voiceNumbers) {
+    const evs = voiceEvents(measure, v)
+    const vexNotes = evs.map(ev => buildVexNote(ev, clef))
+    // With two voices on one staff, force voice 1 stems up / voice 2 stems down
+    // (notation-engraving-spec §Stem Direction). A single voice keeps VexFlow auto.
+    if (multi) vexNotes.forEach(vn => vn.setStemDirection(v === 1 ? Stem.UP : Stem.DOWN))
+    const ghosts = buildGhostNotes(measureCapacity(timeSig) - measureBeatCount(measure, v))
+    const voice = new Voice({ numBeats: timeSig.beats, beatValue: timeSig.beatType })
+      .setStrict(false)
+      .addTickables([...vexNotes, ...ghosts])
+    voices.push(voice)
+    voiceRealNotes.push(vexNotes)
+    realNotes.push(...vexNotes)
+    events.push(...evs)
+  }
+  return { realNotes, events, voices, voiceRealNotes, voiceNumbers }
 }
 
-// Walk backwards from idx to find the effective time sig (propagates forward from last change).
-function effectiveTimeSigAt(measures: Measure[], idx: number, global: TimeSig): TimeSig {
-  for (let i = idx; i >= 0; i--) {
-    if (measures[i].timeSig) return measures[i].timeSig!
-  }
-  return global
+// Format every voice of a built measure together (joinVoices aligns same-beat notes
+// across voices), draw them, generate per-voice beams, apply glyph nudges, and collect
+// geometry. Shared by single-staff and grand-staff (treble/bass) rendering.
+function formatDrawCollect(
+  built: BuiltMeasure,
+  stave: Stave,
+  ctx: ReturnType<InstanceType<typeof Renderer>['getContext']>,
+  idx: number,
+  staveY: number,
+  noteAreaWidth: number,
+  out: {
+    vexById: Map<string, StaveNote>
+    noteGeometry: NoteGeometry[]
+    glyphGeometry: GlyphGeometry[]
+    intraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }>
+  },
+): void {
+  const { voices, voiceRealNotes, voiceNumbers, realNotes, events } = built
+  if (voices.length === 0) return
+  const multi = voices.length > 1
+
+  // Give every note its stave before formatting so VexFlow's accidental column layout
+  // uses pixel-accurate line positions and clears displaced noteheads.
+  voices.forEach(v => v.getTickables().forEach(t => t.setStave(stave)))
+  const formatWidth = stave.getNoteEndX() - stave.getNoteStartX() - NOTE_PAD
+  new Formatter().joinVoices(voices).format(voices, Math.max(noteAreaWidth, formatWidth))
+
+  const beams = voiceRealNotes.flatMap((rn, vi) =>
+    Beam.generateBeams(rn, multi ? { stemDirection: voiceNumbers[vi] === 1 ? Stem.UP : Stem.DOWN } : undefined),
+  )
+  // Apply manual accidental/dot nudges on top of auto layout before drawing.
+  events.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev) })
+  voices.forEach(v => v.draw(ctx, stave))
+  beams.forEach(b => b.setContext(ctx).draw())
+
+  events.forEach((ev, k) => {
+    const vn = realNotes[k]
+    out.vexById.set(ev.id, vn)
+    const ys = vn.getYs()
+    const ax = vn.getAbsoluteX()
+    const ext = noteExtents(vn)
+    out.noteGeometry.push({
+      id: ev.id,
+      type: ev.type,
+      voice: ev.voice,
+      x: ax,
+      cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn),
+      leftX: ax - ext.accLeft,
+      rightX: ax + ext.rightExt,
+      y: ys[0] ?? staveY,
+      ys: ys.length ? [...ys] : [staveY],
+      xs: noteHeadXs(vn, ax),
+      measureIndex: idx,
+    })
+    if (ev.type === 'note') {
+      collectGlyphGeometry(vn, ev, out.glyphGeometry)
+      collectIntraChordAccidentalConflicts(vn, ev, idx, out.intraChordConflicts)
+    }
+  })
 }
 
 function effectiveKeySigAt(measures: Measure[], idx: number, global: KeySig): KeySig {
@@ -462,6 +518,7 @@ export interface MeasureGeometry {
 export interface NoteGeometry {
   id: string
   type: 'note' | 'rest'
+  voice: VoiceNumber   // which voice this event belongs to (for placement disambiguation)
   x: number            // notehead anchor x in SVG px
   cx: number           // glyph visual center x in SVG px (for centering rest overlays)
   leftX: number        // true left edge incl. accidentals/displaced heads (for cursor zone)
@@ -549,9 +606,9 @@ export function renderStaff({
   // Pass 1 — build voices and compute note-area widths.
   const built = measures.map((m, i) => buildMeasure(m, effTimeSigs[i], clef))
   const vexMins: number[] = []
-  const rawWidths = built.map(({ realNotes, voice }) => {
-    if (!voice) { vexMins.push(0); return MIN_NOTE_AREA }
-    const { min, raw } = rawWidthFromVoice(realNotes, voice)
+  const rawWidths = built.map(({ realNotes, voices }) => {
+    if (voices.length === 0) { vexMins.push(0); return MIN_NOTE_AREA }
+    const { min, raw } = rawWidthFromVoice(realNotes, voices)
     vexMins.push(min)
     return raw
   })
@@ -633,45 +690,9 @@ export function renderStaff({
       tempoMarkGeometry.push({ x, y: staveY, tempo: tempoAtMeasure, measureNumber: measure.number })
     }
 
-    const { realNotes, voice } = built[idx]
-    if (voice) {
-      // Give every note its stave before formatting so VexFlow's accidental column
-      // layout uses pixel-accurate line positions and clears displaced noteheads.
-      voice.getTickables().forEach(t => t.setStave(stave))
-      const formatWidth = stave.getNoteEndX() - stave.getNoteStartX() - NOTE_PAD
-      new Formatter().joinVoices([voice]).format([voice], Math.max(noteAreaWidths[idx], formatWidth))
-
-      const beams = Beam.generateBeams(realNotes)
-      // Apply manual accidental/dot nudges on top of auto layout before drawing.
-      measure.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev) })
-      voice.draw(ctx, stave)
-      beams.forEach(b => b.setContext(ctx).draw())
-
-      measure.notes.forEach((ev, k) => {
-        const vn = realNotes[k]
-        vexById.set(ev.id, vn)
-        // For chords, record the primary (lowest) notehead Y.
-        const ys = vn.getYs()
-        const ax = vn.getAbsoluteX()
-        const ext = noteExtents(vn)
-        noteGeometry.push({
-          id: ev.id,
-          type: ev.type,
-          x: ax,
-          cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn),
-          leftX: ax - ext.accLeft,
-          rightX: ax + ext.rightExt,
-          y: ys[0] ?? staveY,
-          ys: ys.length ? [...ys] : [staveY],
-          xs: noteHeadXs(vn, ax),
-          measureIndex: idx,
-        })
-        if (ev.type === 'note') {
-          collectGlyphGeometry(vn, ev, glyphGeometry)
-          collectIntraChordAccidentalConflicts(vn, ev, idx, intraChordConflicts)
-        }
-      })
-    }
+    formatDrawCollect(built[idx], stave, ctx, idx, staveY, noteAreaWidths[idx], {
+      vexById, noteGeometry, glyphGeometry, intraChordConflicts,
+    })
 
     geometry.push({ x, width: staveWidth })
     x += staveWidth
@@ -767,9 +788,9 @@ export function renderGrandStaff({
 
   // Compute per-measure note-area widths — take max of treble and bass so columns align.
   function computeRawWidths(built: BuiltMeasure[]): number[] {
-    return built.map(({ realNotes, voice }) => {
-      if (!voice) return MIN_NOTE_AREA
-      return rawWidthFromVoice(realNotes, voice).raw
+    return built.map(({ realNotes, voices }) => {
+      if (voices.length === 0) return MIN_NOTE_AREA
+      return rawWidthFromVoice(realNotes, voices).raw
     })
   }
 
@@ -877,50 +898,16 @@ export function renderGrandStaff({
     }
 
     // Draw treble notes
-    const { realNotes: trebleReal, voice: trebleVoice } = trebleBuilt[idx] ?? { realNotes: [], voice: null }
-    if (trebleVoice) {
-      trebleVoice.getTickables().forEach(t => t.setStave(trebleStave))
-      const fw = trebleStave.getNoteEndX() - trebleStave.getNoteStartX() - NOTE_PAD
-      new Formatter().joinVoices([trebleVoice]).format([trebleVoice], Math.max(noteAreaWidths[idx], fw))
-      const beams = Beam.generateBeams(trebleReal)
-      trebleMeasures[idx]?.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(trebleReal[k], ev) })
-      trebleVoice.draw(ctx, trebleStave)
-      beams.forEach(b => b.setContext(ctx).draw())
-      trebleMeasures[idx]?.notes.forEach((ev, k) => {
-        const vn = trebleReal[k]
-        trebleVexById.set(ev.id, vn)
-        const tys = vn.getYs()
-        const tax = vn.getAbsoluteX()
-        const text = noteExtents(vn)
-        trebleNoteGeometry.push({ id: ev.id, type: ev.type, x: tax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: tax - text.accLeft, rightX: tax + text.rightExt, y: tys[0] ?? GRAND_TREBLE_Y, ys: tys.length ? [...tys] : [GRAND_TREBLE_Y], xs: noteHeadXs(vn, tax), measureIndex: idx })
-        if (ev.type === 'note') {
-          collectGlyphGeometry(vn, ev, trebleGlyphGeometry)
-          collectIntraChordAccidentalConflicts(vn, ev, idx, trebleIntraChordConflicts)
-        }
+    if (trebleBuilt[idx]) {
+      formatDrawCollect(trebleBuilt[idx], trebleStave, ctx, idx, GRAND_TREBLE_Y, noteAreaWidths[idx], {
+        vexById: trebleVexById, noteGeometry: trebleNoteGeometry, glyphGeometry: trebleGlyphGeometry, intraChordConflicts: trebleIntraChordConflicts,
       })
     }
 
     // Draw bass notes
-    const { realNotes: bassReal, voice: bassVoice } = bassBuilt[idx] ?? { realNotes: [], voice: null }
-    if (bassVoice) {
-      bassVoice.getTickables().forEach(t => t.setStave(bassStave))
-      const fw = bassStave.getNoteEndX() - bassStave.getNoteStartX() - NOTE_PAD
-      new Formatter().joinVoices([bassVoice]).format([bassVoice], Math.max(noteAreaWidths[idx], fw))
-      const beams = Beam.generateBeams(bassReal)
-      bassMeasures[idx]?.notes.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(bassReal[k], ev) })
-      bassVoice.draw(ctx, bassStave)
-      beams.forEach(b => b.setContext(ctx).draw())
-      bassMeasures[idx]?.notes.forEach((ev, k) => {
-        const vn = bassReal[k]
-        bassVexById.set(ev.id, vn)
-        const bys = vn.getYs()
-        const bax = vn.getAbsoluteX()
-        const bext = noteExtents(vn)
-        bassNoteGeometry.push({ id: ev.id, type: ev.type, x: bax, cx: ev.type === 'rest' ? glyphCenterX(vn) : noteheadCenterX(vn), leftX: bax - bext.accLeft, rightX: bax + bext.rightExt, y: bys[0] ?? GRAND_BASS_Y, ys: bys.length ? [...bys] : [GRAND_BASS_Y], xs: noteHeadXs(vn, bax), measureIndex: idx })
-        if (ev.type === 'note') {
-          collectGlyphGeometry(vn, ev, bassGlyphGeometry)
-          collectIntraChordAccidentalConflicts(vn, ev, idx, bassIntraChordConflicts)
-        }
+    if (bassBuilt[idx]) {
+      formatDrawCollect(bassBuilt[idx], bassStave, ctx, idx, GRAND_BASS_Y, noteAreaWidths[idx], {
+        vexById: bassVexById, noteGeometry: bassNoteGeometry, glyphGeometry: bassGlyphGeometry, intraChordConflicts: bassIntraChordConflicts,
       })
     }
 
@@ -952,14 +939,14 @@ function drawTies(
   vexById: Map<string, StaveNote>,
   ctx: ReturnType<InstanceType<typeof Renderer>['getContext']>,
 ): TieGeometry[] {
-  const MAX_CP = 36
-  const HALF_NOTEHEAD = 5
   const out: TieGeometry[] = []
   const flatEventIds = measures.flatMap(m => m.notes.map(ev => ev.id))
   const eventIdToIdx = new Map(flatEventIds.map((id, i) => [id, i] as [string, number]))
   const noteByIdFlat = new Map<string, Note>()
+  const voiceByIdFlat = new Map<string, VoiceNumber>()
   for (const m of measures) {
     for (const ev of m.notes) {
+      voiceByIdFlat.set(ev.id, ev.voice)
       if (ev.type === 'note') noteByIdFlat.set(ev.id, ev)
     }
   }
@@ -981,27 +968,30 @@ function drawTies(
       const firstIndexes = [fromIdx]
       const lastIndexes  = [toIdx]
 
-      // Tie vs. slur: a tie when the two connected heads share a pitch (same sounding
-      // note sustained), otherwise a slur (legato between different pitches).
-      const isTie = !!fromNote && !!toNote && samePitch(fromNote.pitches[fromIdx], toNote.pitches[toIdx])
       const iFrom    = eventIdToIdx.get(tie.from.note) ?? -1
       const iTo      = eventIdToIdx.get(tie.to.note)   ?? -1
       const lo = Math.min(iFrom, iTo)
       const hi = Math.max(iFrom, iTo)
 
-      let stemsUp = 0, stemsDown = 0
-      for (let k = lo; k <= hi; k++) {
-        const vn = vexById.get(flatEventIds[k])
-        if (vn) vn.getStemDirection() === 1 ? stemsUp++ : stemsDown++
+      const fromVoice = voiceByIdFlat.get(tie.from.note)
+      const sameVoice = fromVoice !== undefined && fromVoice === voiceByIdFlat.get(tie.to.note)
+
+      // Tie vs. slur. A tie sustains one pitch with *nothing* in between — same endpoint
+      // pitch AND no intervening note of the same voice. The moment a different note sits
+      // between two same-pitch heads, it's a phrase (legato) slur, not a sustain, so it
+      // must arc over/under that note and be spaced as a slur. Different endpoint pitches
+      // are always a slur.
+      let interiorNoteCount = 0
+      if (sameVoice) {
+        for (let k = lo + 1; k < hi; k++) {
+          const id = flatEventIds[k]
+          if (voiceByIdFlat.get(id) === fromVoice && noteByIdFlat.has(id)) interiorNoteCount++
+        }
       }
-      const direction = ov?.direction ?? (stemsUp >= stemsDown ? 1 : -1)
+      const endpointsSamePitch = !!fromNote && !!toNote && samePitch(fromNote.pitches[fromIdx], toNote.pitches[toIdx])
+      const isTie = endpointsSamePitch && interiorNoteCount === 0
 
       const staveTie  = new StaveTie({ firstNote: first, lastNote: last, firstIndexes, lastIndexes })
-      staveTie.setDirection(direction)
-
-      const pixelSpan   = Math.abs(last.getAbsoluteX() - first.getAbsoluteX())
-      const spanBasedCp = isTie ? 6 : pixelSpan < 60 ? 8 : pixelSpan < 180 ? 14 : 22
-      const tolerance   = pixelSpan < 60 ? -2 : pixelSpan < 180 ? 0 : 3
 
       // Per-notehead endpoint Ys. flattenedEndpointYs returns the full notehead arrays for
       // ties (untouched) and a flattened index-0 for slurs. StaveTie.renderTie indexes these
@@ -1015,18 +1005,39 @@ function drawTies(
       staveTie.getFirstYs = () => flatFirstYs
       staveTie.getLastYs  = () => flatLastYs
 
-      // Representative endpoint for hit-testing/drag handles: the outermost tied notehead on
-      // the side the arch bulges toward (top notehead for an upward tie, bottom for downward).
-      const repPick = (idxs: number[], ys: number[]): number => {
-        let best = idxs[0]
-        for (const i of idxs) {
-          const yi = ys[i] ?? 0, yb = ys[best] ?? 0
-          if (direction === 1 ? yi > yb : yi < yb) best = i
+      // Auto-placement: side (above/below) + arch height. Manual overrides on tie.curve
+      // win inside computeCurvePlacement. See curvePlacement.ts for the decision flow.
+      const firstX  = first.getAbsoluteX()
+      const lastX   = last.getAbsoluteX()
+      // Covered notes = the curve's domain. A single-voice slur spans every note of its
+      // own voice between the endpoints (the phrase contour), so placement clears the whole
+      // phrase rather than just the two clicked heads — and a lower voice never pushes it
+      // away. A tie connects only its two heads; a cross-voice slur can't infer intermediates.
+      // Both of those reduce to the endpoints.
+      const coveredNotes: StaveNote[] = []
+      if (isTie || !sameVoice) {
+        coveredNotes.push(first, last)
+      } else {
+        for (let k = lo; k <= hi; k++) {
+          const id = flatEventIds[k]
+          if (voiceByIdFlat.get(id) !== fromVoice) continue
+          const vn = vexById.get(id)
+          if (vn) coveredNotes.push(vn)
         }
-        return best
       }
-      const repFirstIdx = repPick(firstIndexes, flatFirstYs)
-      const repLastIdx  = repPick(lastIndexes,  flatLastYs)
+      const middleLineY = first.getStave()?.getYForLine(2) ?? flatFirstYs[fromIdx] ?? 0
+      const { direction, cp1, cp2, repFirstIdx, repLastIdx } = computeCurvePlacement({
+        isTie, fromIdx, toIdx,
+        firstYs: flatFirstYs, lastYs: flatLastYs,
+        firstX, lastX,
+        pixelSpan: Math.abs(lastX - firstX),
+        coveredNotes, middleLineY,
+        voiceSide: null,
+        override: ov,
+      })
+      staveTie.setDirection(direction)
+      staveTie.renderOptions.cp1 = cp1
+      staveTie.renderOptions.cp2 = cp2
 
       // Pull the end inward past the end note's leading accidental so the incoming
       // curve clears it instead of crossing over the glyph. Negligible heads ignored.
@@ -1039,28 +1050,6 @@ function drawTies(
 
       const firstY = flatFirstYs[repFirstIdx] ?? 0
       const lastY  = flatLastYs[repLastIdx]   ?? 0
-      const firstX = first.getAbsoluteX()
-      const spanPx = (last.getAbsoluteX() - firstX) || 1
-      let contentBasedCp = 0
-      for (let k = lo + 1; k < hi; k++) {
-        const vn = vexById.get(flatEventIds[k])
-        if (!vn) continue
-        if (!vn.getYs().length) continue
-        const centreY = extremeYTowardSlur(vn, direction)
-        const edgeY   = centreY + direction * HALF_NOTEHEAD
-        const t       = Math.max(0.05, Math.min(0.95, (vn.getAbsoluteX() - firstX) / spanPx))
-        const yLine   = (1 - t) * firstY + t * lastY
-        const excess  = (edgeY - yLine) * direction - tolerance
-        if (excess > 0) {
-          const needed = excess / (2 * t * (1 - t))
-          if (needed > contentBasedCp) contentBasedCp = needed
-        }
-      }
-
-      const cp1 = ov?.cp1 ?? Math.min(MAX_CP, Math.max(spanBasedCp, contentBasedCp))
-      const cp2 = ov?.cp2 ?? cp1 + 4
-      staveTie.renderOptions.cp1 = cp1
-      staveTie.renderOptions.cp2 = cp2
       staveTie.setContext(ctx).draw()
 
       out.push({

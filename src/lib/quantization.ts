@@ -42,6 +42,7 @@ export function quantizeTiming(
         duration,
         dots: 0,
         tied: false,
+        voice: 1 as const,
       }
     })
 }

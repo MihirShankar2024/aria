@@ -194,11 +194,11 @@ export function InsertStaff({
 
     const newId = crypto.randomUUID()
     if (isRest) {
-      setScratch(s => [...s, { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 }])
+      setScratch(s => [...s, { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: 1 }])
     } else {
       const pitch = staffYToPitch(y, STAVE_Y, clef)
       const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-      setScratch(s => [...s, { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false }])
+      setScratch(s => [...s, { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: 1 }])
     }
     return newId
   }

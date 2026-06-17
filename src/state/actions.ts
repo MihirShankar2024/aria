@@ -17,6 +17,7 @@ export type ScoreAction =
   | { type: 'APPLY_MEASURE_NOTES'; edits: { partId: string; measureId: string; notes: NoteEvent[] }[]; removedIds?: string[] }
   | { type: 'UPDATE_NOTE'; partId: string; measureId: string; noteId: string; patch: Partial<Note> }
   | { type: 'ADD_MEASURE'; partId: string }
+  | { type: 'ADD_MEASURES'; count: number }
   | { type: 'DELETE_MEASURE'; partId: string; measureId: string }
   | { type: 'SET_TIME_SIG'; partId: string; measureId: string; timeSig: TimeSig }
   | { type: 'SET_KEY_SIG'; partId: string; measureId: string; keySig: KeySig }

@@ -1,4 +1,4 @@
-import { Trash2, ChevronDown, Music } from 'lucide-react'
+import { Trash2, Music } from 'lucide-react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
 import { INSTRUMENT_DB } from '../../lib/instruments'
 import type { Part } from '../../types/score'
@@ -92,9 +92,8 @@ function PartRow({
         <Music className="h-3.5 w-3.5 text-white/30 flex-shrink-0" />
         <div className="flex-1 min-w-0">
           <Select value={part.instrument} onValueChange={v => onInstrumentChange(part.id, v)}>
-            <SelectTrigger className="w-full min-w-0 h-auto p-0 border-0 bg-transparent! hover:bg-transparent! text-xs text-white/70 hover:text-white font-medium gap-1 focus:ring-0 shadow-none [&>span[data-slot=select-value]]:min-w-0">
+            <SelectTrigger className="w-full min-w-0 h-auto p-0 border-0 bg-transparent! hover:bg-transparent! text-xs text-white/70 hover:text-white font-medium gap-1 focus:ring-0 shadow-none [&>svg]:hidden [&>span[data-slot=select-value]]:min-w-0">
               <SelectValue />
-              <ChevronDown className="h-3 w-3 opacity-50 flex-shrink-0" />
             </SelectTrigger>
             <SelectContent className="bg-zinc-900 border-white/15">
               {availableInstruments.map(inst => (
@@ -109,9 +108,9 @@ function PartRow({
           <button
             onClick={onRemove}
             title="Remove staff"
-            className="opacity-0 group-hover:opacity-100 text-white/30 hover:text-red-400 transition-opacity flex-shrink-0"
+            className="opacity-0 group-hover:opacity-100 shrink-0 flex items-center justify-center h-6 w-6 rounded-md text-white/40 hover:text-red-400 hover:bg-red-400/10 transition"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="h-4 w-4" />
           </button>
         )}
       </div>
@@ -141,9 +140,9 @@ function GrandStaffRow({
           <button
             onClick={onRemove}
             title="Remove piano"
-            className="opacity-0 group-hover:opacity-100 text-white/30 hover:text-red-400 transition-opacity flex-shrink-0"
+            className="opacity-0 group-hover:opacity-100 shrink-0 flex items-center justify-center h-6 w-6 rounded-md text-white/40 hover:text-red-400 hover:bg-red-400/10 transition"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="h-4 w-4" />
           </button>
         )}
       </div>

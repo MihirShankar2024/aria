@@ -30,8 +30,10 @@ interface TimeSigPickerProps {
 export function TimeSigPicker({ current, measureCount, dispatch, children }: TimeSigPickerProps) {
   const [open, setOpen] = useState(false)
   const [beats, setBeats] = useState(current.beats)
+  const [beatsText, setBeatsText] = useState(String(current.beats))
   const [beatType, setBeatType] = useState(current.beatType)
   const [fromMeasure, setFromMeasure] = useState(1)
+  const [fromMeasureText, setFromMeasureText] = useState('1')
 
   const apply = () => {
     const timeSig: TimeSig = { beats, beatType }
@@ -45,6 +47,7 @@ export function TimeSigPicker({ current, measureCount, dispatch, children }: Tim
 
   const preset = (b: number, bt: number) => {
     setBeats(b)
+    setBeatsText(String(b))
     setBeatType(bt)
   }
 
@@ -77,11 +80,19 @@ export function TimeSigPicker({ current, measureCount, dispatch, children }: Tim
             <div className="flex-1">
               <Label className="text-[10px] text-white/40 uppercase tracking-wider">Beats</Label>
               <Input
-                type="number"
-                min={1}
-                max={16}
-                value={beats}
-                onChange={e => setBeats(Math.max(1, Math.min(16, parseInt(e.target.value) || 4)))}
+                type="text"
+                inputMode="numeric"
+                value={beatsText}
+                onChange={e => {
+                  setBeatsText(e.target.value)
+                  const n = parseInt(e.target.value)
+                  if (!isNaN(n)) setBeats(Math.max(1, Math.min(16, n)))
+                }}
+                onBlur={() => {
+                  const clamped = Math.max(1, Math.min(16, parseInt(beatsText) || 4))
+                  setBeats(clamped)
+                  setBeatsText(String(clamped))
+                }}
                 className="h-8 bg-white/5 border-white/15 text-white text-sm"
               />
             </div>
@@ -111,11 +122,19 @@ export function TimeSigPicker({ current, measureCount, dispatch, children }: Tim
             <Label className="text-[10px] text-white/40 uppercase tracking-wider">From measure</Label>
             <div className="flex items-center gap-2 mt-1">
               <Input
-                type="number"
-                min={1}
-                max={measureCount}
-                value={fromMeasure}
-                onChange={e => setFromMeasure(Math.max(1, Math.min(measureCount, parseInt(e.target.value) || 1)))}
+                type="text"
+                inputMode="numeric"
+                value={fromMeasureText}
+                onChange={e => {
+                  setFromMeasureText(e.target.value)
+                  const n = parseInt(e.target.value)
+                  if (!isNaN(n)) setFromMeasure(Math.max(1, Math.min(measureCount, n)))
+                }}
+                onBlur={() => {
+                  const clamped = Math.max(1, Math.min(measureCount, parseInt(fromMeasureText) || 1))
+                  setFromMeasure(clamped)
+                  setFromMeasureText(String(clamped))
+                }}
                 className="h-8 bg-white/5 border-white/15 text-white text-sm w-20"
               />
               <span className="text-xs text-white/40">

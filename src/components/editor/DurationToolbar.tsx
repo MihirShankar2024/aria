@@ -1,25 +1,49 @@
-import { Trash2, Eraser, MousePointer2, Brush, Crosshair } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward } from 'lucide-react'
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
+import { Tooltip, TooltipTrigger, TooltipContent } from '../ui/tooltip'
 import { TimeSigPicker } from './TimeSigPicker'
 import { KeySigPicker } from './KeySigPicker'
 import { TempoPicker } from './TempoPicker'
-import type { Duration, Accidental, TimeSig, KeySig } from '../../types/score'
+import type { Duration, Accidental, TimeSig, KeySig, VoiceNumber } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
-const DURATIONS: { value: Duration; label: string; title: string }[] = [
-  { value: 'whole', label: 'W', title: 'Whole' },
-  { value: 'half', label: 'H', title: 'Half' },
-  { value: 'quarter', label: 'Q', title: 'Quarter' },
-  { value: 'eighth', label: '8', title: 'Eighth' },
-  { value: 'sixteenth', label: '16', title: 'Sixteenth' },
+const DURATIONS: { value: Duration; label: string; name: string; desc: string; keys: string }[] = [
+  { value: 'whole', label: 'W', name: 'Whole note', desc: 'Place whole notes.', keys: 'W' },
+  { value: 'half', label: 'H', name: 'Half note', desc: 'Place half notes.', keys: 'H' },
+  { value: 'quarter', label: 'Q', name: 'Quarter note', desc: 'Place quarter notes.', keys: 'Q' },
+  { value: 'eighth', label: '8', name: 'Eighth note', desc: 'Place eighth notes.', keys: 'E / 8' },
+  { value: 'sixteenth', label: '16', name: 'Sixteenth note', desc: 'Place sixteenth notes.', keys: 'X / 6' },
 ]
 
-const ACCIDENTALS: { value: NonNullable<Accidental>; label: string; title: string }[] = [
-  { value: 'natural', label: '♮', title: 'Natural' },
-  { value: 'sharp', label: '♯', title: 'Sharp' },
-  { value: 'flat', label: '♭', title: 'Flat' },
+const ACCIDENTALS: { value: NonNullable<Accidental>; label: string; name: string; desc: string; keys: string }[] = [
+  { value: 'natural', label: '♮', name: 'Natural', desc: 'Cancel the key signature on placed notes.', keys: 'N' },
+  { value: 'sharp', label: '♯', name: 'Sharp', desc: 'Raise placed notes a semitone.', keys: 'S' },
+  { value: 'flat', label: '♭', name: 'Flat', desc: 'Lower placed notes a semitone.', keys: 'F' },
 ]
+
+/** Rich hover bubble for a dock tool: bold name, keybind chip, one-line description. */
+function DockTip({ name, desc, keys, children }: { name: string; desc: string; keys?: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      {/* Wrapper span is the trigger so the tooltip's own data-state doesn't
+          clobber the toggle's data-[state=on] selected styling. */}
+      <TooltipTrigger asChild>
+        <span className="inline-flex">{children}</span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={8} className="max-w-55 px-3 py-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-semibold text-white">{name}</span>
+          {keys && (
+            <kbd className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/70">{keys}</kbd>
+          )}
+        </div>
+        <p className="mt-0.5 text-[11px] leading-snug text-white/55">{desc}</p>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
 
 const TOGGLE_ITEM_CLASS =
   'h-8 px-2.5 text-xs font-medium text-white/50 rounded-md ' +
@@ -37,6 +61,8 @@ interface DurationToolbarProps {
   onDottedChange: (v: boolean) => void
   isRest: boolean
   onRestChange: (v: boolean) => void
+  activeVoice: VoiceNumber
+  onActiveVoiceChange: (v: VoiceNumber) => void
   selectedAccidental: Accidental
   onAccidentalChange: (a: Accidental) => void
   isTieMode: boolean
@@ -53,6 +79,8 @@ interface DurationToolbarProps {
   onSelectModeChange: (v: boolean) => void
   isSharpshooterMode: boolean
   onSharpshooterModeChange: (v: boolean) => void
+  advanceOnPlace: boolean
+  onAdvanceOnPlaceChange: (v: boolean) => void
   selectedNoteCount: number
   onDeleteSelected: () => void
   hasPendingRests: boolean
@@ -72,6 +100,8 @@ export function DurationToolbar({
   onDottedChange,
   isRest,
   onRestChange,
+  activeVoice,
+  onActiveVoiceChange,
   selectedAccidental,
   onAccidentalChange,
   isTieMode,
@@ -88,6 +118,8 @@ export function DurationToolbar({
   onSelectModeChange,
   isSharpshooterMode,
   onSharpshooterModeChange,
+  advanceOnPlace,
+  onAdvanceOnPlaceChange,
   selectedNoteCount,
   onDeleteSelected,
   hasPendingRests,
@@ -108,71 +140,103 @@ export function DurationToolbar({
           onValueChange={(v) => { if (v) onDurationChange(v as Duration) }}
           className="gap-0.5"
         >
-          {DURATIONS.map(({ value, label, title }) => (
-            <ToggleGroupItem key={value} value={value} title={title} className={TOGGLE_ITEM_CLASS}>
-              {label}
-            </ToggleGroupItem>
+          {DURATIONS.map(({ value, label, name, desc, keys }) => (
+            <DockTip key={value} name={name} desc={desc} keys={keys}>
+              <ToggleGroupItem value={value} className={TOGGLE_ITEM_CLASS}>
+                {label}
+              </ToggleGroupItem>
+            </DockTip>
           ))}
         </ToggleGroup>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Rest mode — its own thing */}
-        <Toggle pressed={isRest} onPressedChange={onRestChange} title="Rest" className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
+        <DockTip name="Rest" desc="Place rests instead of notes." keys="Space">
+          <Toggle pressed={isRest} onPressedChange={onRestChange} className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
+        </DockTip>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Dot + accidentals — one group */}
         <div className="flex items-center gap-0.5">
-          <Toggle pressed={isDotted} onPressedChange={onDottedChange} title="Dotted" className={TOGGLE_ITEM_CLASS}>·</Toggle>
+          <DockTip name="Dotted" desc="Add an augmentation dot (×1.5 duration)." keys="D / .">
+            <Toggle pressed={isDotted} onPressedChange={onDottedChange} className={TOGGLE_ITEM_CLASS}>·</Toggle>
+          </DockTip>
           <ToggleGroup
             type="single"
             value={selectedAccidental ?? ''}
             onValueChange={(v) => onAccidentalChange(v ? (v as NonNullable<Accidental>) : null)}
             className="gap-0.5"
           >
-            {ACCIDENTALS.map(({ value, label, title }) => (
-              <ToggleGroupItem key={value} value={value} title={title} className={TOGGLE_ITEM_CLASS + ' text-base'}>
-                {label}
-              </ToggleGroupItem>
+            {ACCIDENTALS.map(({ value, label, name, desc, keys }) => (
+              <DockTip key={value} name={name} desc={desc} keys={keys}>
+                <ToggleGroupItem value={value} className={TOGGLE_ITEM_CLASS + ' text-base'}>
+                  {label}
+                </ToggleGroupItem>
+              </DockTip>
             ))}
           </ToggleGroup>
         </div>
+
+        <div className="w-px h-5 bg-white/15" />
+
+        {/* Voice — voice 1 stems up, voice 2 stems down */}
+        <ToggleGroup
+          type="single"
+          value={String(activeVoice)}
+          onValueChange={(v) => { if (v) onActiveVoiceChange(Number(v) as VoiceNumber) }}
+          className="gap-0.5"
+        >
+          <DockTip name="Voice 1" desc="Active voice — stems up." keys="V">
+            <ToggleGroupItem value="1" className={TOGGLE_ITEM_CLASS}>V1</ToggleGroupItem>
+          </DockTip>
+          <DockTip name="Voice 2" desc="Active voice — stems down. Hold Alt/Option while placing to drop into voice 2." keys="V">
+            <ToggleGroupItem value="2" className={TOGGLE_ITEM_CLASS}>V2</ToggleGroupItem>
+          </DockTip>
+        </ToggleGroup>
       </div>
 
       {/* Modes bubble */}
       <div className="inline-flex items-center gap-2 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         {/* Tie / slur */}
-        <Toggle pressed={isTieMode} onPressedChange={onTieModeChange} title="Tie / slur — drag between two notes (T)" className={TOGGLE_ITEM_CLASS + ' text-base'}>
-          ⌒
-        </Toggle>
+        <DockTip name="Tie / slur" desc="Drag between two notes to connect them with a tie or slur." keys="T">
+          <Toggle pressed={isTieMode} onPressedChange={onTieModeChange} className={TOGGLE_ITEM_CLASS + ' text-base'}>
+            ⌒
+          </Toggle>
+        </DockTip>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Insert before/between — drop a V marker, build notes in the scratch staff */}
-        <Toggle pressed={isInsertMode} onPressedChange={onInsertModeChange} title="Insert notes before/between — click a gap, build, then ✓ (I)" className={TOGGLE_ITEM_CLASS + ' text-base'}>
-          ⌄
-        </Toggle>
+        <DockTip name="Insert" desc="Click a gap to insert notes before or between existing ones, build in the scratch staff, then confirm with ✓." keys="I">
+          <Toggle pressed={isInsertMode} onPressedChange={onInsertModeChange} className={TOGGLE_ITEM_CLASS + ' text-base'}>
+            ⌄
+          </Toggle>
+        </DockTip>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Fill rests */}
-        <Toggle pressed={isFillMode} onPressedChange={onFillModeChange} title="Fill rests — click a measure to fill it" className={TOGGLE_ITEM_CLASS}>
-          𝄽+
-        </Toggle>
+        <DockTip name="Fill rests" desc="Click a measure to pad it out to full with rests.">
+          <Toggle pressed={isFillMode} onPressedChange={onFillModeChange} className={TOGGLE_ITEM_CLASS}>
+            𝄽+
+          </Toggle>
+        </DockTip>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Select */}
         <div className="relative">
-          <Toggle
-            pressed={isSelectMode}
-            onPressedChange={onSelectModeChange}
-            title="Select — draw box to select notes (Esc to clear)"
-            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
-          >
-            <MousePointer2 className="h-3.5 w-3.5" />
-          </Toggle>
+          <DockTip name="Select" desc="Drag a box to select notes. Esc clears the selection.">
+            <Toggle
+              pressed={isSelectMode}
+              onPressedChange={onSelectModeChange}
+              className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+            >
+              <MousePointer2 className="h-3.5 w-3.5" />
+            </Toggle>
+          </DockTip>
           {isSelectMode && selectedNoteCount > 0 && (
             <button
               onClick={onDeleteSelected}
@@ -187,27 +251,29 @@ export function DurationToolbar({
         <div className="w-px h-5 bg-white/15" />
 
         {/* Sharpshooter — move slur/tie handles + accidental/dot glyph handles */}
-        <Toggle
-          pressed={isSharpshooterMode}
-          onPressedChange={onSharpshooterModeChange}
-          title="Sharpshooter — adjust slurs/ties, accidentals and dots (handle drag) (Tab)"
-          className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
-        >
-          <Crosshair className="h-3.5 w-3.5" />
-        </Toggle>
+        <DockTip name="Sharpshooter" desc="Drag handles to reshape slurs/ties and reposition accidentals and dots." keys="Tab">
+          <Toggle
+            pressed={isSharpshooterMode}
+            onPressedChange={onSharpshooterModeChange}
+            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+          >
+            <Crosshair className="h-3.5 w-3.5" />
+          </Toggle>
+        </DockTip>
 
         <div className="w-px h-5 bg-white/15" />
 
         {/* Erase */}
         <div className="relative">
-          <Toggle
-            pressed={isDeleteMode}
-            onPressedChange={onDeleteModeChange}
-            title="Erase — drag over notes to delete (Delete)"
-            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-red-500/25 data-[state=on]:text-red-300'}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Toggle>
+          <DockTip name="Erase" desc="Drag over notes to delete them.">
+            <Toggle
+              pressed={isDeleteMode}
+              onPressedChange={onDeleteModeChange}
+              className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-red-500/25 data-[state=on]:text-red-300'}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Toggle>
+          </DockTip>
           {hasPendingRests && (
             <button
               onClick={onCollapseRests}
@@ -220,14 +286,15 @@ export function DurationToolbar({
         </div>
 
         {/* Broom — sweep away slurs, accidentals and dots */}
-        <Toggle
-          pressed={isBroomMode}
-          onPressedChange={onBroomModeChange}
-          title="Broom — drag over slurs, accidentals and dots to remove them (B)"
-          className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-amber-500/25 data-[state=on]:text-amber-300'}
-        >
-          <Brush className="h-3.5 w-3.5" />
-        </Toggle>
+        <DockTip name="Broom" desc="Drag over slurs, accidentals and dots to sweep them away (notes stay)." keys="B">
+          <Toggle
+            pressed={isBroomMode}
+            onPressedChange={onBroomModeChange}
+            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-amber-500/25 data-[state=on]:text-amber-300'}
+          >
+            <Brush className="h-3.5 w-3.5" />
+          </Toggle>
+        </DockTip>
       </div>
 
       {/* Notation controls */}
@@ -253,6 +320,22 @@ export function DurationToolbar({
             <span className="font-mono">♩={initialTempo}</span>
           </button>
         </TempoPicker>
+      </div>
+
+      {/* Auto-advance — keyboard placement cursor behaviour, its own bubble on the right */}
+      <div className="inline-flex items-center px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
+        <DockTip
+          name="Auto-advance"
+          desc="After placing a note with the keyboard, skip the cursor to the next beat. Turn off to stay on the note you just placed."
+        >
+          <Toggle
+            pressed={advanceOnPlace}
+            onPressedChange={onAdvanceOnPlaceChange}
+            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+          >
+            <StepForward className="h-3.5 w-3.5" />
+          </Toggle>
+        </DockTip>
       </div>
     </div>
   )

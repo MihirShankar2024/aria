@@ -1,5 +1,5 @@
 import { renderStaff, type StaffLayout } from '../../lib/vexflow/renderer'
-import type { TimeSig, KeySig, Duration, Accidental, Clef, Measure, NoteEvent, Pitch } from '../../types/score'
+import type { TimeSig, KeySig, Duration, Accidental, Clef, Measure, NoteEvent, Pitch, VoiceNumber } from '../../types/score'
 
 // A grey "held note/rest" preview that rides the cursor in placement mode. We
 // render the currently-selected note/rest with the real engraving engine (so the
@@ -36,16 +36,17 @@ export interface GhostNoteOpts {
   clef: Clef
   timeSig: TimeSig
   keySig: KeySig
+  voice?: VoiceNumber
 }
 
 export function renderGhostNote(opts: GhostNoteOpts): GhostRender | null {
-  const { duration, dotted, accidental, isRest, clef, timeSig, keySig } = opts
+  const { duration, dotted, accidental, isRest, clef, timeSig, keySig, voice = 1 } = opts
   // Neutral mid-staff pitch — pitch is irrelevant to the glyph shape, and the
   // caller re-centers the notehead on the cursor anyway.
   const finalPitch: Pitch = { id: 'ghost-pitch', step: 'B', octave: clef === 'bass' ? 3 : 4, accidental }
   const ev: NoteEvent = isRest
-    ? { id: 'ghost', type: 'rest', duration, dots: dotted ? 1 : 0 }
-    : { id: 'ghost', type: 'note', pitches: [finalPitch], duration, dots: dotted ? 1 : 0, tied: false }
+    ? { id: 'ghost', type: 'rest', duration, dots: dotted ? 1 : 0, voice }
+    : { id: 'ghost', type: 'note', pitches: [finalPitch], duration, dots: dotted ? 1 : 0, tied: false, voice }
   const measure: Measure = { id: 'ghost', number: 1, notes: [ev] }
 
   const container = scratchEl()

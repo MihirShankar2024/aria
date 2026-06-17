@@ -5,7 +5,7 @@ import { ScoreEditor } from './components/editor/ScoreEditor'
 
 export default function App() {
   return (
-    <TooltipProvider>
+    <TooltipProvider delayDuration={250} skipDelayDuration={300}>
       <ShaderBackground />
       <div className="relative">
         <ScoreEditor />

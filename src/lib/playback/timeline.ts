@@ -1,5 +1,6 @@
 import type { Score, NoteEvent } from '../../types/score'
 import type { MeasureGeometry, NoteGeometry } from '../vexflow/renderer'
+import { effectiveTimeSigAt } from '../beats'
 
 export interface PlaybackLayout {
   measures: MeasureGeometry[]
@@ -49,7 +50,7 @@ export function buildPlaybackTimeline(score: Score, layout: PlaybackLayout): Pla
   let absTime = 0
 
   for (let mIdx = 0; mIdx < measureCount; mIdx++) {
-    const timeSig = score.parts[0]?.measures[mIdx]?.timeSig ?? score.globalTimeSig
+    const timeSig = effectiveTimeSigAt(score.parts[0]?.measures ?? [], mIdx, score.globalTimeSig)
     const measure = part.measures[mIdx]
     const measureNum = measure?.number ?? (mIdx + 1)
     const tempo = getEffectiveTempo(score, measureNum)

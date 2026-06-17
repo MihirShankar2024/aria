@@ -1,6 +1,7 @@
 import * as Tone from 'tone'
 import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig } from '../../types/score'
 import { loadSoundFont } from './soundfonts'
+import { effectiveTimeSigAt } from '../beats'
 
 const NOTE_MIDI: Record<string, number> = {
   C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11,
@@ -103,55 +104,64 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
     const resolvedNoteOffsets = new Map<string, Map<string, number>>()
 
     for (let mIdx = 0; mIdx < measureCount; mIdx++) {
-      // Effective time sig: look at measure-level override on first part, else global.
-      const timeSig = score.parts[0]?.measures[mIdx]?.timeSig ?? score.globalTimeSig
+      // Effective time sig: most recent override at/before this measure, else global.
+      const timeSig = effectiveTimeSigAt(score.parts[0]?.measures ?? [], mIdx, score.globalTimeSig)
       const measure  = part.measures[mIdx]
       const measureNum = measure?.number ?? (mIdx + 1)
       const tempo    = getEffectiveTempo(score, measureNum)
 
-      // Active key signature and a fresh accidental memory per measure (barline reset).
+      // Active key signature for this measure.
       const keyMap = keySigOffsets(effectiveKeySig(part.measures, mIdx, score.globalKeySig).fifths)
-      const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
 
       const measureDuration = timeSig.beats * (60 / tempo)
+      const measureStart = absTime
       if (measure && measure.notes.length > 0) {
-        for (const event of measure.notes) {
-          const dur = eventDurationSeconds(event, tempo)
-          if (event.type === 'note') {
-            const fromId = tieFromOf.get(event.id)
-            const fromOffsets = fromId ? resolvedNoteOffsets.get(fromId) : undefined
-            const offsets = new Map<string, number>()
-            const midis = event.pitches.map(pitch => {
-              const memKey = `${pitch.step}${pitch.octave}`
-              let offset: number
-              if (pitch.accidental !== null) {
-                offset = explicitOffset(pitch.accidental)
-                measureAcc.set(memKey, offset)
-              } else if (measureAcc.has(memKey)) {
-                offset = measureAcc.get(memKey)!
-              } else if (fromOffsets?.has(memKey)) {
-                // Genuine tie continuation (same letter + octave, no written
-                // accidental): carry the from-note's accidental. Per spec this does
-                // NOT establish accidental memory for later notes, so don't set
-                // measureAcc here. A slur to a different pitch won't match memKey.
-                offset = fromOffsets.get(memKey)!
-              } else {
-                offset = keyMap[pitch.step] ?? 0
+        // Each voice is an independent timeline that starts at the barline, so they
+        // sound concurrently. Accidental memory is per-measure AND per-voice (the spec
+        // forbids accidental leakage between voices), so it resets for each voice.
+        for (const voice of [1, 2] as const) {
+          const voiceNotes = measure.notes.filter(e => e.voice === voice)
+          if (voiceNotes.length === 0) continue
+          const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
+          let voiceTime = measureStart
+          for (const event of voiceNotes) {
+            const dur = eventDurationSeconds(event, tempo)
+            if (event.type === 'note') {
+              const fromId = tieFromOf.get(event.id)
+              const fromOffsets = fromId ? resolvedNoteOffsets.get(fromId) : undefined
+              const offsets = new Map<string, number>()
+              const midis = event.pitches.map(pitch => {
+                const memKey = `${pitch.step}${pitch.octave}`
+                let offset: number
+                if (pitch.accidental !== null) {
+                  offset = explicitOffset(pitch.accidental)
+                  measureAcc.set(memKey, offset)
+                } else if (measureAcc.has(memKey)) {
+                  offset = measureAcc.get(memKey)!
+                } else if (fromOffsets?.has(memKey)) {
+                  // Genuine tie continuation (same letter + octave, no written
+                  // accidental): carry the from-note's accidental. Per spec this does
+                  // NOT establish accidental memory for later notes, so don't set
+                  // measureAcc here. A slur to a different pitch won't match memKey.
+                  offset = fromOffsets.get(memKey)!
+                } else {
+                  offset = keyMap[pitch.step] ?? 0
+                }
+                offsets.set(memKey, offset)
+                return (pitch.octave + 1) * 12 + NOTE_MIDI[pitch.step] + offset
+              })
+              resolvedNoteOffsets.set(event.id, offsets)
+              if (!selectedNoteIds || selectedNoteIds.size === 0 || selectedNoteIds.has(event.id)) {
+                scheduled.push({ note: event, time: voiceTime, duration: dur, tempo, midis })
               }
-              offsets.set(memKey, offset)
-              return (pitch.octave + 1) * 12 + NOTE_MIDI[pitch.step] + offset
-            })
-            resolvedNoteOffsets.set(event.id, offsets)
-            if (!selectedNoteIds || selectedNoteIds.size === 0 || selectedNoteIds.has(event.id)) {
-              scheduled.push({ note: event, time: absTime, duration: dur, tempo, midis })
             }
+            voiceTime += dur
           }
-          absTime += dur
         }
-      } else {
-        // Empty or missing measure: infer a whole rest so all parts stay aligned.
-        absTime += measureDuration
       }
+      // Always advance one full measure so parts/measures stay barline-aligned even when
+      // a voice is incomplete (underfilled) or the measure is empty.
+      absTime = measureStart + measureDuration
     }
 
     // ── Per-notehead tie sustain ──────────────────────────────────────────────

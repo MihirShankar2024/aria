@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration } from '../../lib/beats'
+import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
@@ -13,7 +13,7 @@ import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent } from '../../types/score'
+import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent, VoiceNumber } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const STAVE_Y = 48
@@ -61,6 +61,7 @@ interface StaffCanvasProps {
   selectedAccidental: Accidental
   isDotted: boolean
   isRest: boolean
+  activeVoice?: VoiceNumber
   ties: Tie[]
   isTieMode: boolean
   isFillMode: boolean
@@ -68,6 +69,9 @@ interface StaffCanvasProps {
   isBroomMode: boolean
   isInsertMode: boolean
   isSharpshooterMode?: boolean
+  /** When true (default), placing a note in keyboard mode advances the cursor to the next
+   * beat; when false, the cursor stays on the note just placed. */
+  advanceOnPlace?: boolean
   initialTempo?: number
   tempoChanges?: { measureNumber: number; tempo: number }[]
   forcedStaveWidths?: number[]
@@ -130,6 +134,7 @@ export function StaffCanvas({
   selectedAccidental,
   isDotted,
   isRest,
+  activeVoice = 1,
   ties,
   isTieMode,
   isFillMode,
@@ -137,6 +142,7 @@ export function StaffCanvas({
   isBroomMode,
   isInsertMode,
   isSharpshooterMode = false,
+  advanceOnPlace = true,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -209,6 +215,9 @@ export function StaffCanvas({
   // chord-add, rest-replace, or modifier-on-existing). Lets the keyboard flow advance
   // to the next open spot after appending, while staying put when editing an existing note.
   const placementAppendedRef = useRef(false)
+  // Read inside the once-bound keydown handler, so toggling it takes effect live.
+  const advanceOnPlaceRef = useRef(advanceOnPlace)
+  advanceOnPlaceRef.current = advanceOnPlace
   // The keydown handler is registered once (deps []), so it must read live measure
   // data through refs rather than its stale capture.
   const measuresRef = useRef(measures)
@@ -270,9 +279,10 @@ export function StaffCanvas({
       clef,
       timeSig,
       keySig,
+      voice: activeVoice,
     })
     setGhost(nextGhost)
-  }, [selectedDuration, isDotted, selectedAccidental, isRest, clef, timeSig, keySig,
+  }, [selectedDuration, isDotted, selectedAccidental, isRest, clef, timeSig, keySig, activeVoice,
       isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
 
   // After a reflow (e.g. first note in a bar, or adding a chord tone) a note's
@@ -298,7 +308,7 @@ export function StaffCanvas({
       // doesn't linger in the now-dead end slot.
       const measureHere = measures[kc.measureIndex]
       const nextG = layout.measures[kc.measureIndex + 1]
-      if (measureHere && nextG && isMeasureFull(measureHere, timeSig)) {
+      if (measureHere && nextG && isMeasureFull(measureHere, effectiveTimeSigAt(measures, kc.measureIndex, timeSig))) {
         const nextNotes = layout.notes
           .filter(n => n.measureIndex === kc.measureIndex + 1)
           .sort((a, b) => a.cx - b.cx)
@@ -456,7 +466,7 @@ export function StaffCanvas({
           // the next measure. Gate purely on capacity, not pixel position, so the slot
           // is reliable even when the last note renders near the bar's edge.
           const measureHere = measuresRef.current[mIdx]
-          const full = measureHere ? isMeasureFull(measureHere, timeSigRef.current) : false
+          const full = measureHere ? isMeasureFull(measureHere, effectiveTimeSigAt(measuresRef.current, mIdx, timeSigRef.current)) : false
           const endSlotX = g ? g.x + g.width - 16 : baseCursor.x
           if (!full && !baseCursor.atEnd) {
             setKeyboardCursor({ ...baseCursor, x: endSlotX, anchorId: undefined, atEnd: true })
@@ -484,10 +494,15 @@ export function StaffCanvas({
             if (!locked) {
               // do nothing — the hovering cursor stays put
             } else if (placementAppendedRef.current) {
-              // Appended a new note: hover the next open spot of that measure (the end
-              // slot previews where the next note goes). If this filled the bar, the
-              // reflow effect auto-advances to the next measure. Press Left to go back.
-              setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+              // Appended a new note. With auto-advance on (default), hover the next open
+              // spot of that measure (the end slot previews where the next note goes); if
+              // this filled the bar, the reflow effect auto-advances to the next measure.
+              // With it off, stay anchored on the note just placed.
+              if (advanceOnPlaceRef.current) {
+                setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+              } else {
+                setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
+              }
             } else if (!baseCursor.atEnd) {
               // Edited an existing note (chord-add / rest-replace / modifier): stay on it.
               setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
@@ -521,7 +536,7 @@ export function StaffCanvas({
   // Find the nearest note (not rest) whose chord zone covers x. A finite maxDist is a
   // chord-stacking query, so each note's zone is capped by its duration-scaled radius;
   // an infinite maxDist (tie/delete targeting) keeps the plain nearest-note behaviour.
-  const nearestNoteAtX = (x: number, maxDist = Infinity): NoteGeometry | null => {
+  const nearestNoteAtX = (x: number, maxDist = Infinity, voice?: VoiceNumber): NoteGeometry | null => {
     if (!layout) return null
     const scaled = Number.isFinite(maxDist)
     let best: NoteGeometry | null = null
@@ -529,6 +544,7 @@ export function StaffCanvas({
     let bestCenterDist = Infinity
     for (const n of layout.notes) {
       if (n.type !== 'note') continue
+      if (voice !== undefined && n.voice !== voice) continue
       const weightedLeftX = n.x - (n.x - n.leftX) * ACCIDENTAL_ZONE_WEIGHT
       // Distance to the note's horizontal span (incl. accidentals), 0 when inside it,
       // so the chord-target zone covers the accidentals to the left of the notehead.
@@ -546,12 +562,13 @@ export function StaffCanvas({
   }
 
   // Find the nearest rest within CHORD_PROXIMITY_X of an x position (for replace-on-rest).
-  const nearestRestAtX = (x: number, maxDist = CHORD_PROXIMITY_X): NoteGeometry | null => {
+  const nearestRestAtX = (x: number, maxDist = CHORD_PROXIMITY_X, voice?: VoiceNumber): NoteGeometry | null => {
     if (!layout) return null
     let best: NoteGeometry | null = null
     let bestDist = maxDist
     for (const n of layout.notes) {
       if (n.type !== 'rest') continue
+      if (voice !== undefined && n.voice !== voice) continue
       const d = Math.abs(n.x - x)
       if (d < bestDist) { bestDist = d; best = n }
     }
@@ -759,7 +776,7 @@ export function StaffCanvas({
       const measure = measures[mIdx]
       if (!measure) continue
       for (const id of ids) if (measure.notes.find(n => n.id === id)?.type === 'note') removedIds.push(id)
-      const notes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), measure.timeSig ?? timeSig)
+      const notes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), effectiveTimeSigAt(measures, mIdx, timeSig))
       edits.push({ partId, measureId: measure.id, notes })
     }
     if (edits.length === 0) return
@@ -1022,7 +1039,7 @@ export function StaffCanvas({
       if (down && coords
         && Math.abs(coords.x - down.x) <= PLACE_DRAG_TOLERANCE_PX
         && Math.abs(coords.y - down.y) <= PLACE_DRAG_TOLERANCE_PX) {
-        placeAt(coords.x, coords.y)
+        placeAt(coords.x, coords.y, false, e.altKey)
       }
       return
     }
@@ -1044,9 +1061,11 @@ export function StaffCanvas({
   // existing) and always appends a brand-new event. Used by the end-of-bar slot, where
   // the intent is unambiguously "add the next note" even if the stored x happens to sit
   // near the last note.
-  const placeAt = (x: number, y: number, forceNew = false): string | null => {
+  const placeAt = (x: number, y: number, forceNew = false, altKey = false): string | null => {
     placementAppendedRef.current = false
     if (measures.length === 0) return null
+    // Alt cycles down to the lower voice (voice 2); otherwise the toolbar's active voice.
+    const targetVoice: VoiceNumber = altKey ? 2 : activeVoice
     const stepsDown = Math.round((y - STAVE_TOP_Y) / (LINE_SPACING / 2))
     const snapY = staffStepToY(stepsDown, STAVE_Y)
     // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
@@ -1068,7 +1087,10 @@ export function StaffCanvas({
       }
     }
     if (!forceNew && !isRest) {
-      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
+      // Proximity is restricted to the target voice: a click near a voice-1 note while
+      // placing into voice 2 must NOT chord onto it — it starts an independent voice-2
+      // stack at that beat instead.
+      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
         const pitch = staffYToPitch(snapY, STAVE_Y, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
@@ -1076,29 +1098,27 @@ export function StaffCanvas({
         const targetEv = measure?.notes.find(n => n.id === nearNote.id)
         if (measure && targetEv?.type === 'note') {
           pendingCenterRef.current = nearNote.measureIndex
-          // Same rhythm → the click means "add this tone to the chord". The reducer rejects
-          // same-line clashes (e.g. C♮ + C♯). A different duration is a distinct rhythmic
-          // event, not a chord tone, so place it as a new note right after the target — the
-          // two then sit side by side (e.g. a held half note beside a moving quarter).
+          // Same rhythm in the same voice → add this tone to the chord. A different duration
+          // is a distinct rhythmic event within the voice, placed right after the target.
           if (targetEv.duration === selectedDuration && targetEv.dots === (isDotted ? 1 : 0)) {
             dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
             onNotePlaced?.()
             return nearNote.id
           }
           const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-          if (!noteCanFit(measure, candidate, timeSig)) return null
+          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, nearNote.measureIndex, timeSig), targetVoice)) return null
           const newId = crypto.randomUUID()
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
             type: 'INSERT_EVENTS', partId, measureId: measure.id, index: insertIdx,
-            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false }],
+            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice }],
           })
           onNotePlaced?.()
           return newId
         }
         return null
       }
-      const nearRest = nearestRestAtX(x)
+      const nearRest = nearestRestAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearRest) {
         const pitch = staffYToPitch(snapY, STAVE_Y, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
@@ -1111,7 +1131,7 @@ export function StaffCanvas({
             partId,
             measureId: measure.id,
             restId: nearRest.id,
-            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false },
+            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice },
           })
           onNotePlaced?.()
           return newId
@@ -1121,7 +1141,7 @@ export function StaffCanvas({
     } else if (!forceNew) {
       // Rest mode: clicking an existing note replaces it with a rest — mirror of
       // replacing a rest with a note above.
-      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X)
+      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
         const measure = measures[nearNote.measureIndex]
         if (measure) {
@@ -1132,7 +1152,7 @@ export function StaffCanvas({
             partId,
             measureId: measure.id,
             eventId: nearNote.id,
-            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
+            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
           })
           onNotePlaced?.()
           return newId
@@ -1144,19 +1164,19 @@ export function StaffCanvas({
     const measure = measures[idx]
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, timeSig)) {
+    if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, idx, timeSig), targetVoice)) {
       return null
     }
     placementAppendedRef.current = true
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
     if (isRest) {
-      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 } })
+      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice } })
       onNotePlaced?.()
     } else {
       const pitch = staffYToPitch(snapY, STAVE_Y, clef)
       const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false } })
+      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice } })
       onNotePlaced?.()
     }
     return newId
@@ -1268,7 +1288,8 @@ export function StaffCanvas({
     if (!measure) return null
     const beatCount = measureBeatCount(measure)
     if (beatCount < 0.001) return null
-    const full = isMeasureFull(measure, timeSig)
+    // Green only when every occupied voice independently fills the measure.
+    const full = incompleteVoices(measure, effectiveTimeSigAt(measures, i, timeSig)).length === 0
     return (
       <div
         key={measure.id}
@@ -1693,7 +1714,7 @@ export function StaffCanvas({
         <InsertStaff
           left={CARD_PAD - 4 + insertSession.anchorX - scrollLeft}
           top={CARD_PAD + STAVE_TOP_Y - 96 - 16}
-          capacity={measureRemainingBeats(measures[insertSession.measureIndex], timeSig)}
+          capacity={measureRemainingBeats(measures[insertSession.measureIndex], effectiveTimeSigAt(measures, insertSession.measureIndex, timeSig))}
           timeSig={timeSig}
           keySig={keySig}
           clef={clef}

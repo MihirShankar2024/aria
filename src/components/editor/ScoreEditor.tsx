@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Undo2, Redo2 } from 'lucide-react'
+import { Undo2, Redo2, Minus, Plus } from 'lucide-react'
 import { useScore } from '../../hooks/useScore'
 import { usePlayback } from '../../hooks/usePlayback'
 import { useScrollSync } from '../../hooks/useScrollSync'
@@ -10,13 +10,15 @@ import { GrandStaffCanvas } from './GrandStaffCanvas'
 import { DurationToolbar } from './DurationToolbar'
 import { PartsSidebar } from './PartsSidebar'
 import { AddInstrumentButton } from './AddInstrumentButton'
+import { RemoveTrackDialog, AddMeasuresDialog } from './TrackDialogs'
 import { PlaybackBar } from '../playback/PlaybackBar'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
+import { effectiveTimeSigAt } from '../../lib/beats'
 import { transposeChromatic } from '../../lib/transposition/transpose'
 import { selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
 import type { PendingRest } from './useDeleteTrail'
-import type { Part, Duration, Accidental, NoteEvent, Tie } from '../../types/score'
+import type { Part, Duration, Accidental, NoteEvent, Tie, VoiceNumber } from '../../types/score'
 
 const EMPTY_TIES: Tie[] = []
 
@@ -53,6 +55,7 @@ export function ScoreEditor() {
   const [selectedDuration, setSelectedDuration] = useState<Duration>('quarter')
   const [isDotted, setIsDotted] = useState(false)
   const [isRest, setIsRest] = useState(false)
+  const [activeVoice, setActiveVoice] = useState<VoiceNumber>(1)
   const [selectedAccidental, setSelectedAccidental] = useState<Accidental>(null)
   const [isTieMode, setIsTieMode] = useState(false)
   const [isFillMode, setIsFillMode] = useState(false)
@@ -61,8 +64,14 @@ export function ScoreEditor() {
   const [isInsertMode, setIsInsertMode] = useState(false)
   const [isSelectMode, setIsSelectMode] = useState(false)
   const [isSharpshooterMode, setIsSharpshooterMode] = useState(false)
+  // Keyboard placement: after placing a note, advance the cursor to the next beat (true,
+  // default) or stay on the note just placed (false).
+  const [advanceOnPlace, setAdvanceOnPlace] = useState(true)
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
   const [pendingRests, setPendingRests] = useState<PendingRest[] | null>(null)
+  // Track-header dialogs: confirm before removing a track; prompt for measure count.
+  const [removeTarget, setRemoveTarget] = useState<{ partId: string; name: string } | null>(null)
+  const [addMeasuresOpen, setAddMeasuresOpen] = useState(false)
   const scrollSync = useScrollSync()
   const { reportLayout } = usePlaybackScroll({ scrollSync, score, status })
 
@@ -100,10 +109,12 @@ export function ScoreEditor() {
     const sc = scoreRef.current
     const edits: { partId: string; measureId: string; notes: typeof sc.parts[0]['measures'][0]['notes'] }[] = []
     for (const { partId, measureId, restIds } of pend) {
-      const measure = sc.parts.find(p => p.id === partId)?.measures.find(m => m.id === measureId)
-      if (!measure) continue
+      const part = sc.parts.find(p => p.id === partId)
+      const mIdx = part?.measures.findIndex(m => m.id === measureId) ?? -1
+      const measure = mIdx >= 0 ? part!.measures[mIdx] : undefined
+      if (!part || !measure) continue
       const remove = new Set(restIds)
-      const notes = normalizeMeasureRests(measure.notes.filter(n => !remove.has(n.id)), measure.timeSig ?? sc.globalTimeSig)
+      const notes = normalizeMeasureRests(measure.notes.filter(n => !remove.has(n.id)), effectiveTimeSigAt(part.measures, mIdx, sc.globalTimeSig))
       edits.push({ partId, measureId, notes })
     }
     setPendingRests(null)
@@ -166,6 +177,7 @@ export function ScoreEditor() {
         case 'f': setSelectedAccidental(prev => { const next = prev === 'flat' ? null : 'flat'; if (next) setIsRest(false); return next }); break
         case 's': setSelectedAccidental(prev => { const next = prev === 'sharp' ? null : 'sharp'; if (next) setIsRest(false); return next }); break
         case 'n': setSelectedAccidental(prev => { const next = prev === 'natural' ? null : 'natural'; if (next) setIsRest(false); return next }); break
+        case 'v': setActiveVoice(prev => (prev === 1 ? 2 : 1)); break
         case 't': enterTieMode(prev => !prev); break
         case 'b': enterBroomMode(prev => !prev); break
         case 'i': enterInsertMode(prev => !prev); break
@@ -218,11 +230,12 @@ export function ScoreEditor() {
             const byEvent = selectionByEvent(selectedNoteIdsRef.current)
             const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
             for (const part of sc.parts) {
-              for (const measure of part.measures) {
+              for (let mIdx = 0; mIdx < part.measures.length; mIdx++) {
+                const measure = part.measures[mIdx]
                 if (!measure.notes.some(n => byEvent.has(n.id))) continue
                 // Remove selected noteheads (emptied chords drop out), then shift the rest
                 // left (no in-place rests), like collapsePending.
-                const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), measure.timeSig ?? sc.globalTimeSig)
+                const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), effectiveTimeSigAt(part.measures, mIdx, sc.globalTimeSig))
                 edits.push({ partId: part.id, measureId: measure.id, notes })
               }
             }
@@ -298,10 +311,11 @@ export function ScoreEditor() {
     const byEvent = selectionByEvent(selectedNoteIds)
     const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
     for (const part of score.parts) {
-      for (const measure of part.measures) {
+      for (let mIdx = 0; mIdx < part.measures.length; mIdx++) {
+        const measure = part.measures[mIdx]
         if (!measure.notes.some(n => byEvent.has(n.id))) continue
         // Remove selected noteheads (emptied chords drop out) and shift the rest left.
-        const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), measure.timeSig ?? score.globalTimeSig)
+        const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), effectiveTimeSigAt(part.measures, mIdx, score.globalTimeSig))
         edits.push({ partId: part.id, measureId: measure.id, notes })
       }
     }
@@ -346,6 +360,7 @@ export function ScoreEditor() {
     selectedAccidental,
     isDotted,
     isRest,
+    activeVoice,
     isTieMode,
     isFillMode,
     isDeleteMode,
@@ -353,6 +368,7 @@ export function ScoreEditor() {
     isInsertMode,
     isSelectMode,
     isSharpshooterMode,
+    advanceOnPlace,
     selectedNoteIds,
     onSelectionChange: setSelectedNoteIds,
     initialTempo: score.tempo,
@@ -405,6 +421,8 @@ export function ScoreEditor() {
           onDottedChange={setIsDotted}
           isRest={isRest}
           onRestChange={setIsRest}
+          activeVoice={activeVoice}
+          onActiveVoiceChange={setActiveVoice}
           selectedAccidental={selectedAccidental}
           onAccidentalChange={handleAccidentalChange}
           isTieMode={isTieMode}
@@ -421,6 +439,8 @@ export function ScoreEditor() {
           onSelectModeChange={enterSelectMode}
           isSharpshooterMode={isSharpshooterMode}
           onSharpshooterModeChange={enterSharpshooterMode}
+          advanceOnPlace={advanceOnPlace}
+          onAdvanceOnPlaceChange={setAdvanceOnPlace}
           selectedNoteCount={selectedNoteIds.size}
           onDeleteSelected={deleteSelectedNotes}
           hasPendingRests={!!pendingRests}
@@ -445,9 +465,12 @@ export function ScoreEditor() {
             if (group.type === 'grand') {
               return (
                 <div key={group.treble.id}>
-                  <p className="text-[11px] text-white/35 mb-2 font-medium tracking-widest uppercase">
-                    Piano
-                  </p>
+                  <TrackHeader
+                    name="Piano"
+                    canRemove={groups.length > 1}
+                    onRemove={() => setRemoveTarget({ partId: group.treble.id, name: 'Piano' })}
+                    onAddMeasures={() => setAddMeasuresOpen(true)}
+                  />
                   <GrandStaffCanvas
                     treblePart={group.treble}
                     bassPart={group.bass}
@@ -462,9 +485,12 @@ export function ScoreEditor() {
             const { part } = group
             return (
               <div key={part.id}>
-                <p className="text-[11px] text-white/35 mb-2 font-medium tracking-widest uppercase">
-                  {part.name}
-                </p>
+                <TrackHeader
+                  name={part.name}
+                  canRemove={groups.length > 1}
+                  onRemove={() => setRemoveTarget({ partId: part.id, name: part.name })}
+                  onAddMeasures={() => setAddMeasuresOpen(true)}
+                />
                 <StaffCanvas
                   partId={part.id}
                   measures={part.measures}
@@ -495,6 +521,54 @@ export function ScoreEditor() {
           <AddInstrumentButton dispatch={dispatch} />
         </div>
       </footer>
+
+      <RemoveTrackDialog
+        trackName={removeTarget?.name ?? null}
+        open={removeTarget !== null}
+        onOpenChange={open => { if (!open) setRemoveTarget(null) }}
+        onConfirm={() => { if (removeTarget) dispatch({ type: 'REMOVE_PART', partId: removeTarget.partId }) }}
+      />
+      <AddMeasuresDialog
+        open={addMeasuresOpen}
+        onOpenChange={setAddMeasuresOpen}
+        onConfirm={count => dispatch({ type: 'ADD_MEASURES', count })}
+      />
+    </div>
+  )
+}
+
+function TrackHeader({
+  name,
+  canRemove,
+  onRemove,
+  onAddMeasures,
+}: {
+  name: string
+  canRemove: boolean
+  onRemove: () => void
+  onAddMeasures: () => void
+}) {
+  return (
+    <div className="flex items-center gap-2 mb-2 group">
+      <p className="text-[11px] text-white/35 font-medium tracking-widest uppercase">{name}</p>
+      {canRemove && (
+        <button
+          onClick={onRemove}
+          title="Remove instrument"
+          className="opacity-0 group-hover:opacity-100 flex items-center justify-center h-4 w-4 rounded-full border border-white/20 text-white/40 hover:text-red-400 hover:border-red-400/60 transition"
+        >
+          <Minus className="h-2.5 w-2.5" />
+        </button>
+      )}
+      <div className="flex-1" />
+      <button
+        onClick={onAddMeasures}
+        title="Add measures"
+        className="flex items-center gap-1 rounded-md border border-white/15 bg-white/5 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-white/55 hover:border-white/30 hover:bg-white/10 hover:text-white transition"
+      >
+        <Plus className="h-3 w-3" />
+        Measures
+      </button>
     </div>
   )
 }

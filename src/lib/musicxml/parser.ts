@@ -21,7 +21,7 @@ function parseNote(el: Element): NoteEvent {
   const dots = el.querySelectorAll('dot').length
 
   if (isRest) {
-    const rest: Rest = { id: crypto.randomUUID(), type: 'rest', duration, dots }
+    const rest: Rest = { id: crypto.randomUUID(), type: 'rest', duration, dots, voice: 1 }
     return rest
   }
 
@@ -39,6 +39,7 @@ function parseNote(el: Element): NoteEvent {
     duration,
     dots,
     tied,
+    voice: 1,
   }
   return note
 }

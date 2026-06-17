@@ -9,7 +9,7 @@ import {
   GRAND_STAFF_HEIGHT,
 } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, whichGrandStaffStave, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration } from '../../lib/beats'
+import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
@@ -21,7 +21,7 @@ import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent } from '../../types/score'
+import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent, VoiceNumber } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const DOT_R = 7
@@ -88,12 +88,16 @@ interface GrandStaffCanvasProps {
   selectedAccidental: Accidental
   isDotted: boolean
   isRest: boolean
+  activeVoice?: VoiceNumber
   isTieMode: boolean
   isFillMode: boolean
   isDeleteMode: boolean
   isBroomMode: boolean
   isInsertMode: boolean
   isSharpshooterMode?: boolean
+  /** When true (default), placing a note in keyboard mode advances the cursor to the next
+   * beat; when false, the cursor stays on the note just placed. */
+  advanceOnPlace?: boolean
   initialTempo?: number
   tempoChanges?: { measureNumber: number; tempo: number }[]
   forcedStaveWidths?: number[]
@@ -120,12 +124,14 @@ export function GrandStaffCanvas({
   selectedAccidental,
   isDotted,
   isRest,
+  activeVoice = 1,
   isTieMode,
   isFillMode,
   isDeleteMode,
   isBroomMode,
   isInsertMode,
   isSharpshooterMode = false,
+  advanceOnPlace = true,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -183,6 +189,9 @@ export function GrandStaffCanvas({
   // chord-add, rest-replace, or modifier-on-existing). Lets the keyboard flow advance
   // to the next open spot after appending, while staying put when editing.
   const placementAppendedRef = useRef(false)
+  // Read inside the once-bound keydown handler, so toggling it takes effect live.
+  const advanceOnPlaceRef = useRef(advanceOnPlace)
+  advanceOnPlaceRef.current = advanceOnPlace
   const trebleMeasuresRef = useRef(treblePart.measures)
   trebleMeasuresRef.current = treblePart.measures
   const bassMeasuresRef = useRef(bassPart.measures)
@@ -244,9 +253,10 @@ export function GrandStaffCanvas({
       clef: 'treble',
       timeSig,
       keySig,
+      voice: activeVoice,
     })
     setGhost(nextGhost)
-  }, [selectedDuration, isDotted, selectedAccidental, isRest, timeSig, keySig,
+  }, [selectedDuration, isDotted, selectedAccidental, isRest, timeSig, keySig, activeVoice,
       isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
 
   // Smoothly recenter the active measure once it drifts into the right quarter.
@@ -320,7 +330,7 @@ export function GrandStaffCanvas({
       // doesn't linger in the now-dead end slot.
       const measureHere = measuresForStave(kc.stave)[kc.measureIndex]
       const nextG = layout.measures[kc.measureIndex + 1]
-      if (measureHere && nextG && isMeasureFull(measureHere, timeSig)) {
+      if (measureHere && nextG && isMeasureFull(measureHere, effectiveTimeSigAt(measuresForStave(kc.stave), kc.measureIndex, timeSig))) {
         const nextNotes = staveNotes
           .filter(n => n.measureIndex === kc.measureIndex + 1)
           .sort((a, b) => a.cx - b.cx)
@@ -376,13 +386,14 @@ export function GrandStaffCanvas({
   for (const meas of bassPart.measures) for (const ev of meas.notes) noteBeatsById.set(ev.id, noteBeatDuration(ev))
   const chordProximityFor = (id: string) => chordProximityForBeats(noteBeatsById.get(id) ?? 1)
 
-  const nearestNoteAtX = (notes: NoteGeometry[], x: number, maxDist = Infinity): NoteGeometry | null => {
+  const nearestNoteAtX = (notes: NoteGeometry[], x: number, maxDist = Infinity, voice?: VoiceNumber): NoteGeometry | null => {
     const scaled = Number.isFinite(maxDist)
     let best: NoteGeometry | null = null
     let bestDist = Infinity
     let bestCenterDist = Infinity
     for (const n of notes) {
       if (n.type !== 'note') continue
+      if (voice !== undefined && n.voice !== voice) continue
       const weightedLeftX = n.x - (n.x - n.leftX) * ACCIDENTAL_ZONE_WEIGHT
       // Distance to the note's horizontal span (incl. accidentals), 0 when inside it.
       const d = x < weightedLeftX ? weightedLeftX - x : x > n.rightX ? x - n.rightX : 0
@@ -398,11 +409,12 @@ export function GrandStaffCanvas({
     return best
   }
 
-  const nearestRestAtX = (notes: NoteGeometry[], x: number, maxDist = CHORD_PROXIMITY_X): NoteGeometry | null => {
+  const nearestRestAtX = (notes: NoteGeometry[], x: number, maxDist = CHORD_PROXIMITY_X, voice?: VoiceNumber): NoteGeometry | null => {
     let best: NoteGeometry | null = null
     let bestDist = maxDist
     for (const n of notes) {
       if (n.type !== 'rest') continue
+      if (voice !== undefined && n.voice !== voice) continue
       const d = Math.abs(n.x - x)
       if (d < bestDist) { bestDist = d; best = n }
     }
@@ -551,7 +563,7 @@ export function GrandStaffCanvas({
         if (!measure) continue
         for (const id of ids) if (measure.notes.find(n => n.id === id)?.type === 'note') removedIds.push(id)
         // Remove marked notes entirely and shift the remainder left (no in-place rests).
-        const newNotes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), measure.timeSig ?? timeSig)
+        const newNotes = normalizeMeasureRests(measure.notes.filter(n => !ids.has(n.id)), effectiveTimeSigAt(part.measures, mIdx, timeSig))
         edits.push({ partId: part.id, measureId: measure.id, notes: newNotes })
       }
     }
@@ -911,7 +923,7 @@ export function GrandStaffCanvas({
       if (down && coords
         && Math.abs(coords.x - down.x) <= PLACE_DRAG_TOLERANCE_PX
         && Math.abs(coords.y - down.y) <= PLACE_DRAG_TOLERANCE_PX) {
-        placeAt(coords.x, coords.y)
+        placeAt(coords.x, coords.y, false, e.altKey)
       }
       return
     }
@@ -933,9 +945,10 @@ export function GrandStaffCanvas({
 
   // Returns the id of the note/rest placed or modified (so the keyboard cursor can
   // anchor to it), or null if nothing happened.
-  const placeAt = (x: number, y: number, forceNew = false): string | null => {
+  const placeAt = (x: number, y: number, forceNew = false, altKey = false): string | null => {
     placementAppendedRef.current = false
     if (isSharpshooterMode) return null
+    const targetVoice: VoiceNumber = altKey ? 2 : activeVoice
     const stave = whichStave(y)
     const staveY = stave === 'treble' ? GRAND_TREBLE_Y : GRAND_BASS_Y
     const part = stave === 'treble' ? treblePart : bassPart
@@ -962,7 +975,9 @@ export function GrandStaffCanvas({
     }
 
     if (!forceNew && !isRest) {
-      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
+      // Proximity restricted to the target voice so a click near another voice's note
+      // starts an independent stack instead of chording onto it.
+      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
         const pitch = staffYToPitch(snapY, staveY, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
@@ -970,28 +985,27 @@ export function GrandStaffCanvas({
         const targetEv = measure?.notes.find(n => n.id === nearNote.id)
         if (measure && targetEv?.type === 'note') {
           pendingCenterRef.current = nearNote.measureIndex
-          // Same rhythm → add this tone to the chord (reducer rejects same-line clashes like
-          // C♮ + C♯). A different duration is a distinct rhythmic event, not a chord tone, so
-          // place it as a new note right after the target so the two sit side by side.
+          // Same rhythm in the same voice → chord tone. A different duration is a distinct
+          // rhythmic event within the voice, placed right after the target.
           if (targetEv.duration === selectedDuration && targetEv.dots === (isDotted ? 1 : 0)) {
             dispatch({ type: 'ADD_CHORD_NOTE', partId: part.id, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
             onNotePlaced?.()
             return nearNote.id
           }
           const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-          if (!noteCanFit(measure, candidate, timeSig)) return null
+          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, nearNote.measureIndex, timeSig), targetVoice)) return null
           const newId = crypto.randomUUID()
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
             type: 'INSERT_EVENTS', partId: part.id, measureId: measure.id, index: insertIdx,
-            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false }],
+            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice }],
           })
           onNotePlaced?.()
           return newId
         }
         return null
       }
-      const nearRest = nearestRestAtX(notes, x)
+      const nearRest = nearestRestAtX(notes, x, CHORD_PROXIMITY_X, targetVoice)
       if (nearRest) {
         const pitch = staffYToPitch(snapY, staveY, clef)
         const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
@@ -1004,7 +1018,7 @@ export function GrandStaffCanvas({
             partId: part.id,
             measureId: measure.id,
             restId: nearRest.id,
-            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false },
+            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice },
           })
           onNotePlaced?.()
           return newId
@@ -1012,7 +1026,7 @@ export function GrandStaffCanvas({
         return null
       }
     } else if (!forceNew) {
-      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
+      const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
         const measure = part.measures[nearNote.measureIndex]
         if (measure) {
@@ -1023,7 +1037,7 @@ export function GrandStaffCanvas({
             partId: part.id,
             measureId: measure.id,
             eventId: nearNote.id,
-            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
+            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
           })
           onNotePlaced?.()
           return newId
@@ -1035,7 +1049,7 @@ export function GrandStaffCanvas({
     const measure = part.measures[idx]
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, timeSig)) return null
+    if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, idx, timeSig), targetVoice)) return null
     placementAppendedRef.current = true
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
@@ -1045,7 +1059,7 @@ export function GrandStaffCanvas({
         type: 'ADD_REST',
         partId: part.id,
         measureId: measure.id,
-        rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0 },
+        rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
       })
       onNotePlaced?.()
       return newId
@@ -1064,6 +1078,7 @@ export function GrandStaffCanvas({
         duration: selectedDuration,
         dots: isDotted ? 1 : 0,
         tied: false,
+        voice: targetVoice,
       },
     })
     onNotePlaced?.()
@@ -1177,7 +1192,7 @@ export function GrandStaffCanvas({
             break
           }
           const measureHere = measuresForStave(baseCursor.stave)[mIdx]
-          const full = measureHere ? isMeasureFull(measureHere, timeSigRef.current) : false
+          const full = measureHere ? isMeasureFull(measureHere, effectiveTimeSigAt(measuresForStave(baseCursor.stave), mIdx, timeSigRef.current)) : false
           const endSlotX = g ? g.x + g.width - 16 : baseCursor.x
           if (!full && !baseCursor.atEnd) {
             setKeyboardCursor({ ...baseCursor, x: endSlotX, anchorId: undefined, atEnd: true })
@@ -1210,9 +1225,14 @@ export function GrandStaffCanvas({
             if (!locked) {
               // do nothing — the hovering cursor stays put
             } else if (placementAppendedRef.current) {
-              // Appended a new note: hover the next open spot of that measure. If this
-              // filled the bar, the reflow effect auto-advances to the next measure.
-              setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+              // Appended a new note. With auto-advance on (default), hover the next open
+              // spot of that measure (if this filled the bar, the reflow effect advances to
+              // the next measure). With it off, stay anchored on the note just placed.
+              if (advanceOnPlaceRef.current) {
+                setKeyboardCursor({ ...baseCursor, anchorId: undefined, atEnd: true })
+              } else {
+                setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
+              }
             } else if (!baseCursor.atEnd) {
               // Edited an existing note (chord-add / rest-replace / modifier): stay on it.
               setKeyboardCursor({ ...baseCursor, anchorId: placedId, atEnd: false })
@@ -1262,7 +1282,7 @@ export function GrandStaffCanvas({
     const tm = treblePart.measures[i]
     const bm = bassPart.measures[i]
     if (tm && measureBeatCount(tm) > 0.001) {
-      const full = isMeasureFull(tm, timeSig)
+      const full = incompleteVoices(tm, effectiveTimeSigAt(treblePart.measures, i, timeSig)).length === 0
       elems.push(
         <div key={`t-${i}`} className="absolute pointer-events-none" style={{
           left: g.x, top: TREBLE_TOP_Y, width: g.width, height: TREBLE_BOTTOM_Y - TREBLE_TOP_Y,
@@ -1274,7 +1294,7 @@ export function GrandStaffCanvas({
       )
     }
     if (bm && measureBeatCount(bm) > 0.001) {
-      const full = isMeasureFull(bm, timeSig)
+      const full = incompleteVoices(bm, effectiveTimeSigAt(bassPart.measures, i, timeSig)).length === 0
       elems.push(
         <div key={`b-${i}`} className="absolute pointer-events-none" style={{
           left: g.x, top: BASS_TOP_Y, width: g.width, height: BASS_BOTTOM_Y - BASS_TOP_Y,
@@ -1696,7 +1716,7 @@ export function GrandStaffCanvas({
           <InsertStaff
             left={CARD_PAD - 4 + insertSession.anchorX - scrollLeft}
             top={CARD_PAD + topY - 96 - 16}
-            capacity={measureRemainingBeats(measure, timeSig)}
+            capacity={measureRemainingBeats(measure, effectiveTimeSigAt(part.measures, insertSession.measureIndex, timeSig))}
             timeSig={timeSig}
             keySig={keySig}
             clef={insertSession.stave === 'treble' ? 'treble' : 'bass'}

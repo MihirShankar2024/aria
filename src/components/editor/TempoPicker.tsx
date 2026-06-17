@@ -24,9 +24,17 @@ interface TempoPickerProps {
 export function TempoPicker({ initialTempo, measureCount, dispatch, children }: TempoPickerProps) {
   const [open, setOpen] = useState(false)
   const [bpm, setBpm] = useState(initialTempo)
+  const [bpmText, setBpmText] = useState(String(initialTempo))
   const [fromMeasure, setFromMeasure] = useState(1)
+  const [fromMeasureText, setFromMeasureText] = useState('1')
 
   const clamp = (v: number) => Math.max(20, Math.min(300, v))
+
+  // Slider/preset changes drive the canonical bpm; keep the text field showing it too.
+  const setBpmSynced = (v: number) => {
+    setBpm(v)
+    setBpmText(String(v))
+  }
 
   const apply = () => {
     if (fromMeasure <= 1) {
@@ -48,11 +56,19 @@ export function TempoPicker({ initialTempo, measureCount, dispatch, children }: 
           <div className="flex items-center gap-3">
             <span className="text-white/50 text-sm">♩ =</span>
             <Input
-              type="number"
-              min={20}
-              max={300}
-              value={bpm}
-              onChange={e => setBpm(clamp(parseInt(e.target.value) || 60))}
+              type="text"
+              inputMode="numeric"
+              value={bpmText}
+              onChange={e => {
+                setBpmText(e.target.value)
+                const n = parseInt(e.target.value)
+                if (!isNaN(n)) setBpm(clamp(n))
+              }}
+              onBlur={() => {
+                const clamped = clamp(parseInt(bpmText) || 60)
+                setBpm(clamped)
+                setBpmText(String(clamped))
+              }}
               className="h-9 bg-white/5 border-white/15 text-white text-lg font-semibold w-24 text-center"
             />
             <span className="text-white/40 text-xs">BPM</span>
@@ -64,7 +80,7 @@ export function TempoPicker({ initialTempo, measureCount, dispatch, children }: 
             max={300}
             step={1}
             value={[bpm]}
-            onValueChange={([v]) => setBpm(v)}
+            onValueChange={([v]) => setBpmSynced(v)}
             className="w-full"
           />
 
@@ -73,7 +89,7 @@ export function TempoPicker({ initialTempo, measureCount, dispatch, children }: 
             {TEMPO_MARKS.map(({ label, bpm: b }) => (
               <button
                 key={label}
-                onClick={() => setBpm(b)}
+                onClick={() => setBpmSynced(b)}
                 className="px-2 py-1 rounded text-[10px] bg-white/5 text-white/50 hover:bg-white/10 hover:text-white transition-colors"
               >
                 {label}
@@ -86,11 +102,19 @@ export function TempoPicker({ initialTempo, measureCount, dispatch, children }: 
             <Label className="text-[10px] text-white/40 uppercase tracking-wider">From measure</Label>
             <div className="flex items-center gap-2 mt-1">
               <Input
-                type="number"
-                min={1}
-                max={measureCount}
-                value={fromMeasure}
-                onChange={e => setFromMeasure(Math.max(1, Math.min(measureCount, parseInt(e.target.value) || 1)))}
+                type="text"
+                inputMode="numeric"
+                value={fromMeasureText}
+                onChange={e => {
+                  setFromMeasureText(e.target.value)
+                  const n = parseInt(e.target.value)
+                  if (!isNaN(n)) setFromMeasure(Math.max(1, Math.min(measureCount, n)))
+                }}
+                onBlur={() => {
+                  const clamped = Math.max(1, Math.min(measureCount, parseInt(fromMeasureText) || 1))
+                  setFromMeasure(clamped)
+                  setFromMeasureText(String(clamped))
+                }}
                 className="h-8 bg-white/5 border-white/15 text-white text-sm w-20"
               />
               <span className="text-xs text-white/40">

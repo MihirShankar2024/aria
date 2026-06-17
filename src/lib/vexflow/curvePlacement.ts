@@ -134,8 +134,10 @@ function autoDirection(input: PlacementInput): CurveDirection {
   if (chordRole === 'top') return -1
   if (chordRole === 'bottom') return 1
 
-  // 4. Single voice: the curve goes opposite the stems (notehead side). Only notes
-  //    that actually have a stem vote.
+  // 4. Single voice: the curve goes opposite the stems (notehead side). Stems up →
+  //    noteheads sit below → curve bulges DOWN (1); stems down → curve bulges UP (-1).
+  //    This matches VexFlow's own default (StaveTie direction = stem direction). Only
+  //    notes that actually have a stem vote.
   let stemsUp = 0
   let stemsDown = 0
   for (const vn of coveredNotes) {
@@ -143,7 +145,7 @@ function autoDirection(input: PlacementInput): CurveDirection {
     if (vn.getStemDirection() === 1) stemsUp++
     else stemsDown++
   }
-  if (stemsUp + stemsDown > 0) return stemsUp >= stemsDown ? -1 : 1
+  if (stemsUp + stemsDown > 0) return stemsUp >= stemsDown ? 1 : -1
 
   // 5. Whole notes / no stems anywhere: standard practice keys off staff position —
   //    above when the head sits at or above the middle line, below otherwise.

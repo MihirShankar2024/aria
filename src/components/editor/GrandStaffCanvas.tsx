@@ -657,7 +657,7 @@ export function GrandStaffCanvas({
     setBroomMarks([])
     if (targets.length === 0) return
     const parts = [treblePart, bassPart]
-    const glyphsByNote = new Map<string, BroomTarget[]>()
+    const glyphsByNote = new Map<string, Extract<BroomTarget, { kind: 'glyph' }>[]>()
     for (const t of targets) {
       if (t.kind !== 'glyph') continue
       const arr = glyphsByNote.get(t.noteId) ?? []

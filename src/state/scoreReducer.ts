@@ -11,6 +11,25 @@ function createDefaultMeasure(number: number): Measure {
   return { id: crypto.randomUUID(), number, notes: [] }
 }
 
+// Build the measure list for a brand-new part so it stays barline-aligned AND inherits
+// the universal time/key-signature overrides already placed mid-score. Time sig and key
+// sig live per-measure per-part (applied to every part via SET_SCORE_*_AT), so a fresh
+// part built from blank measures would silently miss any change after measure 1 and break
+// the "signatures are universal" invariant. We copy each override from a reference part
+// (the first existing part — all parts share the same overrides) keyed by measure number.
+// Tempo is already score-level (tempoChanges), so it needs no copying here.
+function createInheritedMeasures(score: Score, count: number): Measure[] {
+  const reference = score.parts[0]
+  return Array.from({ length: count }, (_, i) => {
+    const number = i + 1
+    const measure = createDefaultMeasure(number)
+    const ref = reference?.measures.find(m => m.number === number)
+    if (ref?.timeSig) measure.timeSig = ref.timeSig
+    if (ref?.keySig) measure.keySig = ref.keySig
+    return measure
+  })
+}
+
 // Rest canonicalization walks a single linear timeline, so it must run per voice —
 // otherwise it would merge/mis-group rests from two interleaved voices. Each voice's
 // events are normalized independently and the result is re-stamped with its voice
@@ -349,6 +368,20 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         }
         break
       }
+      case 'CLEAR_MEASURE_KEY_SIG': {
+        for (const part of draft.parts) {
+          const measure = part.measures.find(m => m.number === action.measureNumber)
+          if (measure) measure.keySig = undefined
+        }
+        break
+      }
+      case 'CLEAR_MEASURE_TIME_SIG': {
+        for (const part of draft.parts) {
+          const measure = part.measures.find(m => m.number === action.measureNumber)
+          if (measure) measure.timeSig = undefined
+        }
+        break
+      }
       case 'SET_GLOBAL_TIME_SIG': {
         draft.globalTimeSig = action.timeSig
         break
@@ -385,9 +418,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           name: action.name,
           instrument: action.instrument,
           clef: action.clef,
-          measures: Array.from({ length: getMeasureCount(draft) || 4 }, (_, i) =>
-            createDefaultMeasure(i + 1),
-          ),
+          measures: createInheritedMeasures(draft, getMeasureCount(draft) || 4),
         })
         break
       }
@@ -400,7 +431,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           name: 'Piano (Treble)',
           instrument: 'piano',
           clef: 'treble',
-          measures: Array.from({ length: count }, (_, i) => createDefaultMeasure(i + 1)),
+          measures: createInheritedMeasures(draft, count),
           grandStaffPartnerId: bassId,
         })
         draft.parts.push({
@@ -408,7 +439,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           name: 'Piano (Bass)',
           instrument: 'piano_bass',
           clef: 'bass',
-          measures: Array.from({ length: count }, (_, i) => createDefaultMeasure(i + 1)),
+          measures: createInheritedMeasures(draft, count),
           grandStaffPartnerId: trebleId,
         })
         break

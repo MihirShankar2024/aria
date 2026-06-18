@@ -146,3 +146,17 @@ body {
   background: var(--background);
   color: var(--foreground);
 }
+
+/* Empty-track hint: gentle bob + fade-in so the prompt feels alive, not static.
+   Anchored from the right edge, so it only bobs vertically (translateY). */
+@keyframes empty-hint-float {
+  0%, 100% { transform: translateY(-50%); }
+  50%      { transform: translateY(calc(-50% - 5px)); }
+}
+@keyframes empty-hint-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.empty-track-hint {
+  animation: empty-hint-in 0.6s ease-out both, empty-hint-float 4.5s ease-in-out 0.6s infinite backwards;
+}

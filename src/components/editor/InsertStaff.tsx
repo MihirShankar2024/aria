@@ -41,6 +41,7 @@ interface InsertStaffProps {
   isRest: boolean
   onCommit: (events: NoteEvent[]) => void
   onCancel: () => void
+  onPlaceFailed?: () => void
 }
 
 const STEP_ORDER = { C: 0, D: 1, E: 2, F: 3, G: 4, A: 5, B: 6 }
@@ -63,6 +64,7 @@ export function InsertStaff({
   isRest,
   onCommit,
   onCancel,
+  onPlaceFailed,
 }: InsertStaffProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scratch, setScratch] = useState<NoteEvent[]>([])
@@ -190,7 +192,7 @@ export function InsertStaff({
     }
 
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (beats + noteBeatDuration(candidate) > capacity + EPS) return null  // would overflow the target measure
+    if (beats + noteBeatDuration(candidate) > capacity + EPS) { onPlaceFailed?.(); return null }
 
     const newId = crypto.randomUUID()
     if (isRest) {

@@ -11,7 +11,7 @@ export function usePlayback() {
   const set = useCallback((s: PlaybackStatus) => { statusRef.current = s; setStatus(s) }, [])
 
   // Start from the beginning, or resume from a paused playhead.
-  const play = useCallback(async (score: Score, selectedNoteIds?: Set<string>) => {
+  const play = useCallback(async (score: Score, selectedNoteIds?: Set<string>, partVolumes?: Record<string, number>) => {
     if (statusRef.current === 'playing') return
     if (statusRef.current === 'paused') {
       resumePlayback()
@@ -19,7 +19,7 @@ export function usePlayback() {
       return
     }
     set('playing')
-    await buildAndPlayScore(score, () => set('stopped'), selectedNoteIds)
+    await buildAndPlayScore(score, () => set('stopped'), selectedNoteIds, partVolumes)
   }, [set])
 
   // Halt playback but keep the playhead so play() resumes from here.

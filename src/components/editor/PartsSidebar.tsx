@@ -1,5 +1,6 @@
-import { Trash2, Music } from 'lucide-react'
+import { Trash2, Music, Volume2 } from 'lucide-react'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select'
+import { Slider } from '../ui/slider'
 import { INSTRUMENT_DB } from '../../lib/instruments'
 import type { Part } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
@@ -7,9 +8,29 @@ import type { ScoreAction } from '../../state/actions'
 interface PartsSidebarProps {
   parts: Part[]
   dispatch: (action: ScoreAction) => void
+  volumes: Record<string, number>
+  // Sets playback volume (gain 0–1) for the given part ids — a grand staff updates both.
+  onVolumeChange: (partIds: string[], volume: number) => void
 }
 
-export function PartsSidebar({ parts, dispatch }: PartsSidebarProps) {
+// A compact playback-volume row shared by single parts and grand staves.
+function VolumeSlider({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="flex items-center gap-2 px-4 pb-1">
+      <Volume2 className="h-3 w-3 text-white/30 flex-shrink-0" />
+      <Slider
+        value={[value]}
+        min={0}
+        max={1}
+        step={0.01}
+        onValueChange={([v]) => onChange(v)}
+        className="flex-1"
+      />
+    </div>
+  )
+}
+
+export function PartsSidebar({ parts, dispatch, volumes, onVolumeChange }: PartsSidebarProps) {
   // Group grand-staff pairs so we can render them together.
   const rendered = new Set<string>()
   const groups: Array<{ type: 'single'; part: Part } | { type: 'grand'; treble: Part; bass: Part }> = []
@@ -57,6 +78,8 @@ export function PartsSidebar({ parts, dispatch }: PartsSidebarProps) {
               canRemove={parts.length > 2}
               onRemove={() => handleRemove(group.treble.id)}
               onInstrumentChange={handleInstrumentChange}
+              volume={volumes[group.treble.id] ?? 1}
+              onVolumeChange={v => onVolumeChange([group.treble.id, group.bass.id], v)}
             />
           ) : (
             <PartRow
@@ -65,6 +88,8 @@ export function PartsSidebar({ parts, dispatch }: PartsSidebarProps) {
               canRemove={parts.length > 1}
               onRemove={() => handleRemove(group.part.id)}
               onInstrumentChange={handleInstrumentChange}
+              volume={volumes[group.part.id] ?? 1}
+              onVolumeChange={v => onVolumeChange([group.part.id], v)}
             />
           ),
         )}
@@ -78,11 +103,15 @@ function PartRow({
   canRemove,
   onRemove,
   onInstrumentChange,
+  volume,
+  onVolumeChange,
 }: {
   part: Part
   canRemove: boolean
   onRemove: () => void
   onInstrumentChange: (partId: string, instrument: string) => void
+  volume: number
+  onVolumeChange: (volume: number) => void
 }) {
   const availableInstruments = Object.values(INSTRUMENT_DB).filter(i => i.key !== 'piano_bass')
 
@@ -114,6 +143,7 @@ function PartRow({
           </button>
         )}
       </div>
+      <VolumeSlider value={volume} onChange={onVolumeChange} />
     </div>
   )
 }
@@ -121,12 +151,16 @@ function PartRow({
 function GrandStaffRow({
   canRemove,
   onRemove,
+  volume,
+  onVolumeChange,
 }: {
   treble: Part
   bass: Part
   canRemove: boolean
   onRemove: () => void
   onInstrumentChange: (partId: string, instrument: string) => void
+  volume: number
+  onVolumeChange: (volume: number) => void
 }) {
   return (
     <div className="px-2">
@@ -146,6 +180,7 @@ function GrandStaffRow({
           </button>
         )}
       </div>
+      <VolumeSlider value={volume} onChange={onVolumeChange} />
     </div>
   )
 }

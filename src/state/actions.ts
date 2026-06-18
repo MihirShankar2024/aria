@@ -21,6 +21,8 @@ export type ScoreAction =
   | { type: 'DELETE_MEASURE'; partId: string; measureId: string }
   | { type: 'SET_TIME_SIG'; partId: string; measureId: string; timeSig: TimeSig }
   | { type: 'SET_KEY_SIG'; partId: string; measureId: string; keySig: KeySig }
+  | { type: 'CLEAR_MEASURE_KEY_SIG'; measureNumber: number }
+  | { type: 'CLEAR_MEASURE_TIME_SIG'; measureNumber: number }
   | { type: 'SET_GLOBAL_TIME_SIG'; timeSig: TimeSig }
   | { type: 'SET_GLOBAL_KEY_SIG'; keySig: KeySig }
   | { type: 'SET_SCORE_TIME_SIG_AT'; measureNumber: number; timeSig: TimeSig }

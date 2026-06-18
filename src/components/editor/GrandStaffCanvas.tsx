@@ -9,7 +9,8 @@ import {
   GRAND_STAFF_HEIGHT,
 } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, whichGrandStaffStave, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { getClipboard, cloneWithFreshIds } from './clipboard'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
@@ -51,6 +52,12 @@ const TREBLE_BOTTOM_Y = TREBLE_TOP_Y + 4 * LINE_SPACING
 const BASS_TOP_Y      = GRAND_BASS_Y + STAVE_TOP_OFFSET
 const BASS_BOTTOM_Y   = BASS_TOP_Y + 4 * LINE_SPACING
 const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
+
+// Broom highlight box offsets — tune these to align each rect with the actual glyph.
+const BROOM_KEY_SIG_DY  = 30   // key signature accidentals (vertical)
+const BROOM_KEY_SIG_DX  = -10  // key signature accidentals (horizontal)
+const BROOM_TIME_SIG_DY = 48   // time signature digits
+const BROOM_TEMPO_DY    = 8    // tempo marking text above the stave
 const PANEL_EDGE_DEADBAND_PX = 10  // keep cursor from latching at panel extremes
 
 interface HoverInfo { x: number; snapY: number; stave: 'treble' | 'bass'; isChordTarget: boolean; restTarget: { x: number; y: number } | null; noteTarget: { x: number; y: number } | null }
@@ -60,6 +67,9 @@ interface TieDrag { partId: string; fromId: string; fromPitchId: string; fromX: 
 type BroomTarget =
   | { kind: 'glyph'; key: string; partId: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
   | { kind: 'tie'; key: string; partId: string; tieId: string; x: number; y: number }
+  | { kind: 'keySig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
+  | { kind: 'timeSig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
+  | { kind: 'tempo'; key: string; measureNumber: number; x: number; y: number }
 
 // A chosen insertion point on a specific stave.
 interface InsertSession {
@@ -110,6 +120,7 @@ interface GrandStaffCanvasProps {
   onTieComplete?: () => void
   onFillComplete?: () => void
   onInsertComplete?: () => void
+  onPlaceFailed?: () => void
   onRestsCommitted?: (pending: PendingRest[]) => void
   onPlaybackLayoutChange?: (layout: PlaybackLayout) => void
 }
@@ -131,7 +142,7 @@ export function GrandStaffCanvas({
   isBroomMode,
   isInsertMode,
   isSharpshooterMode = false,
-  advanceOnPlace = true,
+  advanceOnPlace = false,
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
@@ -144,6 +155,7 @@ export function GrandStaffCanvas({
   onTieComplete,
   onFillComplete,
   onInsertComplete,
+  onPlaceFailed,
   onPlaybackLayoutChange,
 }: GrandStaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -208,6 +220,9 @@ export function GrandStaffCanvas({
   const broomRef = useRef<Map<string, BroomTarget>>(new Map())
   const [broomMarks, setBroomMarks] = useState<BroomTarget[]>([])
   const broomingRef = useRef(false)
+  // Stave+measure briefly flashed red when a paste is rejected for overflowing the bar.
+  const [failFlash, setFailFlash] = useState<{ stave: 'treble' | 'bass'; measureIndex: number } | null>(null)
+  const failTimerRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -612,6 +627,25 @@ export function GrandStaffCanvas({
         added = true
       }
     }
+    for (const d of layout.decorations) {
+      if (Math.hypot(d.x - x, d.y - y) > BRUSH_R * 2) continue
+      const key = `d:${d.kind}:${d.measureIndex}`
+      if (broomRef.current.has(key)) continue
+      const measureNumber = treblePart.measures[d.measureIndex]?.number
+      if (measureNumber === undefined) continue
+      broomRef.current.set(key, { kind: d.kind as 'keySig' | 'timeSig', key, measureIndex: d.measureIndex, measureNumber, x: d.x, y: d.y })
+      added = true
+    }
+    for (const tm of layout.tempoMarks) {
+      if (tm.measureNumber === 1) continue
+      const tmBroomX = tm.x + 28
+      const tmBroomY = tm.y - 16
+      if (Math.hypot(tmBroomX - x, tmBroomY - y) > BRUSH_R * 2) continue
+      const key = `tempo:${tm.measureNumber}`
+      if (broomRef.current.has(key)) continue
+      broomRef.current.set(key, { kind: 'tempo', key, measureNumber: tm.measureNumber, x: tmBroomX, y: tmBroomY })
+      added = true
+    }
     if (added) setBroomMarks([...broomRef.current.values()])
   }
 
@@ -645,6 +679,15 @@ export function GrandStaffCanvas({
     }
     for (const t of targets) {
       if (t.kind === 'tie') dispatch({ type: 'REMOVE_TIE', partId: t.partId, tieId: t.tieId })
+      if (t.kind === 'keySig') {
+        if (t.measureNumber === 1) {
+          dispatch({ type: 'SET_GLOBAL_KEY_SIG', keySig: { fifths: 0, mode: 'major' } })
+        } else {
+          dispatch({ type: 'CLEAR_MEASURE_KEY_SIG', measureNumber: t.measureNumber })
+        }
+      }
+      if (t.kind === 'timeSig') dispatch({ type: 'CLEAR_MEASURE_TIME_SIG', measureNumber: t.measureNumber })
+      if (t.kind === 'tempo') dispatch({ type: 'REMOVE_MEASURE_TEMPO', measureNumber: t.measureNumber })
     }
   }
 
@@ -993,7 +1036,7 @@ export function GrandStaffCanvas({
             return nearNote.id
           }
           const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, nearNote.measureIndex, timeSig), targetVoice)) return null
+          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, nearNote.measureIndex, timeSig), targetVoice)) { onPlaceFailed?.(); return null }
           const newId = crypto.randomUUID()
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
@@ -1049,7 +1092,7 @@ export function GrandStaffCanvas({
     const measure = part.measures[idx]
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, idx, timeSig), targetVoice)) return null
+    if (!noteCanFit(measure, candidate, effectiveTimeSigAt(part.measures, idx, timeSig), targetVoice)) { onPlaceFailed?.(); return null }
     placementAppendedRef.current = true
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
@@ -1088,6 +1131,43 @@ export function GrandStaffCanvas({
   const placeAtRef = useRef(placeAt)
   placeAtRef.current = placeAt
 
+  // Flash a measure red on the given stave to signal a rejected paste.
+  const flashFail = (stave: 'treble' | 'bass', measureIndex: number) => {
+    setFailFlash({ stave, measureIndex })
+    if (failTimerRef.current !== null) window.clearTimeout(failTimerRef.current)
+    failTimerRef.current = window.setTimeout(() => setFailFlash(null), 450)
+  }
+
+  // Paste the clipboard at the cursor (keyboard cursor, else mouse hover) on its stave,
+  // inserting before the cursor note. Rejected (red flash) when it overflows the bar.
+  const pasteFromClipboard = () => {
+    const clip = getClipboard()
+    if (clip.length === 0 || !layout) return
+    const kc = keyboardCursorRef.current
+    const stave: 'treble' | 'bass' = kc?.stave ?? hoverInfoRef.current?.stave ?? 'treble'
+    const cursorX = kc?.x ?? hoverInfoRef.current?.x
+    if (cursorX == null) return
+    const mIdx = kc?.measureIndex ?? getMeasureIndexAtX(cursorX)
+    const part = stave === 'treble' ? treblePart : bassPart
+    const measure = part.measures[mIdx]
+    if (!measure) return
+    const ts = effectiveTimeSigAt(part.measures, mIdx, timeSig)
+    const events = cloneWithFreshIds(clip)
+    for (const v of [1, 2] as VoiceNumber[]) {
+      const add = events.filter(ev => ev.voice === v).reduce((s, ev) => s + noteBeatDuration(ev), 0)
+      if (add > 0 && measureBeatCount(measure, v) + add > measureCapacity(ts) + 0.001) {
+        flashFail(stave, mIdx)
+        onPlaceFailed?.()
+        return
+      }
+    }
+    const gapIndex = gapAtX(stave, mIdx, cursorX)?.gapIndex ?? measure.notes.length
+    pendingCenterRef.current = mIdx
+    dispatch({ type: 'INSERT_EVENTS', partId: part.id, measureId: measure.id, index: gapIndex, events })
+  }
+  const pasteRef = useRef(pasteFromClipboard)
+  pasteRef.current = pasteFromClipboard
+
   const previewNextSlotX = (stave: 'treble' | 'bass', mIdx: number): number => {
     if (!layout) return keyboardCursor?.x ?? 0
     const g = layout.measures[mIdx]
@@ -1117,8 +1197,13 @@ export function GrandStaffCanvas({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (!mouseInStaffRef.current) return
-      if (isSelectModeRef.current || isSharpshooterModeRef.current) return
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') {
+        e.preventDefault()
+        pasteRef.current()
+        return
+      }
+      if (isSelectModeRef.current || isSharpshooterModeRef.current) return
       if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
 
       const currentLayout = layoutRef.current
@@ -1308,6 +1393,13 @@ export function GrandStaffCanvas({
     return elems
   })
 
+  // Empty track: no notes placed in either stave (rests don't count). Show a friendly
+  // hint centered over the grand staff inviting the user to start playing.
+  const isEmptyTrack =
+    (treblePart.measures.length > 0 || bassPart.measures.length > 0) &&
+    treblePart.measures.every(m => m.notes.every(n => n.type !== 'note')) &&
+    bassPart.measures.every(m => m.notes.every(n => n.type !== 'note'))
+
   const tempoOverlays = layout?.tempoMarks.map(tm => (
     <div
       key={`tempo-${tm.measureNumber}`}
@@ -1351,7 +1443,7 @@ export function GrandStaffCanvas({
       ref={el => { scrollRef.current = el; scrollSync?.register(el) }}
       onScroll={() => { if (scrollRef.current) { scrollSync?.onScroll(scrollRef.current); setScrollLeft(scrollRef.current.scrollLeft) } }}
       className={
-        'bg-white rounded-lg p-4 block w-full select-none overflow-x-auto ' +
+        'relative bg-white rounded-lg p-4 block w-full select-none overflow-x-auto ' +
         (isTieMode || isFillMode || isDeleteMode || isInsertMode ? 'cursor-pointer' : 'cursor-crosshair')
       }
       style={{ minHeight: GRAND_STAFF_HEIGHT + 32 }}
@@ -1375,6 +1467,24 @@ export function GrandStaffCanvas({
         <div ref={containerRef} />
         {measureOverlays}
         {tempoOverlays}
+
+        {/* Rejected-paste flash on the target stave. */}
+        {failFlash && layout?.measures[failFlash.measureIndex] && (() => {
+          const g = layout.measures[failFlash.measureIndex]
+          const top = failFlash.stave === 'treble' ? TREBLE_TOP_Y : BASS_TOP_Y
+          const h = failFlash.stave === 'treble' ? TREBLE_BOTTOM_Y - TREBLE_TOP_Y : BASS_BOTTOM_Y - BASS_TOP_Y
+          return (
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                left: g.x, top, width: g.width, height: h,
+                background: 'rgba(239,68,68,0.22)',
+                border: '1.5px solid rgba(239,68,68,0.7)',
+                zIndex: 17,
+              }}
+            />
+          )
+        })()}
 
         {/* Violet highlights for selected noteheads (per-pitch). */}
         {selectedNoteIds && layout && (() => {
@@ -1663,13 +1773,23 @@ export function GrandStaffCanvas({
               const tieGeoById = new Map<string, TieGeometry>()
               for (const { ties } of allTieHandles()) for (const g of ties) tieGeoById.set(g.id, g)
               return broomMarks.map(t => {
+                const hl = 'rgba(251,191,36,0.35)'
+                const hlStroke = 'rgba(251,191,36,0.9)'
                 if (t.kind === 'tie') {
                   const geo = tieGeoById.get(t.tieId)
                   if (!geo) return null
-                  // Highlight the whole arc, not just its apex.
                   return <path key={t.key} d={slurArcPath(geo)} fill="none" stroke="rgba(251,191,36,0.85)" strokeWidth={9} strokeLinecap="round" />
                 }
-                return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill="rgba(251,191,36,0.35)" stroke="rgba(251,191,36,0.9)" strokeWidth={1.5} />
+                if (t.kind === 'keySig') {
+                  return <rect key={t.key} x={t.x - 30 + BROOM_KEY_SIG_DX} y={t.y - 26 + BROOM_KEY_SIG_DY} width={60} height={52} rx={5} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+                }
+                if (t.kind === 'timeSig') {
+                  return <rect key={t.key} x={t.x - 16} y={t.y - 26 + BROOM_TIME_SIG_DY} width={32} height={52} rx={5} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+                }
+                if (t.kind === 'tempo') {
+                  return <rect key={t.key} x={t.x - 30} y={t.y - 10 + BROOM_TEMPO_DY} width={60} height={20} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+                }
+                return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
               })
             })()}
             {broomTrail.map((p, i) => {
@@ -1702,6 +1822,56 @@ export function GrandStaffCanvas({
           )
         })()}
       </div>
+
+      {/* Empty-track invitation — fades in and gently bobs in the white space to the
+          right of the staff lines. Anchored to the card's right edge. */}
+      {isEmptyTrack && layout && (
+        <div
+          className="empty-track-hint absolute pointer-events-none select-none flex flex-col items-end gap-2.5 text-right"
+          style={{
+            right: 32,
+            top: CARD_PAD + (TREBLE_TOP_Y + BASS_BOTTOM_Y) / 2,
+            zIndex: 12,
+          }}
+        >
+          <div
+            className="flex items-center gap-3 rounded-full px-6 py-3.5 backdrop-blur-sm"
+            style={{
+              background: 'rgba(140,92,255,0.08)',
+              border: '1px solid rgba(140,92,255,0.22)',
+              boxShadow: '0 6px 28px -6px rgba(140,92,255,0.35)',
+            }}
+          >
+            <span className="text-2xl" style={{ color: 'var(--primary)' }}>♪</span>
+            <span className="text-lg font-medium" style={{ color: 'var(--primary)' }}>
+              Hover and click
+            </span>
+            <span className="text-sm opacity-60" style={{ color: 'var(--primary)' }}>or press</span>
+            <kbd
+              className="rounded-md px-2 py-1 text-sm font-semibold leading-none"
+              style={{ background: 'rgba(140,92,255,0.15)', color: 'var(--primary)', border: '1px solid rgba(140,92,255,0.3)' }}
+            >
+              ⏎
+            </kbd>
+            <span className="text-lg font-medium" style={{ color: 'var(--primary)' }}>
+              to place a note
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-sm opacity-70" style={{ color: 'var(--primary)' }}>
+            <span>use</span>
+            {['←', '↑', '↓', '→'].map(k => (
+              <kbd
+                key={k}
+                className="rounded px-1.5 py-1 text-xs font-semibold leading-none"
+                style={{ background: 'rgba(140,92,255,0.12)', border: '1px solid rgba(140,92,255,0.25)' }}
+              >
+                {k}
+              </kbd>
+            ))}
+            <span>to move around</span>
+          </div>
+        </div>
+      )}
     </div>
 
       {/* Scratch staff for the locked insertion point. Lives outside the
@@ -1726,6 +1896,7 @@ export function GrandStaffCanvas({
             isRest={isRest}
             onCommit={commitInsert}
             onCancel={() => { setInsertSession(null); onInsertComplete?.() }}
+            onPlaceFailed={onPlaceFailed}
           />
         )
       })()}

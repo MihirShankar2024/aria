@@ -68,7 +68,7 @@ interface ScheduledNote {
 // notes still ringing (their envelopes live on the audio clock, not the transport).
 let activeSamplers: Tone.Sampler[] = []
 
-export async function buildAndPlayScore(score: Score, onStop?: () => void, selectedNoteIds?: Set<string>): Promise<void> {
+export async function buildAndPlayScore(score: Score, onStop?: () => void, selectedNoteIds?: Set<string>, partVolumes?: Record<string, number>): Promise<void> {
   await Tone.start()
   const transport = Tone.getTransport()
   transport.cancel()
@@ -89,6 +89,10 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
   const measureCount = Math.max(...score.parts.map(p => p.measures.length))
 
   for (const { part, sampler } of parts) {
+    // Per-part playback volume as note velocity (0–1). Applied per trigger rather than on
+    // the sampler, since loadSoundFont caches one sampler per instrument — two parts on the
+    // same instrument share it, so setting sampler.volume would cross-contaminate them.
+    const partVelocity = Math.max(0, Math.min(1, partVolumes?.[part.id] ?? 1))
     const scheduled: ScheduledNote[] = []
     let absTime = 0
 
@@ -206,7 +210,7 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
         dur += voiceByHead.get(cur)!.duration
       }
       const { noteName, time } = voice
-      transport.schedule(t => sampler.triggerAttackRelease(noteName, dur, t), time)
+      transport.schedule(t => sampler.triggerAttackRelease(noteName, dur, t, partVelocity), time)
     }
 
     totalTime = Math.max(totalTime, absTime)

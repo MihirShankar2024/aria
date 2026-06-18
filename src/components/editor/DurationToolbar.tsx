@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward } from 'lucide-react'
+import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward, Music2 } from 'lucide-react'
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { Tooltip, TooltipTrigger, TooltipContent } from '../ui/tooltip'
@@ -24,7 +24,8 @@ const ACCIDENTALS: { value: NonNullable<Accidental>; label: string; name: string
 ]
 
 /** Rich hover bubble for a dock tool: bold name, keybind chip, one-line description. */
-function DockTip({ name, desc, keys, children }: { name: string; desc: string; keys?: string; children: ReactNode }) {
+function DockTip({ name, desc, keys, children }: { name: string; desc: ReactNode; keys?: string | string[]; children: ReactNode }) {
+  const keyList = keys ? (Array.isArray(keys) ? keys : [keys]) : []
   return (
     <Tooltip>
       {/* Wrapper span is the trigger so the tooltip's own data-state doesn't
@@ -32,14 +33,18 @@ function DockTip({ name, desc, keys, children }: { name: string; desc: string; k
       <TooltipTrigger asChild>
         <span className="inline-flex">{children}</span>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={8} className="max-w-55 px-3 py-2">
+      <TooltipContent side="bottom" sideOffset={8} className="max-w-60 px-3 py-2">
         <div className="flex items-center justify-between gap-3">
           <span className="font-semibold text-white">{name}</span>
-          {keys && (
-            <kbd className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/70">{keys}</kbd>
+          {keyList.length > 0 && (
+            <span className="flex gap-1 shrink-0">
+              {keyList.map(k => (
+                <kbd key={k} className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/70">{k}</kbd>
+              ))}
+            </span>
           )}
         </div>
-        <p className="mt-0.5 text-[11px] leading-snug text-white/55">{desc}</p>
+        <div className="mt-0.5 text-[11px] leading-snug text-white/55">{desc}</div>
       </TooltipContent>
     </Tooltip>
   )
@@ -81,6 +86,8 @@ interface DurationToolbarProps {
   onSharpshooterModeChange: (v: boolean) => void
   advanceOnPlace: boolean
   onAdvanceOnPlaceChange: (v: boolean) => void
+  transposedView: boolean
+  onTransposedViewChange: (v: boolean) => void
   selectedNoteCount: number
   onDeleteSelected: () => void
   hasPendingRests: boolean
@@ -120,6 +127,8 @@ export function DurationToolbar({
   onSharpshooterModeChange,
   advanceOnPlace,
   onAdvanceOnPlaceChange,
+  transposedView,
+  onTransposedViewChange,
   selectedNoteCount,
   onDeleteSelected,
   hasPendingRests,
@@ -228,7 +237,20 @@ export function DurationToolbar({
 
         {/* Select */}
         <div className="relative">
-          <DockTip name="Select" desc="Drag a box to select notes. Esc clears the selection.">
+          <DockTip
+            name="Select"
+            keys="⇧"
+            desc={
+              <>
+                Drag a box to select notes. Esc to clear.
+                <ul className="mt-1 space-y-0.5 list-none">
+                  <li>Drag selection to reposition notes</li>
+                  <li>↑ / ↓ to shift pitch by a step</li>
+                  <li>Ctrl+C / Ctrl+X to copy / cut</li>
+                </ul>
+              </>
+            }
+          >
             <Toggle
               pressed={isSelectMode}
               onPressedChange={onSelectModeChange}
@@ -265,7 +287,7 @@ export function DurationToolbar({
 
         {/* Erase */}
         <div className="relative">
-          <DockTip name="Erase" desc="Drag over notes to delete them.">
+          <DockTip name="Erase" keys="⌦" desc="Drag over notes to delete them.">
             <Toggle
               pressed={isDeleteMode}
               onPressedChange={onDeleteModeChange}
@@ -286,7 +308,7 @@ export function DurationToolbar({
         </div>
 
         {/* Broom — sweep away slurs, accidentals and dots */}
-        <DockTip name="Broom" desc="Drag over slurs, accidentals and dots to sweep them away (notes stay)." keys="B">
+        <DockTip name="Broom" desc="Drag over slurs, accidentals, dots, key signatures, time signatures, or tempo markings to sweep them away (notes stay). " keys="B">
           <Toggle
             pressed={isBroomMode}
             onPressedChange={onBroomModeChange}
@@ -334,6 +356,18 @@ export function DurationToolbar({
             className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
           >
             <StepForward className="h-3.5 w-3.5" />
+          </Toggle>
+        </DockTip>
+        <DockTip
+          name="Transposed parts"
+          desc="Show each part in its written/transposed key (e.g. Bb trumpet up a tone). Turn off for concert pitch — all parts in the same key."
+        >
+          <Toggle
+            pressed={transposedView}
+            onPressedChange={onTransposedViewChange}
+            className={TOGGLE_ITEM_CLASS + ' ml-1 data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+          >
+            <Music2 className="h-3.5 w-3.5" />
           </Toggle>
         </DockTip>
       </div>

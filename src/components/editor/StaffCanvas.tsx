@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { getClipboard, cloneWithFreshIds } from './clipboard'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
@@ -11,9 +12,9 @@ import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEdit
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
-import { diatonicStep } from '../../lib/transposition/transpose'
+import { diatonicStep, writtenPitchToConcert, concertPitchToWritten, transposeMeasuresForDisplay, transposeKeySigForDisplay } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent, VoiceNumber } from '../../types/score'
+import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent, VoiceNumber, Pitch } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const STAVE_Y = 48
@@ -48,14 +49,23 @@ const PLACE_DRAG_TOLERANCE_PX = 4  // px — press-and-release within this count
 const STAVE_TOP_Y    = STAVE_Y + STAVE_TOP_OFFSET
 const STAVE_BOTTOM_Y = STAVE_TOP_Y + 4 * LINE_SPACING
 const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
+
+// Broom highlight box vertical offsets — tune these to align each rect with the actual glyph.
+const BROOM_KEY_SIG_DY  = 30  // key signature accidentals
+const BROOM_TIME_SIG_DY = 48  // time signature digits
+const BROOM_TEMPO_DY    = 8   // tempo marking text above the stave
 const PANEL_EDGE_DEADBAND_PX = 10  // keep cursor from latching at panel extremes
 
 interface StaffCanvasProps {
   partId: string
+  instrument: string
   measures: Measure[]
   timeSig: TimeSig
   keySig: KeySig
   clef?: Clef
+  /** When true, render in the part's written/transposed key and treat clicks as
+   * written pitches (converted back to concert on entry). Concert pitch otherwise. */
+  transposedView?: boolean
   dispatch: (action: ScoreAction) => void
   selectedDuration: Duration
   selectedAccidental: Accidental
@@ -84,6 +94,7 @@ interface StaffCanvasProps {
   onTieComplete?: () => void
   onFillComplete?: () => void
   onInsertComplete?: () => void
+  onPlaceFailed?: () => void
   onRestsCommitted?: (pending: PendingRest[]) => void
   onPlaybackLayoutChange?: (layout: PlaybackLayout) => void
 }
@@ -122,13 +133,18 @@ interface TieDrag {
 type BroomTarget =
   | { kind: 'glyph'; key: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
   | { kind: 'tie'; key: string; tieId: string; x: number; y: number }
+  | { kind: 'keySig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
+  | { kind: 'timeSig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
+  | { kind: 'tempo'; key: string; measureNumber: number; x: number; y: number }
 
 export function StaffCanvas({
   partId,
+  instrument,
   measures,
   timeSig,
   keySig,
   clef = 'treble',
+  transposedView = false,
   dispatch,
   selectedDuration,
   selectedAccidental,
@@ -155,6 +171,7 @@ export function StaffCanvas({
   onTieComplete,
   onFillComplete,
   onInsertComplete,
+  onPlaceFailed,
   onPlaybackLayoutChange,
 }: StaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -185,6 +202,9 @@ export function StaffCanvas({
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
   const [scrollLeft, setScrollLeft] = useState(0)
+  // Measure index briefly flashed red when a paste is rejected for overflowing the bar.
+  const [failMeasure, setFailMeasure] = useState<number | null>(null)
+  const failTimerRef = useRef<number | null>(null)
 
   // Keyboard adjustment: arrow keys nudge the cursor away from the raw mouse position.
   // Moving the mouse resets these back to null (mouse takes over again).
@@ -238,14 +258,33 @@ export function StaffCanvas({
   const [broomMarks, setBroomMarks] = useState<BroomTarget[]>([])
   const broomingRef = useRef(false)
 
+  // What we draw: in transposed view, the part's written key + transposed notes
+  // (ids preserved so ties/selection still match the concert-pitch store).
+  const displayMeasures = useMemo(
+    () => (transposedView ? transposeMeasuresForDisplay(measures, instrument) : measures),
+    [transposedView, measures, instrument],
+  )
+  const displayKeySig = useMemo(
+    () => (transposedView ? transposeKeySigForDisplay(keySig, instrument) : keySig),
+    [transposedView, keySig, instrument],
+  )
+
+  // A staff click resolves to a *written* pitch in transposed view; convert back to
+  // concert before it is stored or compared against the concert-pitch store.
+  const toConcert = (pitch: Pitch): Pitch =>
+    transposedView ? writtenPitchToConcert(pitch, instrument) : pitch
+  // Stored concert pitches spelled for hit-testing against the written display.
+  const toWritten = (pitches: Pitch[]): Pitch[] =>
+    transposedView ? pitches.map(p => concertPitchToWritten(p, instrument)) : pitches
+
   useEffect(() => {
     if (!containerRef.current) return
     try {
       const result = renderStaff({
         container: containerRef.current,
-        measures,
+        measures: displayMeasures,
         timeSig,
-        keySig,
+        keySig: displayKeySig,
         clef,
         ties,
         staveY: STAVE_Y,
@@ -257,7 +296,7 @@ export function StaffCanvas({
     } catch (err) {
       console.error('Staff render failed', err)
     }
-  }, [measures, timeSig, keySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths])
+  }, [displayMeasures, timeSig, displayKeySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths])
 
   useEffect(() => {
     if (!layout || !onPlaybackLayoutChange) return
@@ -387,9 +426,16 @@ export function StaffCanvas({
     const handler = (e: KeyboardEvent) => {
       // Only active when the mouse is inside this staff canvas.
       if (!mouseInStaffRef.current) return
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
+      // Paste at the cursor. No-ops without a cursor (e.g. select mode clears it), so the
+      // user exits to note-entry mode and positions the cursor before pasting.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'v') {
+        e.preventDefault()
+        pasteRef.current()
+        return
+      }
       // Select mode owns the arrow keys (nudge selected notes) — handled in ScoreEditor.
       if (isSelectModeRef.current) return
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
       if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(e.key)) return
 
       const currentLayout = layoutRef.current
@@ -636,7 +682,7 @@ export function StaffCanvas({
           i === pitchIndex ? { ...p, accidental: selectedAccidental } : p,
         )
       } else {
-        const clicked = staffYToPitch(clickY, STAVE_Y, clef)
+        const clicked = toConcert(staffYToPitch(clickY, STAVE_Y, clef))
         patch.pitches = ev.pitches.map(p =>
           p.step === clicked.step && p.octave === clicked.octave
             ? { ...p, accidental: selectedAccidental }
@@ -719,6 +765,26 @@ export function StaffCanvas({
       broomRef.current.set(key, { kind: 'tie', key, tieId: geo.id, x: pts.apex.x, y: pts.apex.y })
       added = true
     }
+    for (const d of layout.decorations) {
+      if (Math.hypot(d.x - x, d.y - y) > BRUSH_R * 2) continue
+      const key = `d:${d.kind}:${d.measureIndex}`
+      if (broomRef.current.has(key)) continue
+      const measureNumber = measures[d.measureIndex]?.number
+      if (measureNumber === undefined) continue
+      broomRef.current.set(key, { kind: d.kind as 'keySig' | 'timeSig', key, measureIndex: d.measureIndex, measureNumber, x: d.x, y: d.y })
+      added = true
+    }
+    for (const tm of layout.tempoMarks) {
+      if (tm.measureNumber === 1) continue // first measure's tempo is global, not removable
+      // Tempo text renders above the stave; adjust hit point up to match the visual.
+      const tmBroomX = tm.x + 28
+      const tmBroomY = tm.y - 16
+      if (Math.hypot(tmBroomX - x, tmBroomY - y) > BRUSH_R * 2) continue
+      const key = `tempo:${tm.measureNumber}`
+      if (broomRef.current.has(key)) continue
+      broomRef.current.set(key, { kind: 'tempo', key, measureNumber: tm.measureNumber, x: tmBroomX, y: tmBroomY })
+      added = true
+    }
     if (added) setBroomMarks([...broomRef.current.values()])
   }
 
@@ -752,6 +818,15 @@ export function StaffCanvas({
     }
     for (const t of targets) {
       if (t.kind === 'tie') dispatch({ type: 'REMOVE_TIE', partId, tieId: t.tieId })
+      if (t.kind === 'keySig') {
+        if (t.measureNumber === 1) {
+          dispatch({ type: 'SET_GLOBAL_KEY_SIG', keySig: { fifths: 0, mode: 'major' } })
+        } else {
+          dispatch({ type: 'CLEAR_MEASURE_KEY_SIG', measureNumber: t.measureNumber })
+        }
+      }
+      if (t.kind === 'timeSig') dispatch({ type: 'CLEAR_MEASURE_TIME_SIG', measureNumber: t.measureNumber })
+      if (t.kind === 'tempo') dispatch({ type: 'REMOVE_MEASURE_TEMPO', measureNumber: t.measureNumber })
     }
   }
 
@@ -1080,7 +1155,7 @@ export function StaffCanvas({
       if (nearNote) {
         const measure = measures[nearNote.measureIndex]
         const ev = measure?.notes.find(n => n.id === nearNote.id)
-        if (ev?.type === 'note' && noteHasPitchAtStaffY(ev.pitches, snapY, STAVE_Y, clef)) {
+        if (ev?.type === 'note' && noteHasPitchAtStaffY(toWritten(ev.pitches), snapY, STAVE_Y, clef)) {
           applyModifierToExistingNote(nearNote, snapY)
           return nearNote.id
         }
@@ -1093,7 +1168,7 @@ export function StaffCanvas({
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
         const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+        const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
         const measure = measures[nearNote.measureIndex]
         const targetEv = measure?.notes.find(n => n.id === nearNote.id)
         if (measure && targetEv?.type === 'note') {
@@ -1106,7 +1181,7 @@ export function StaffCanvas({
             return nearNote.id
           }
           const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, nearNote.measureIndex, timeSig), targetVoice)) return null
+          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, nearNote.measureIndex, timeSig), targetVoice)) { onPlaceFailed?.(); return null }
           const newId = crypto.randomUUID()
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
@@ -1121,7 +1196,7 @@ export function StaffCanvas({
       const nearRest = nearestRestAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearRest) {
         const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-        const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+        const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
         const measure = measures[nearRest.measureIndex]
         if (measure) {
           pendingCenterRef.current = nearRest.measureIndex
@@ -1165,6 +1240,7 @@ export function StaffCanvas({
     if (!measure) return null
     const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
     if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, idx, timeSig), targetVoice)) {
+      onPlaceFailed?.()
       return null
     }
     placementAppendedRef.current = true
@@ -1175,7 +1251,7 @@ export function StaffCanvas({
       onNotePlaced?.()
     } else {
       const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-      const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+      const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
       dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice } })
       onNotePlaced?.()
     }
@@ -1184,6 +1260,43 @@ export function StaffCanvas({
   // Stable ref so the keydown handler always calls the current closure.
   const placeAtRef = useRef(placeAt)
   placeAtRef.current = placeAt
+
+  // Flash a measure red to signal a rejected paste (overflows the time signature).
+  const flashFailMeasure = (mIdx: number) => {
+    setFailMeasure(mIdx)
+    if (failTimerRef.current !== null) window.clearTimeout(failTimerRef.current)
+    failTimerRef.current = window.setTimeout(() => setFailMeasure(null), 450)
+  }
+
+  // Paste the clipboard at the current cursor (keyboard cursor, else mouse hover),
+  // inserting before the cursor note — the "insert button" semantics. Rejected (with a
+  // red flash) when the pasted events would push a voice past the measure's capacity.
+  const pasteFromClipboard = () => {
+    const clip = getClipboard()
+    if (clip.length === 0 || !layout) return
+    const kc = keyboardCursorRef.current
+    const cursorX = kc?.x ?? hoverInfoRef.current?.x
+    if (cursorX == null) return
+    const mIdx = kc?.measureIndex ?? getMeasureIndexAtX(cursorX)
+    const measure = measures[mIdx]
+    if (!measure) return
+    const ts = effectiveTimeSigAt(measures, mIdx, timeSig)
+    const events = cloneWithFreshIds(clip)
+    // Per-voice capacity guard: each voice the paste touches must still fit.
+    for (const v of [1, 2] as VoiceNumber[]) {
+      const add = events.filter(ev => ev.voice === v).reduce((s, ev) => s + noteBeatDuration(ev), 0)
+      if (add > 0 && measureBeatCount(measure, v) + add > measureCapacity(ts) + 0.001) {
+        flashFailMeasure(mIdx)
+        onPlaceFailed?.()
+        return
+      }
+    }
+    const gapIndex = gapAtX(mIdx, cursorX)?.gapIndex ?? measure.notes.length
+    pendingCenterRef.current = mIdx
+    dispatch({ type: 'INSERT_EVENTS', partId, measureId: measure.id, index: gapIndex, events })
+  }
+  const pasteRef = useRef(pasteFromClipboard)
+  pasteRef.current = pasteFromClipboard
 
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (measures.length === 0) return
@@ -1308,6 +1421,10 @@ export function StaffCanvas({
     )
   })
 
+  // Empty track: no notes placed anywhere (rests don't count). Show a friendly hint
+  // centered over the staff inviting the user to start playing.
+  const isEmptyTrack = measures.length > 0 && measures.every(m => m.notes.every(n => n.type !== 'note'))
+
   // Tempo mark overlays — rendered above the stave.
   const tempoOverlays = layout?.tempoMarks.map(tm => {
     const gIdx = layout.measures.findIndex((_, i) => measures[i]?.number === tm.measureNumber)
@@ -1330,7 +1447,7 @@ export function StaffCanvas({
       ref={el => { scrollRef.current = el; scrollSync?.register(el) }}
       onScroll={() => { if (scrollRef.current) { scrollSync?.onScroll(scrollRef.current); setScrollLeft(scrollRef.current.scrollLeft) } }}
       className={
-        'bg-white rounded-lg p-4 block w-full select-none overflow-x-auto ' +
+        'relative bg-white rounded-lg p-4 block w-full select-none overflow-x-auto ' +
         (isTieMode || isFillMode || isDeleteMode || isInsertMode ? 'cursor-pointer' : 'cursor-crosshair')
       }
       onClick={handleClick}
@@ -1354,6 +1471,23 @@ export function StaffCanvas({
 
         {measureOverlays}
         {tempoOverlays}
+
+        {/* Rejected-paste flash: the bar can't hold the pasted notes. */}
+        {failMeasure !== null && layout?.measures[failMeasure] && (
+          <div
+            className="absolute pointer-events-none"
+            style={{
+              left: layout.measures[failMeasure].x,
+              top: STAVE_TOP_Y,
+              width: layout.measures[failMeasure].width,
+              height: STAVE_BOTTOM_Y - STAVE_TOP_Y,
+              background: 'rgba(239,68,68,0.22)',
+              border: '1.5px solid rgba(239,68,68,0.7)',
+              zIndex: 17,
+            }}
+          />
+        )}
+
 
         {/* Violet highlights for selected noteheads (per-pitch). */}
         {selectedNoteIds && layout && (() => {
@@ -1671,13 +1805,23 @@ export function StaffCanvas({
             style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 30, overflow: 'visible' }}
           >
             {broomMarks.map(t => {
+              const hl = 'rgba(251,191,36,0.35)'
+              const hlStroke = 'rgba(251,191,36,0.9)'
               if (t.kind === 'tie') {
                 const geo = layout?.ties.find(g => g.id === t.tieId)
                 if (!geo) return null
-                // Highlight the whole arc, not just its apex.
                 return <path key={t.key} d={slurArcPath(geo)} fill="none" stroke="rgba(251,191,36,0.85)" strokeWidth={9} strokeLinecap="round" />
               }
-              return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill="rgba(251,191,36,0.35)" stroke="rgba(251,191,36,0.9)" strokeWidth={1.5} />
+              if (t.kind === 'keySig') {
+                return <rect key={t.key} x={t.x - 30} y={t.y - 26 + BROOM_KEY_SIG_DY} width={60} height={52} rx={5} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+              }
+              if (t.kind === 'timeSig') {
+                return <rect key={t.key} x={t.x - 16} y={t.y - 26 + BROOM_TIME_SIG_DY} width={32} height={52} rx={5} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+              }
+              if (t.kind === 'tempo') {
+                return <rect key={t.key} x={t.x - 30} y={t.y - 10 + BROOM_TEMPO_DY} width={60} height={20} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+              }
+              return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
             })}
             {broomTrail.map((p, i) => {
               const age = (performance.now() - p.born) / TRAIL_MS
@@ -1705,6 +1849,56 @@ export function StaffCanvas({
           </div>
         )}
       </div>
+
+      {/* Empty-track invitation — fades in and gently bobs in the white space to the
+          right of the staff lines. Anchored to the card's right edge. */}
+      {isEmptyTrack && layout && (
+        <div
+          className="empty-track-hint absolute pointer-events-none select-none flex flex-col items-end gap-2.5 text-right"
+          style={{
+            right: 32,
+            top: CARD_PAD + (STAVE_TOP_Y + STAVE_BOTTOM_Y) / 2,
+            zIndex: 12,
+          }}
+        >
+          <div
+            className="flex items-center gap-3 rounded-full px-6 py-3.5 backdrop-blur-sm"
+            style={{
+              background: 'rgba(140,92,255,0.08)',
+              border: '1px solid rgba(140,92,255,0.22)',
+              boxShadow: '0 6px 28px -6px rgba(140,92,255,0.35)',
+            }}
+          >
+            <span className="text-2xl" style={{ color: 'var(--primary)' }}>♪</span>
+            <span className="text-lg font-medium" style={{ color: 'var(--primary)' }}>
+              Hover and click
+            </span>
+            <span className="text-sm opacity-60" style={{ color: 'var(--primary)' }}>or press</span>
+            <kbd
+              className="rounded-md px-2 py-1 text-sm font-semibold leading-none"
+              style={{ background: 'rgba(140,92,255,0.15)', color: 'var(--primary)', border: '1px solid rgba(140,92,255,0.3)' }}
+            >
+              ⏎
+            </kbd>
+            <span className="text-lg font-medium" style={{ color: 'var(--primary)' }}>
+              to place a note
+            </span>
+          </div>
+          <div className="flex items-center gap-2 text-sm opacity-70" style={{ color: 'var(--primary)' }}>
+            <span>use</span>
+            {['←', '↑', '↓', '→'].map(k => (
+              <kbd
+                key={k}
+                className="rounded px-1.5 py-1 text-xs font-semibold leading-none"
+                style={{ background: 'rgba(140,92,255,0.12)', border: '1px solid rgba(140,92,255,0.25)' }}
+              >
+                {k}
+              </kbd>
+            ))}
+            <span>to move around</span>
+          </div>
+        </div>
+      )}
     </div>
 
       {/* Scratch staff for the locked insertion point. Lives outside the
@@ -1724,6 +1918,7 @@ export function StaffCanvas({
           isRest={isRest}
           onCommit={commitInsert}
           onCancel={() => { setInsertSession(null); onInsertComplete?.() }}
+          onPlaceFailed={onPlaceFailed}
         />
       )}
     </div>

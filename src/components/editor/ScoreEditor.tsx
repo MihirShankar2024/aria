@@ -17,6 +17,7 @@ import { normalizeMeasureRests } from '../../lib/rests'
 import { effectiveTimeSigAt } from '../../lib/beats'
 import { transposeChromatic } from '../../lib/transposition/transpose'
 import { selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
+import { setClipboard } from './clipboard'
 import type { PendingRest } from './useDeleteTrail'
 import type { Part, Duration, Accidental, NoteEvent, Tie, VoiceNumber } from '../../types/score'
 
@@ -66,14 +67,33 @@ export function ScoreEditor() {
   const [isSharpshooterMode, setIsSharpshooterMode] = useState(false)
   // Keyboard placement: after placing a note, advance the cursor to the next beat (true,
   // default) or stay on the note just placed (false).
-  const [advanceOnPlace, setAdvanceOnPlace] = useState(true)
+  const [advanceOnPlace, setAdvanceOnPlace] = useState(false)
+  // Notation display mode: when true, each part is shown in its written/transposed key
+  // (concert pitch is still the stored source of truth). Session-only, defaults on.
+  const [transposedView, setTransposedView] = useState(true)
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
+  // Per-part playback volume (gain 0–1, default 1 = unity). A mixer setting, kept out of
+  // score state so dragging a slider doesn't churn the undo history.
+  const [volumes, setVolumes] = useState<Record<string, number>>({})
+  // Transient toast (e.g. "Copied"). `id` retriggers the fade-in on repeated copies.
+  const [toast, setToast] = useState<{ msg: string; id: number } | null>(null)
+  const toastTimerRef = useRef<number | null>(null)
+  const showToast = useCallback((msg: string) => {
+    setToast({ msg, id: Date.now() })
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = window.setTimeout(() => setToast(null), 1600)
+  }, [])
+  const showToastRef = useRef(showToast)
+  showToastRef.current = showToast
   const [pendingRests, setPendingRests] = useState<PendingRest[] | null>(null)
   // Track-header dialogs: confirm before removing a track; prompt for measure count.
   const [removeTarget, setRemoveTarget] = useState<{ partId: string; name: string } | null>(null)
   const [addMeasuresOpen, setAddMeasuresOpen] = useState(false)
   const scrollSync = useScrollSync()
   const { reportLayout } = usePlaybackScroll({ scrollSync, score, status })
+
+  const volumesRef = useRef(volumes)
+  volumesRef.current = volumes
 
   const handlePlay = useCallback((sc: typeof score, selectedNoteIds?: Set<string>) => {
     if (status === 'stopped') scrollToStartIfNeeded(scrollSync)
@@ -82,7 +102,7 @@ export function ScoreEditor() {
     const eventIds = selectedNoteIds && selectedNoteIds.size > 0
       ? new Set([...selectedNoteIds].map(k => parseSelKey(k).id))
       : selectedNoteIds
-    play(sc, eventIds)
+    play(sc, eventIds, volumesRef.current)
   }, [status, play, scrollSync])
 
   // Accidentals are note-only — choosing one means the user intends a note, so drop
@@ -139,6 +159,76 @@ export function ScoreEditor() {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'y') {
         e.preventDefault()
         redo()
+        return
+      }
+      // Copy selected noteheads to the shared clipboard. Paste (Cmd+V) is handled by the
+      // staff canvas the cursor is in, since that's where the insertion point lives.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'c') {
+        const sel = selectedNoteIdsRef.current
+        if (sel.size === 0) return
+        e.preventDefault()
+        const byEvent = selectionByEvent(sel)
+        const events: NoteEvent[] = []
+        for (const part of scoreRef.current.parts) {
+          for (const measure of part.measures) {
+            for (const ev of measure.notes) {
+              const s = byEvent.get(ev.id)
+              if (!s) continue
+              // Whole rest, or a fully-selected note → copy as-is; a partially-selected
+              // chord → copy only the selected pitches.
+              if (ev.type === 'rest' || s === 'all') { events.push(ev); continue }
+              const pitches = ev.pitches.filter((_, i) => s.has(i))
+              if (pitches.length) events.push({ ...ev, pitches })
+            }
+          }
+        }
+        if (events.length) {
+          setClipboard(events)
+          const n = events.length
+          showToastRef.current(`Copied ${n} ${n === 1 ? 'note' : 'notes'}`)
+        }
+        // Drop back to note-entry mode so the cursor (and its ghost-note preview) is live
+        // and Cmd+V has somewhere to paste — otherwise paste looks broken in select mode.
+        setIsSelectMode(false)
+        setSelectedNoteIds(new Set())
+        return
+      }
+      // Cut: copy selected notes to clipboard, delete them, then exit select mode.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'x') {
+        const sel = selectedNoteIdsRef.current
+        if (sel.size === 0) return
+        e.preventDefault()
+        const byEvent = selectionByEvent(sel)
+        const events: NoteEvent[] = []
+        for (const part of scoreRef.current.parts) {
+          for (const measure of part.measures) {
+            for (const ev of measure.notes) {
+              const s = byEvent.get(ev.id)
+              if (!s) continue
+              if (ev.type === 'rest' || s === 'all') { events.push(ev); continue }
+              const pitches = ev.pitches.filter((_, i) => s.has(i))
+              if (pitches.length) events.push({ ...ev, pitches })
+            }
+          }
+        }
+        if (events.length) {
+          setClipboard(events)
+          const n = events.length
+          showToastRef.current(`Cut and copied ${n} ${n === 1 ? 'note' : 'notes'}`)
+          // Delete the selected notes from the score.
+          const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+          for (const part of scoreRef.current.parts) {
+            for (let mIdx = 0; mIdx < part.measures.length; mIdx++) {
+              const measure = part.measures[mIdx]
+              if (!measure.notes.some(n => byEvent.has(n.id))) continue
+              const notes = normalizeMeasureRests(deleteSelectedPitches(measure.notes, byEvent), effectiveTimeSigAt(part.measures, mIdx, scoreRef.current.globalTimeSig))
+              edits.push({ partId: part.id, measureId: measure.id, notes })
+            }
+          }
+          if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+        }
+        setIsSelectMode(false)
+        setSelectedNoteIds(new Set())
         return
       }
       if (e.metaKey || e.ctrlKey) return
@@ -369,6 +459,7 @@ export function ScoreEditor() {
     isSelectMode,
     isSharpshooterMode,
     advanceOnPlace,
+    transposedView,
     selectedNoteIds,
     onSelectionChange: setSelectedNoteIds,
     initialTempo: score.tempo,
@@ -380,11 +471,24 @@ export function ScoreEditor() {
     onTieComplete: handleTieComplete,
     onFillComplete: handleFillComplete,
     onInsertComplete: handleInsertComplete,
+    onPlaceFailed: () => showToastRef.current('Doesn\'t fit in measure'),
     onRestsCommitted: handleRestsCommitted,
   }
 
   return (
     <div className="relative min-h-screen text-white flex flex-col">
+      {/* Transient toast (copy confirmation, etc.) — floats at the top, fades in. */}
+      {toast && (
+        <div
+          key={toast.id}
+          className="fixed top-4 left-1/2 -translate-x-1/2 z-50 pointer-events-none animate-in fade-in slide-in-from-top-2 duration-200"
+        >
+          <div className="rounded-full bg-white/10 border border-white/15 px-4 py-1.5 text-xs font-medium text-white/90 backdrop-blur-md shadow-lg">
+            {toast.msg}
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-white/10">
         <h1 className="text-xl font-semibold tracking-tight"></h1>
@@ -441,6 +545,8 @@ export function ScoreEditor() {
           onSharpshooterModeChange={enterSharpshooterMode}
           advanceOnPlace={advanceOnPlace}
           onAdvanceOnPlaceChange={setAdvanceOnPlace}
+          transposedView={transposedView}
+          onTransposedViewChange={setTransposedView}
           selectedNoteCount={selectedNoteIds.size}
           onDeleteSelected={deleteSelectedNotes}
           hasPendingRests={!!pendingRests}
@@ -455,7 +561,16 @@ export function ScoreEditor() {
 
       {/* Body: sidebar + score */}
       <div className="flex flex-1 overflow-hidden">
-        <PartsSidebar parts={score.parts} dispatch={dispatch} />
+        <PartsSidebar
+          parts={score.parts}
+          dispatch={dispatch}
+          volumes={volumes}
+          onVolumeChange={(partIds, v) => setVolumes(prev => {
+            const next = { ...prev }
+            for (const id of partIds) next[id] = v
+            return next
+          })}
+        />
 
         <main className="flex-1 px-6 py-8 space-y-8 overflow-y-auto">
           {groups.map((group, groupIdx) => {
@@ -493,6 +608,7 @@ export function ScoreEditor() {
                 />
                 <StaffCanvas
                   partId={part.id}
+                  instrument={part.instrument}
                   measures={part.measures}
                   timeSig={score.globalTimeSig}
                   keySig={score.globalKeySig}

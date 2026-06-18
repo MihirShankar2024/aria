@@ -37,7 +37,7 @@ export const INSTRUMENT_DB: Record<string, InstrumentConfig> = {
   alto_saxophone: {
     key: 'alto_saxophone',
     displayName: 'Alto Saxophone (Eb)',
-    transposition: -9,         // sounds a major 6th lower than written (Eb instrument)
+    transposition: 9,          // written a major 6th above concert (Eb instrument)
     clef: 'treble',
     rangeMin: 49,              // Db3 concert (written Bb3)
     rangeMax: 80,              // Ab5 concert (written F6)
@@ -48,7 +48,7 @@ export const INSTRUMENT_DB: Record<string, InstrumentConfig> = {
   french_horn: {
     key: 'french_horn',
     displayName: 'Horn in F',
-    transposition: -7,         // sounds a perfect 5th lower than written
+    transposition: 7,          // written a perfect 5th above concert
     clef: 'treble',
     rangeMin: 34,              // Bb1 concert
     rangeMax: 77,              // F5 concert

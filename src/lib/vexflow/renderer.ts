@@ -70,6 +70,7 @@ const NOTE_PAD = 24
 const FIRST_MEASURE_ALLOWANCE = 130  // clef + key sig (up to 7 acc) + time sig
 const KEY_CHANGE_ALLOWANCE = 80      // naturals + new accidentals on key change
 const TIME_CHANGE_ALLOWANCE = 40     // time sig glyph on mid-score changes
+const POST_DECOR_PAD = 16            // extra breathing room after key/time sig glyphs
 const MIN_NOTE_AREA = 120
 const MAX_NOTE_AREA = 400
 const SNAP_STEP = 32
@@ -205,13 +206,14 @@ function computeColumnWidths(measures: Measure[], effTimeSigs: TimeSig[], clef: 
 }
 
 function decorForMeasure(effKs: KeySig[], effTs: TimeSig[], i: number, isGrand: boolean): number {
-  if (i === 0) return FIRST_MEASURE_ALLOWANCE + (isGrand ? 20 : 0)
+  if (i === 0) return FIRST_MEASURE_ALLOWANCE + (isGrand ? 20 : 0) + POST_DECOR_PAD
   const prevKey = effKs[i - 1], curKey = effKs[i]
   const prevTs = effTs[i - 1], curTs = effTs[i]
   if (!prevKey || !curKey || !prevTs || !curTs) return 0
   const keyChanged = prevKey.fifths !== curKey.fifths
   const tsChanged  = prevTs.beats !== curTs.beats || prevTs.beatType !== curTs.beatType
-  return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0)
+  const hasDecor = keyChanged || tsChanged
+  return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0) + (hasDecor ? POST_DECOR_PAD : 0)
 }
 
 /**
@@ -559,6 +561,15 @@ export interface TieGeometry {
   direction: number   // 1 = bulge down, -1 = bulge up
 }
 
+// A removable key-sig or time-sig decoration in a non-first measure.
+export interface DecorGeometry {
+  kind: 'keySig' | 'timeSig'
+  measureIndex: number
+  measureId: string
+  x: number   // approximate glyph center x
+  y: number   // approximate glyph center y (staff midline)
+}
+
 export interface StaffLayout {
   width: number
   height: number
@@ -567,6 +578,7 @@ export interface StaffLayout {
   glyphs: GlyphGeometry[]
   tempoMarks: TempoMarkGeometry[]
   ties: TieGeometry[]
+  decorations: DecorGeometry[]
 }
 
 export interface RenderScoreOptions {
@@ -621,14 +633,15 @@ export function renderStaff({
 
   // Compute decoration allowance per measure.
   const decorAllowance = measures.map((_, i) => {
-    if (i === 0) return FIRST_MEASURE_ALLOWANCE
+    if (i === 0) return FIRST_MEASURE_ALLOWANCE + POST_DECOR_PAD
     const prevKey = effKeySigs[i - 1]
     const curKey  = effKeySigs[i]
     const prevTs  = effTimeSigs[i - 1]
     const curTs   = effTimeSigs[i]
     const keyChanged = prevKey.fifths !== curKey.fifths
     const tsChanged  = prevTs.beats !== curTs.beats || prevTs.beatType !== curTs.beatType
-    return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0)
+    const hasDecor = keyChanged || tsChanged
+    return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0) + (hasDecor ? POST_DECOR_PAD : 0)
   })
 
   const staveWidths: number[] = forcedStaveWidths
@@ -644,6 +657,7 @@ export function renderStaff({
   const glyphGeometry: GlyphGeometry[] = []
   const intraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }> = []
   const tempoMarkGeometry: TempoMarkGeometry[] = []
+  const decorGeometry: DecorGeometry[] = []
   const vexById = new Map<string, StaveNote>()
   let x = LEFT_MARGIN
 
@@ -661,6 +675,8 @@ export function renderStaff({
       // Key sig on first measure (skip 'C' to avoid empty key sig display for C major).
       if (effKeySig.fifths !== 0) {
         stave.addKeySignature(fifthsToVexKey(effKeySig.fifths))
+        // Clef is ~40px wide; key sig center is roughly halfway through the key sig area.
+        decorGeometry.push({ kind: 'keySig', measureIndex: 0, measureId: measure.id, x: x + 65, y: staveY + 24 })
       }
       stave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
     } else {
@@ -670,11 +686,14 @@ export function renderStaff({
         const newKey  = fifthsToVexKey(effKeySig.fifths)
         const oldKey  = fifthsToVexKey(prevKeySig!.fifths)
         stave.addKeySignature(newKey, oldKey)
+        decorGeometry.push({ kind: 'keySig', measureIndex: idx, measureId: measure.id, x: x + KEY_CHANGE_ALLOWANCE / 2, y: staveY + 24 })
       }
       // Show time sig change.
       const tsChanged = prevTimeSig && (prevTimeSig.beats !== effTimeSig.beats || prevTimeSig.beatType !== effTimeSig.beatType)
       if (tsChanged) {
         stave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
+        const keyOffset = (keyChanged ? KEY_CHANGE_ALLOWANCE : 0)
+        decorGeometry.push({ kind: 'timeSig', measureIndex: idx, measureId: measure.id, x: x + keyOffset + TIME_CHANGE_ALLOWANCE / 2, y: staveY + 24 })
       }
     }
 
@@ -709,6 +728,7 @@ export function renderStaff({
     glyphs: glyphGeometry,
     tempoMarks: tempoMarkGeometry,
     ties: tieGeometry,
+    decorations: decorGeometry,
   }
 }
 
@@ -744,6 +764,7 @@ export interface GrandStaffLayout {
   tempoMarks: TempoMarkGeometry[]
   trebleTies: TieGeometry[]
   bassTies: TieGeometry[]
+  decorations: DecorGeometry[]
 }
 
 export interface RenderGrandStaffOptions {
@@ -801,14 +822,15 @@ export function renderGrandStaff({
   const noteAreaWidths = syncRaw.map(w => Math.round(w + BLEND_FACTOR * (maxWidth - w)))
 
   const decorAllowance = Array.from({ length: count }, (_, i) => {
-    if (i === 0) return FIRST_MEASURE_ALLOWANCE + 20 // extra for brace
+    if (i === 0) return FIRST_MEASURE_ALLOWANCE + 20 + POST_DECOR_PAD // extra for brace
     const prevKey = effKeySigs[i - 1]
     const curKey  = effKeySigs[i]
     const prevTs  = effTimeSigs[i - 1]
     const curTs   = effTimeSigs[i]
     const keyChanged = prevKey && prevKey.fifths !== curKey.fifths
     const tsChanged  = prevTs && (prevTs.beats !== curTs.beats || prevTs.beatType !== curTs.beatType)
-    return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0)
+    const hasDecor = keyChanged || tsChanged
+    return (keyChanged ? KEY_CHANGE_ALLOWANCE : 0) + (tsChanged ? TIME_CHANGE_ALLOWANCE : 0) + (hasDecor ? POST_DECOR_PAD : 0)
   })
 
   const staveWidths = forcedStaveWidths
@@ -819,6 +841,7 @@ export function renderGrandStaff({
 
   const measureGeometry: MeasureGeometry[] = []
   const tempoMarkGeometry: TempoMarkGeometry[] = []
+  const decorGeometry: DecorGeometry[] = []
   const trebleNoteGeometry: NoteGeometry[] = []
   const bassNoteGeometry: NoteGeometry[] = []
   const trebleGlyphGeometry: GlyphGeometry[] = []
@@ -849,6 +872,8 @@ export function renderGrandStaff({
         const vexKey = fifthsToVexKey(effKeySig.fifths)
         trebleStave.addKeySignature(vexKey)
         bassStave.addKeySignature(vexKey)
+        const trebleMeasureId = trebleMeasures[0]?.id
+        if (trebleMeasureId) decorGeometry.push({ kind: 'keySig', measureIndex: 0, measureId: trebleMeasureId, x: x + 75, y: GRAND_TREBLE_Y + 24 })
       }
       trebleStave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
       bassStave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
@@ -859,11 +884,16 @@ export function renderGrandStaff({
         const oldKey = fifthsToVexKey(prevKeySig!.fifths)
         trebleStave.addKeySignature(newKey, oldKey)
         bassStave.addKeySignature(newKey, oldKey)
+        const trebleMeasureId = trebleMeasures[idx]?.id
+        if (trebleMeasureId) decorGeometry.push({ kind: 'keySig', measureIndex: idx, measureId: trebleMeasureId, x: x + KEY_CHANGE_ALLOWANCE / 2, y: GRAND_TREBLE_Y + 24 })
       }
       const tsChanged = prevTimeSig && (prevTimeSig.beats !== effTimeSig.beats || prevTimeSig.beatType !== effTimeSig.beatType)
       if (tsChanged) {
         trebleStave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
         bassStave.addTimeSignature(`${effTimeSig.beats}/${effTimeSig.beatType}`)
+        const trebleMeasureId = trebleMeasures[idx]?.id
+        const keyOffset = (keyChanged ? KEY_CHANGE_ALLOWANCE : 0)
+        if (trebleMeasureId) decorGeometry.push({ kind: 'timeSig', measureIndex: idx, measureId: trebleMeasureId, x: x + keyOffset + TIME_CHANGE_ALLOWANCE / 2, y: GRAND_TREBLE_Y + 24 })
       }
     }
 
@@ -930,6 +960,7 @@ export function renderGrandStaff({
     tempoMarks: tempoMarkGeometry,
     trebleTies: trebleTieGeometry,
     bassTies: bassTieGeometry,
+    decorations: decorGeometry,
   }
 }
 

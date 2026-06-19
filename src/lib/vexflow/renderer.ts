@@ -9,13 +9,14 @@ import {
   Dot,
   Modifier,
   Beam,
+  Tuplet,
   Stem,
   StaveTie,
   StaveConnector,
   MetricsDefaults,
 } from 'vexflow'
-import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber } from '../../types/score'
-import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt } from '../beats'
+import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber, Tuplet as TupletDef } from '../../types/score'
+import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt, eventBeats } from '../beats'
 import { newPitchId } from '../pitch'
 import { computeCurvePlacement } from './curvePlacement'
 
@@ -409,12 +410,71 @@ function collectIntraChordAccidentalConflicts(
 interface BuiltMeasure {
   realNotes: StaveNote[]          // every real note across voices, concatenated v1-then-v2
   events: NoteEvent[]             // source events, parallel 1:1 with realNotes
+  onsets: number[]                // sounded onset (quarter-note beats from measure start), parallel to realNotes
+  capacityBeats: number           // measure capacity in quarter-note beats (the onset→x denominator)
   voices: Voice[]                 // one VexFlow Voice per occupied voice
   voiceRealNotes: StaveNote[][]   // real notes per voice, parallel to `voices` (for beams)
+  voiceBeamGroups: StaveNote[][][] // per voice, beamable segments split at tuplet boundaries
   voiceNumbers: VoiceNumber[]     // voice number per entry in `voices`
+  tuplets: Tuplet[]               // VexFlow tuplet objects to draw after formatting
 }
 
-const EMPTY_BUILT: BuiltMeasure = { realNotes: [], events: [], voices: [], voiceRealNotes: [], voiceNumbers: [] }
+const EMPTY_BUILT: BuiltMeasure = { realNotes: [], events: [], onsets: [], capacityBeats: 0, voices: [], voiceRealNotes: [], voiceBeamGroups: [], voiceNumbers: [], tuplets: [] }
+
+// Split one voice's real notes into contiguous beamable segments, breaking at every
+// change of tuplet membership. Beams must not cross a tuplet boundary or join notes of
+// different tuplet depth, so each tuplet group becomes its own segment and runs of
+// plain notes form their own. With no tuplets this returns a single segment (identical
+// to the previous whole-voice beaming).
+function beamSegments(evs: NoteEvent[], vexNotes: StaveNote[], tuplets?: TupletDef[]): StaveNote[][] {
+  const segments: StaveNote[][] = []
+  let current: StaveNote[] = []
+  let currentKey: string | undefined
+  evs.forEach((ev, i) => {
+    const t = tuplets?.find(tp => tp.memberIds.includes(ev.id))
+    const key = t?.id // undefined = plain run
+    if (key !== currentKey && current.length) {
+      segments.push(current)
+      current = []
+    }
+    currentKey = key
+    current.push(vexNotes[i])
+  })
+  if (current.length) segments.push(current)
+  return segments
+}
+
+// Construct VexFlow Tuplet objects for the tuplet groups whose members live in this voice.
+// Members are gathered by event id in document order. In a multi-voice measure the bracket
+// is placed away from the staff middle on the voice's stem side (voice 1 stems up → bracket
+// above; voice 2 stems down → bracket below). Nested tuplets render stacked because VexFlow
+// offsets each tuplet by NESTING_OFFSET when their note spans overlap.
+function buildVexTuplets(
+  evs: NoteEvent[],
+  vexNotes: StaveNote[],
+  tupletDefs: TupletDef[] | undefined,
+  voice: VoiceNumber | undefined,
+): Tuplet[] {
+  if (!tupletDefs || tupletDefs.length === 0) return []
+  const vexByEventId = new Map<string, StaveNote>()
+  evs.forEach((ev, i) => vexByEventId.set(ev.id, vexNotes[i]))
+  const out: Tuplet[] = []
+  for (const def of tupletDefs) {
+    const notes = def.memberIds.map(id => vexByEventId.get(id)).filter((n): n is StaveNote => !!n)
+    if (notes.length === 0) continue // members belong to a different voice
+    const location = voice === 2 ? Tuplet.LOCATION_BOTTOM : Tuplet.LOCATION_TOP
+    out.push(
+      new Tuplet(notes, {
+        numNotes: def.played,
+        notesOccupied: def.inSpaceOf,
+        ratioed: false,   // engraving convention: print only the note count, never "6:4"/"5:3"
+        bracketed: def.showBracket,
+        location,
+      }),
+    )
+  }
+  return out
+}
 
 function buildMeasure(measure: Measure, timeSig: TimeSig, clef: Clef = 'treble'): BuiltMeasure {
   if (measure.notes.length === 0) return EMPTY_BUILT
@@ -423,8 +483,11 @@ function buildMeasure(measure: Measure, timeSig: TimeSig, clef: Clef = 'treble')
   const multi = voiceNumbers.length > 1
   const realNotes: StaveNote[] = []
   const events: NoteEvent[] = []
+  const onsets: number[] = []
   const voices: Voice[] = []
   const voiceRealNotes: StaveNote[][] = []
+  const voiceBeamGroups: StaveNote[][][] = []
+  const tuplets: Tuplet[] = []
 
   for (const v of voiceNumbers) {
     const evs = voiceEvents(measure, v)
@@ -438,15 +501,72 @@ function buildMeasure(measure: Measure, timeSig: TimeSig, clef: Clef = 'treble')
       .addTickables([...vexNotes, ...ghosts])
     voices.push(voice)
     voiceRealNotes.push(vexNotes)
+    voiceBeamGroups.push(beamSegments(evs, vexNotes, measure.tuplets))
     realNotes.push(...vexNotes)
     events.push(...evs)
+    // Sounded onset (tuplet-scaled) of each event within this voice, accumulated exactly.
+    let acc = 0
+    for (const ev of evs) {
+      onsets.push(acc)
+      acc += eventBeats(ev, measure.tuplets)
+    }
+    tuplets.push(...buildVexTuplets(evs, vexNotes, measure.tuplets, multi ? v : undefined))
   }
-  return { realNotes, events, voices, voiceRealNotes, voiceNumbers }
+  return { realNotes, events, onsets, capacityBeats: measureCapacity(timeSig), voices, voiceRealNotes, voiceBeamGroups, voiceNumbers, tuplets }
 }
 
-// Format every voice of a built measure together (joinVoices aligns same-beat notes
-// across voices), draw them, generate per-voice beams, apply glyph nudges, and collect
-// geometry. Shared by single-staff and grand-staff (treble/bass) rendering.
+// Re-space a multi-voice measure so notes sit at x proportional to their sounded onset:
+// shared beats line up exactly (same onset → same x) and everything else is spaced evenly
+// by time. VexFlow's own cross-voice formatter keys tick contexts by reduced-fraction
+// numerator, which collapses to incomparable scales once a tuplet meets a plain voice (and
+// can even merge two distinct onsets onto one context), so independent polyrhythms there
+// render with notes out of time order. We sidestep that entirely: each voice is formatted
+// in isolation (its own contexts are monotonic and never collide), then every note's tick
+// context is pinned to a time-proportional x here. Onsets are taken from our exact rational
+// beat engine, so any combination of polyrhythms across the two voices is handled.
+//
+// A minimum-gap pass (matching the column's accidental-aware min width, which already sums
+// every note's extent) keeps near-simultaneous notes from overlapping without overflowing
+// the measure. Groups of notes that share an onset are kept together so shared beats stay
+// aligned even when nudged.
+function applyOnsetProportionalLayout(built: BuiltMeasure, formatWidth: number): void {
+  const { realNotes, onsets, capacityBeats } = built
+  if (realNotes.length === 0 || capacityBeats <= 0) return
+
+  // Group note indices by exact sounded onset (rounded to absorb float noise).
+  const groups = new Map<number, number[]>()
+  onsets.forEach((o, i) => {
+    const key = Math.round(o * 1e6) / 1e6
+    const g = groups.get(key)
+    if (g) g.push(i)
+    else groups.set(key, [i])
+  })
+  const onsetKeys = [...groups.keys()].sort((a, b) => a - b)
+
+  // Left inset so the earliest group's leading accidentals stay inside the note area.
+  const firstIdxs = groups.get(onsetKeys[0]) ?? []
+  const leftPad = Math.max(0, ...firstIdxs.map(i => noteExtents(realNotes[i]).accLeft))
+  const usable = Math.max(formatWidth - leftPad, 1)
+
+  let prevRight = -Infinity
+  for (const onset of onsetKeys) {
+    const idxs = groups.get(onset)!
+    const maxLeft = Math.max(0, ...idxs.map(i => noteExtents(realNotes[i]).accLeft))
+    let x = leftPad + (onset / capacityBeats) * usable
+    if (x - maxLeft < prevRight + ACC_GAP) x = prevRight + ACC_GAP + maxLeft
+    let groupRight = -Infinity
+    for (const i of idxs) {
+      realNotes[i].getTickContext().setX(x)
+      groupRight = Math.max(groupRight, x + noteExtents(realNotes[i]).rightExt)
+    }
+    prevRight = groupRight
+  }
+}
+
+// Format every voice of a built measure, draw them, generate per-voice beams, apply glyph
+// nudges, and collect geometry. Shared by single-staff and grand-staff rendering. A single
+// voice uses VexFlow's native layout; multi-voice measures are formatted per-voice and then
+// re-spaced by sounded onset (see applyOnsetProportionalLayout) so polyrhythms align.
 function formatDrawCollect(
   built: BuiltMeasure,
   stave: Stave,
@@ -461,7 +581,7 @@ function formatDrawCollect(
     intraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }>
   },
 ): void {
-  const { voices, voiceRealNotes, voiceNumbers, realNotes, events } = built
+  const { voices, voiceBeamGroups, voiceNumbers, realNotes, events, tuplets } = built
   if (voices.length === 0) return
   const multi = voices.length > 1
 
@@ -469,15 +589,28 @@ function formatDrawCollect(
   // uses pixel-accurate line positions and clears displaced noteheads.
   voices.forEach(v => v.getTickables().forEach(t => t.setStave(stave)))
   const formatWidth = stave.getNoteEndX() - stave.getNoteStartX() - NOTE_PAD
-  new Formatter().joinVoices(voices).format(voices, Math.max(noteAreaWidth, formatWidth))
+  const targetWidth = Math.max(noteAreaWidth, formatWidth)
+  if (multi) {
+    // Format each voice in isolation (clean monotonic contexts), then pin every note to a
+    // time-proportional x so independent polyrhythms align on shared beats.
+    voices.forEach(v => new Formatter().joinVoices([v]).format([v], targetWidth))
+    applyOnsetProportionalLayout(built, formatWidth)
+  } else {
+    new Formatter().joinVoices(voices).format(voices, targetWidth)
+  }
 
-  const beams = voiceRealNotes.flatMap((rn, vi) =>
-    Beam.generateBeams(rn, multi ? { stemDirection: voiceNumbers[vi] === 1 ? Stem.UP : Stem.DOWN } : undefined),
+  // Beam per segment so beams never cross a tuplet boundary (segments are split there).
+  const beams = voiceBeamGroups.flatMap((segments, vi) =>
+    segments.flatMap(seg =>
+      Beam.generateBeams(seg, multi ? { stemDirection: voiceNumbers[vi] === 1 ? Stem.UP : Stem.DOWN } : undefined),
+    ),
   )
   // Apply manual accidental/dot nudges on top of auto layout before drawing.
   events.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev) })
   voices.forEach(v => v.draw(ctx, stave))
   beams.forEach(b => b.setContext(ctx).draw())
+  // Tuplet brackets/numbers ride on top of the formatted notes and beams.
+  tuplets.forEach(t => t.setContext(ctx).draw())
 
   events.forEach((ev, k) => {
     const vn = realNotes[k]

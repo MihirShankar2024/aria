@@ -9,7 +9,7 @@ import {
   GRAND_STAFF_HEIGHT,
 } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, whichGrandStaffStave, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt, deriveTuplet } from '../../lib/beats'
 import { getClipboard, cloneWithFreshIds } from './clipboard'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
@@ -22,7 +22,7 @@ import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent, VoiceNumber } from '../../types/score'
+import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent, VoiceNumber, Pitch } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 
 const DOT_R = 7
@@ -105,6 +105,9 @@ interface GrandStaffCanvasProps {
   isBroomMode: boolean
   isInsertMode: boolean
   isSharpshooterMode?: boolean
+  /** When true, placed notes flow into a reserved tuplet of `tupletSpec` (polyrhythm entry). */
+  tupletEntry?: boolean
+  tupletSpec?: { played: number; beats: number }
   /** When true (default), placing a note in keyboard mode advances the cursor to the next
    * beat; when false, the cursor stays on the note just placed. */
   advanceOnPlace?: boolean
@@ -142,6 +145,8 @@ export function GrandStaffCanvas({
   isBroomMode,
   isInsertMode,
   isSharpshooterMode = false,
+  tupletEntry = false,
+  tupletSpec = { played: 3, beats: 1 },
   advanceOnPlace = false,
   initialTempo,
   tempoChanges = [],
@@ -1002,6 +1007,34 @@ export function GrandStaffCanvas({
       Math.round((y - (staveY + STAVE_TOP_OFFSET)) / (LINE_SPACING / 2)),
       staveY,
     )
+
+    // Polyrhythm entry: a click on a reserved placeholder rest fills that exact slot (so other
+    // slots can be left as rests, like normal entry); otherwise reserve a fresh tuplet here.
+    if (tupletEntry) {
+      const nearRest = nearestRestAtX(notes, x, CHORD_PROXIMITY_X, targetVoice)
+      const targetRestId = nearRest && part.measures[nearRest.measureIndex]?.tuplets?.some(t => t.placeholderIds?.includes(nearRest.id))
+        ? nearRest.id : undefined
+      const mIdx = targetRestId ? nearRest!.measureIndex : idx
+      const measure = part.measures[mIdx]
+      if (!measure) return null
+      const atIndex = measure.notes.filter(n => n.voice === targetVoice).length
+      let pitches: Pitch[] | null = null
+      if (!isRest) {
+        const pitch = staffYToPitch(snapY, staveY, clef)
+        pitches = [selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch]
+      }
+      const newId = crypto.randomUUID()
+      placementAppendedRef.current = true
+      pendingCenterRef.current = mIdx
+      const { inSpaceOf, baseDuration, baseDots } = deriveTuplet(tupletSpec.played, tupletSpec.beats)
+      dispatch({
+        type: 'PLACE_TUPLET_NOTE', partId: part.id, measureId: measure.id, voice: targetVoice,
+        played: tupletSpec.played, inSpaceOf, beats: tupletSpec.beats, baseDuration, baseDots,
+        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId,
+      })
+      onNotePlaced?.()
+      return newId
+    }
 
     if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
       const hit = noteHeadAt(notes, x, snapY)

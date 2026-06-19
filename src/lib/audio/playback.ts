@@ -1,7 +1,7 @@
 import * as Tone from 'tone'
-import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig } from '../../types/score'
+import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig, Tuplet } from '../../types/score'
 import { loadSoundFont } from './soundfonts'
-import { effectiveTimeSigAt } from '../beats'
+import { effectiveTimeSigAt, eventBeats } from '../beats'
 
 const NOTE_MIDI: Record<string, number> = {
   C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11,
@@ -41,9 +41,10 @@ function effectiveKeySig(measures: Measure[], idx: number, global: KeySig): KeyS
   return global
 }
 
-function eventDurationSeconds(event: NoteEvent, tempo: number): number {
-  const beats = { whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25 }[event.duration]
-  return beats * (event.dots > 0 ? 1.5 : 1) * (60 / tempo)
+// Sounded seconds for an event, including any tuplet scaling (a triplet member sounds
+// shorter than its written value), so playback timing matches the engraved rhythm.
+function eventDurationSeconds(event: NoteEvent, tempo: number, tuplets?: Tuplet[]): number {
+  return eventBeats(event, tuplets) * (60 / tempo)
 }
 
 // Returns the effective tempo at a given measure number.
@@ -129,7 +130,7 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
           const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
           let voiceTime = measureStart
           for (const event of voiceNotes) {
-            const dur = eventDurationSeconds(event, tempo)
+            const dur = eventDurationSeconds(event, tempo, measure.tuplets)
             if (event.type === 'note') {
               const fromId = tieFromOf.get(event.id)
               const fromOffsets = fromId ? resolvedNoteOffsets.get(fromId) : undefined

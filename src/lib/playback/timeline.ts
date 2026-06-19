@@ -1,6 +1,6 @@
-import type { Score, NoteEvent } from '../../types/score'
+import type { Score, NoteEvent, Tuplet } from '../../types/score'
 import type { MeasureGeometry, NoteGeometry } from '../vexflow/renderer'
-import { effectiveTimeSigAt } from '../beats'
+import { effectiveTimeSigAt, eventBeats } from '../beats'
 
 export interface PlaybackLayout {
   measures: MeasureGeometry[]
@@ -21,9 +21,10 @@ function getEffectiveTempo(score: Score, measureNumber: number): number {
   return tempo
 }
 
-function eventDurationSeconds(event: NoteEvent, tempo: number): number {
-  const beats = { whole: 4, half: 2, quarter: 1, eighth: 0.5, sixteenth: 0.25 }[event.duration]
-  return beats * (event.dots > 0 ? 1.5 : 1) * (60 / tempo)
+// Sounded seconds for an event, including any tuplet scaling (tuplet members sound shorter
+// than their written value, so the timeline must use the scaled beat count).
+function eventDurationSeconds(event: NoteEvent, tempo: number, tuplets?: Tuplet[]): number {
+  return eventBeats(event, tuplets) * (60 / tempo)
 }
 
 /** Map transport time (seconds) to a horizontal scroll x using the last event at/before t. */
@@ -62,7 +63,7 @@ export function buildPlaybackTimeline(score: Score, layout: PlaybackLayout): Pla
       for (const event of measure.notes) {
         const geom = noteById.get(event.id)
         points.push({ time: absTime, x: geom?.cx ?? fallbackX })
-        absTime += eventDurationSeconds(event, tempo)
+        absTime += eventDurationSeconds(event, tempo, measure.tuplets)
       }
     } else {
       points.push({ time: absTime, x: fallbackX })

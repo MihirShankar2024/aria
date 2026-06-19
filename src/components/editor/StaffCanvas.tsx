@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt, deriveTuplet } from '../../lib/beats'
 import { getClipboard, cloneWithFreshIds } from './clipboard'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
@@ -79,6 +79,9 @@ interface StaffCanvasProps {
   isBroomMode: boolean
   isInsertMode: boolean
   isSharpshooterMode?: boolean
+  /** When true, placed notes flow into a reserved tuplet of `tupletSpec` (polyrhythm entry). */
+  tupletEntry?: boolean
+  tupletSpec?: { played: number; beats: number }
   /** When true (default), placing a note in keyboard mode advances the cursor to the next
    * beat; when false, the cursor stays on the note just placed. */
   advanceOnPlace?: boolean
@@ -158,6 +161,8 @@ export function StaffCanvas({
   isBroomMode,
   isInsertMode,
   isSharpshooterMode = false,
+  tupletEntry = false,
+  tupletSpec = { played: 3, beats: 1 },
   advanceOnPlace = true,
   initialTempo,
   tempoChanges = [],
@@ -1143,6 +1148,33 @@ export function StaffCanvas({
     const targetVoice: VoiceNumber = altKey ? 2 : activeVoice
     const stepsDown = Math.round((y - STAVE_TOP_Y) / (LINE_SPACING / 2))
     const snapY = staffStepToY(stepsDown, STAVE_Y)
+    // Polyrhythm entry: a click on a reserved placeholder rest fills that exact slot (so other
+    // slots can be left as rests, like normal entry); otherwise reserve a fresh tuplet here.
+    if (tupletEntry) {
+      const nearRest = nearestRestAtX(x, CHORD_PROXIMITY_X, targetVoice)
+      const targetRestId = nearRest && measures[nearRest.measureIndex]?.tuplets?.some(t => t.placeholderIds?.includes(nearRest.id))
+        ? nearRest.id : undefined
+      const idx = targetRestId ? nearRest!.measureIndex : getMeasureIndexAtX(x)
+      const measure = measures[idx]
+      if (!measure) return null
+      const atIndex = measure.notes.filter(n => n.voice === targetVoice).length
+      let pitches: Pitch[] | null = null
+      if (!isRest) {
+        const pitch = staffYToPitch(snapY, STAVE_Y, clef)
+        pitches = [toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)]
+      }
+      const newId = crypto.randomUUID()
+      placementAppendedRef.current = true
+      pendingCenterRef.current = idx
+      const { inSpaceOf, baseDuration, baseDots } = deriveTuplet(tupletSpec.played, tupletSpec.beats)
+      dispatch({
+        type: 'PLACE_TUPLET_NOTE', partId, measureId: measure.id, voice: targetVoice,
+        played: tupletSpec.played, inSpaceOf, beats: tupletSpec.beats, baseDuration, baseDots,
+        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId,
+      })
+      onNotePlaced?.()
+      return newId
+    }
     // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
     // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
     // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).

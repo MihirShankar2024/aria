@@ -1,8 +1,8 @@
 import { produce } from 'immer'
-import type { Score, Part, Measure, TimeSig, Pitch, NoteEvent, VoiceNumber } from '../types/score'
+import type { Score, Part, Measure, TimeSig, Pitch, NoteEvent, VoiceNumber, Tuplet, Rest } from '../types/score'
 import type { ScoreAction } from './actions'
 import { normalizeMeasureRests, fillMeasureWithRests } from '../lib/rests'
-import { measureBeatCount, measureCapacity, noteBeatDuration, effectiveTimeSigAt } from '../lib/beats'
+import { measureBeatCount, measureCapacity, measureRemainingBeats, noteBeatDuration, effectiveTimeSigAt } from '../lib/beats'
 import { INSTRUMENT_DB } from '../lib/instruments'
 
 const VOICES: readonly VoiceNumber[] = [1, 2]
@@ -36,11 +36,19 @@ function createInheritedMeasures(score: Score, count: number): Measure[] {
 // (rests created inside `normalizeMeasureRests` default to voice 1). The flat array
 // comes back grouped voice-1-then-voice-2; renderer/ties don't depend on cross-voice
 // order, and within-voice order is preserved.
-function normalizeByVoice(notes: NoteEvent[], ts: TimeSig): NoteEvent[] {
+function normalizeByVoice(notes: NoteEvent[], ts: TimeSig, tuplets?: Tuplet[]): NoteEvent[] {
   const out: NoteEvent[] = []
+  const inTuplet = new Set(tuplets?.flatMap(t => t.memberIds) ?? [])
   for (const v of VOICES) {
     const ofVoice = notes.filter(n => n.voice === v)
     if (ofVoice.length === 0) continue
+    // Rest canonicalization assumes a dyadic beat grid, which doesn't hold inside a tuplet.
+    // If this voice carries any tuplet members, leave its events untouched so authored
+    // tuplet content (and its rests) survives and no rest merges across a tuplet boundary.
+    if (ofVoice.some(ev => inTuplet.has(ev.id))) {
+      out.push(...ofVoice)
+      continue
+    }
     for (const ev of normalizeMeasureRests(ofVoice, ts)) {
       out.push(ev.voice === v ? ev : { ...ev, voice: v })
     }
@@ -48,14 +56,62 @@ function normalizeByVoice(notes: NoteEvent[], ts: TimeSig): NoteEvent[] {
   return out
 }
 
+// Swap an id inside every tuplet's member list (a replaced rest/note keeps its tuplet
+// slot rather than dissolving the group). Run before pruneTuplets on replace paths.
+function remapTupletMember(measure: Measure, oldId: string, newId: string): void {
+  if (!measure.tuplets) return
+  for (const t of measure.tuplets) {
+    const i = t.memberIds.indexOf(oldId)
+    if (i !== -1) t.memberIds[i] = newId
+    // Replacing a reserved rest (e.g. via normal entry) commits that slot — it's no longer empty.
+    if (t.placeholderIds) t.placeholderIds = t.placeholderIds.filter(id => id !== oldId)
+  }
+}
+
+// Drop tuplet members that no longer exist and tuplets that fall below two members, then
+// orphan-clear any parentId whose parent was removed. Run after any note deletion/replace.
+function pruneTuplets(measure: Measure): void {
+  if (!measure.tuplets || measure.tuplets.length === 0) return
+  const liveIds = new Set(measure.notes.map(n => n.id))
+  let tuplets = measure.tuplets
+    .map(t => ({
+      ...t,
+      memberIds: t.memberIds.filter(id => liveIds.has(id)),
+      placeholderIds: t.placeholderIds?.filter(id => liveIds.has(id)),
+    }))
+    .filter(t => t.memberIds.length >= 2)
+  const liveTupletIds = new Set(tuplets.map(t => t.id))
+  tuplets = tuplets.map(t => (t.parentId && !liveTupletIds.has(t.parentId) ? { ...t, parentId: undefined } : t))
+  measure.tuplets = tuplets.length ? tuplets : undefined
+}
+
+// Greedy-decompose a written beat length into rests (largest dyadic value first). Used to
+// re-reserve the unused tail of a tuplet slot that a finer note splits. Tuplet slot lengths are
+// dyadic down to a sixteenth, so this terminates with representable durations.
+const REST_UNITS: [Rest['duration'], number][] = [['whole', 4], ['half', 2], ['quarter', 1], ['eighth', 0.5], ['sixteenth', 0.25]]
+function decomposeRests(beats: number, voice: VoiceNumber): Rest[] {
+  const out: Rest[] = []
+  let rem = beats
+  for (const [duration, b] of REST_UNITS) {
+    while (rem >= b - 1e-6) { out.push({ id: crypto.randomUUID(), type: 'rest', duration, dots: 0, voice }); rem -= b }
+  }
+  return out
+}
+
 // Pad each occupied voice's trailing gap with rests (the tool a user runs to complete
 // a red voice). An empty measure fills voice 1.
-function fillByVoice(notes: NoteEvent[], ts: TimeSig): NoteEvent[] {
+function fillByVoice(notes: NoteEvent[], ts: TimeSig, tuplets?: Tuplet[]): NoteEvent[] {
   const occupied = VOICES.filter(v => notes.some(n => n.voice === v))
   const targets = occupied.length ? occupied : [1 as VoiceNumber]
+  const inTuplet = new Set(tuplets?.flatMap(t => t.memberIds) ?? [])
   const out: NoteEvent[] = []
   for (const v of targets) {
     const ofVoice = notes.filter(n => n.voice === v)
+    // Rest-fill uses the dyadic beat grid, invalid inside a tuplet — leave tuplet voices alone.
+    if (ofVoice.some(ev => inTuplet.has(ev.id))) {
+      out.push(...ofVoice)
+      continue
+    }
     for (const ev of fillMeasureWithRests(ofVoice, ts)) {
       out.push(ev.voice === v ? ev : { ...ev, voice: v })
     }
@@ -120,7 +176,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
           measure.notes.push(action.note)
-          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
         }
         break
       }
@@ -130,7 +186,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
           measure.notes.push(action.rest)
-          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
         }
         break
       }
@@ -145,8 +201,10 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           // Reject only if swapping in the (longer) note would overflow the rest's own voice.
           const newTotal = measureBeatCount(measure, rest.voice) - noteBeatDuration(rest) + noteBeatDuration(action.note)
           if (newTotal <= measureCapacity(ts) + 0.001) {
+            remapTupletMember(measure, rest.id, action.note.id)
             measure.notes[idx] = action.note
-            measure.notes = normalizeByVoice(measure.notes, ts)
+            measure.notes = normalizeByVoice(measure.notes, ts, measure.tuplets)
+            pruneTuplets(measure)
           }
         }
         break
@@ -162,8 +220,10 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           // Reject only if the swapped-in event would overflow the old event's own voice.
           const newTotal = measureBeatCount(measure, old.voice) - noteBeatDuration(old) + noteBeatDuration(action.event)
           if (newTotal <= measureCapacity(ts) + 0.001) {
+            remapTupletMember(measure, old.id, action.event.id)
             measure.notes[idx] = action.event
-            measure.notes = normalizeByVoice(measure.notes, ts)
+            measure.notes = normalizeByVoice(measure.notes, ts, measure.tuplets)
+            pruneTuplets(measure)
           }
         }
         break
@@ -175,7 +235,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (measure && action.events.length > 0) {
           const at = Math.max(0, Math.min(action.index, measure.notes.length))
           measure.notes.splice(at, 0, ...action.events)
-          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
         }
         break
       }
@@ -184,7 +244,8 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const measure = part?.measures.find(m => m.id === action.measureId)
         if (part && measure) {
           measure.notes = measure.notes.filter(n => n.id !== action.noteId)
-          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
+          pruneTuplets(measure)
           // Drop ties whose endpoint was just removed (no note left to draw to).
           if (part.ties) {
             part.ties = part.ties.filter(t => t.from.note !== action.noteId && t.to.note !== action.noteId)
@@ -245,7 +306,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           const measure = draft.parts
             .find(p => p.id === edit.partId)
             ?.measures.find(m => m.id === edit.measureId)
-          if (measure) { measure.notes = edit.notes; touchedParts.add(edit.partId) }
+          if (measure) { measure.notes = edit.notes; pruneTuplets(measure); touchedParts.add(edit.partId) }
         }
         // Drop ties whose endpoint notehead no longer exists — covers whole-note removal
         // and per-pitch deletion (a chord tone stripped while the note remains).
@@ -260,7 +321,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           .find(p => p.id === action.partId)
           ?.measures.find(m => m.id === action.measureId)
         if (measure) {
-          measure.notes = fillByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = fillByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
         }
         break
       }
@@ -271,7 +332,7 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         const note = measure?.notes.find(n => n.id === action.noteId)
         if (measure && note) {
           Object.assign(note, action.patch)
-          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+          measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
         }
         break
       }
@@ -304,11 +365,132 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           // If all pitches removed, delete the note entirely.
           if (note.pitches.length === 0) {
             measure.notes = measure.notes.filter(n => n.id !== action.noteId)
-            measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure))
+            measure.notes = normalizeByVoice(measure.notes, effectiveTimeSig(draft, measure), measure.tuplets)
+            pruneTuplets(measure)
           }
           // Drop ties on the removed head (whole note or just this chord tone).
           pruneUnresolvedTies(part)
         }
+        break
+      }
+      case 'CREATE_TUPLET': {
+        const measure = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+        if (!measure || action.memberIds.length < 2 || action.played < 2 || action.inSpaceOf < 1) break
+        // Members must be real events of a single voice and contiguous in that voice's order.
+        const memberSet = new Set(action.memberIds)
+        const members = measure.notes.filter(n => memberSet.has(n.id))
+        if (members.length !== action.memberIds.length) break
+        const voice = members[0].voice
+        if (members.some(m => m.voice !== voice)) break
+        const voiceOrder = measure.notes.filter(n => n.voice === voice).map(n => n.id)
+        const positions = action.memberIds.map(id => voiceOrder.indexOf(id)).sort((a, b) => a - b)
+        const contiguous = positions.every((p, i) => i === 0 || p === positions[i - 1] + 1)
+        if (!contiguous) break
+        // Keep members in voice order regardless of selection order.
+        const orderedIds = voiceOrder.filter(id => memberSet.has(id))
+        // Nest if every member already lives in one existing tuplet.
+        const parent = measure.tuplets?.find(t => orderedIds.every(id => t.memberIds.includes(id)))
+        measure.tuplets ??= []
+        measure.tuplets.push({
+          id: crypto.randomUUID(),
+          played: action.played,
+          inSpaceOf: action.inSpaceOf,
+          memberIds: orderedIds,
+          parentId: parent?.id,
+        })
+        break
+      }
+      case 'REMOVE_TUPLET': {
+        const measure = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+        if (measure?.tuplets) {
+          // Re-parent children of the removed tuplet to its own parent so nesting stays valid.
+          const removed = measure.tuplets.find(t => t.id === action.tupletId)
+          measure.tuplets = measure.tuplets
+            .filter(t => t.id !== action.tupletId)
+            .map(t => (t.parentId === action.tupletId ? { ...t, parentId: removed?.parentId } : t))
+          if (measure.tuplets.length === 0) measure.tuplets = undefined
+        }
+        break
+      }
+      case 'PLACE_TUPLET_NOTE': {
+        const measure = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+        if (!measure || action.played < 2 || action.inSpaceOf < 1) break
+        const { voice } = action
+        const placed: NoteEvent = action.pitches
+          ? { id: action.noteId, type: 'note', pitches: action.pitches, duration: action.duration, dots: action.dots, tied: false, voice }
+          : { id: action.noteId, type: 'rest', duration: action.duration, dots: action.dots, voice }
+        const W = noteBeatDuration(placed)
+
+        // Resolve the target tuplet + the slot to start filling at. A click on a reserved
+        // placeholder rest (`targetRestId`) fills that exact slot; otherwise reserve a fresh tuplet
+        // at the cursor and fill its first slot. Placement never auto-flows onto committed notes/
+        // rests — only reserved placeholder slots are fillable — so unclicked slots stay rests.
+        let target: Tuplet | undefined
+        let startPos: number
+        if (action.targetRestId) {
+          target = (measure.tuplets ?? []).find(t => t.placeholderIds?.includes(action.targetRestId!))
+          if (!target) break
+          startPos = target.memberIds.indexOf(action.targetRestId)
+        } else {
+          // Reserve a fresh tuplet of `played` rests of the base unit at the cursor. The base unit
+          // (one slot) is the derived `baseDuration`/`baseDots`, independent of the placed value.
+          const U = noteBeatDuration({ duration: action.baseDuration, dots: action.baseDots })
+          const ts = effectiveTimeSig(draft, measure)
+          if (action.inSpaceOf * U > measureRemainingBeats(measure, ts, voice) + 0.001) break
+          const rests: Rest[] = Array.from({ length: action.played }, () => ({
+            id: crypto.randomUUID(), type: 'rest', duration: action.baseDuration, dots: action.baseDots, voice,
+          }))
+          // Translate the voice-local atIndex to a measure.notes splice index.
+          let count = 0
+          let spliceAt = measure.notes.length
+          for (let i = 0; i < measure.notes.length; i++) {
+            if (measure.notes[i].voice === voice) { if (count === action.atIndex) { spliceAt = i; break }; count++ }
+          }
+          measure.notes.splice(spliceAt, 0, ...rests)
+          const ids = rests.map(r => r.id)
+          target = { id: crypto.randomUUID(), played: action.played, inSpaceOf: action.inSpaceOf, memberIds: ids, placeholderIds: [...ids] }
+          measure.tuplets ??= []
+          measure.tuplets.push(target)
+          startPos = 0
+        }
+        if (startPos < 0) break
+
+        // Consume placeholder space starting at `startPos`: walk contiguous placeholder slots
+        // until they cover the placed event's written length `W`. A note larger than one slot
+        // eats several whole slots; a note smaller than a slot splits it, the leftover re-reserved
+        // as placeholder rest(s) so finer values fill the rest of that slot.
+        const placeholders = new Set(target.placeholderIds ?? [])
+        let acc = 0
+        const consumed: string[] = []
+        for (let i = startPos; i < target.memberIds.length && acc < W - 1e-6; i++) {
+          const id = target.memberIds[i]
+          if (!placeholders.has(id)) break // hit a committed slot — placed event won't fit here
+          const slot = measure.notes.find(n => n.id === id)
+          if (!slot) break
+          acc += noteBeatDuration(slot)
+          consumed.push(id)
+        }
+        if (consumed.length === 0 || acc < W - 1e-6) break // not enough open space at this slot
+        const leftover = decomposeRests(acc - W, voice) // re-reserve the unused tail of the last slot
+
+        // Replace the first consumed slot with the placed event, insert leftover rests after it,
+        // and drop the remaining consumed placeholders.
+        const replaceIdx = measure.notes.findIndex(n => n.id === consumed[0])
+        measure.notes[replaceIdx] = placed
+        if (leftover.length) measure.notes.splice(replaceIdx + 1, 0, ...leftover)
+        const dropIds = new Set(consumed.slice(1))
+        measure.notes = measure.notes.filter(n => !dropIds.has(n.id))
+        target.memberIds.splice(startPos, consumed.length, action.noteId, ...leftover.map(r => r.id))
+        // Consumed slots are now committed; the placed id is not a placeholder, but the leftover is.
+        target.placeholderIds = (target.placeholderIds ?? [])
+          .filter(id => !consumed.includes(id))
+          .concat(leftover.map(r => r.id))
         break
       }
       case 'ADD_MEASURE': {

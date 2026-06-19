@@ -56,10 +56,32 @@ export interface KeySig {
   mode: 'major' | 'minor'
 }
 
+/**
+ * A tuplet groups consecutive events of ONE voice within a measure, printing `played`
+ * notes in the time normally occupied by `inSpaceOf` of the same written value (an
+ * eighth-note triplet is played:3 / inSpaceOf:2). Members keep their written
+ * `Duration`/`dots`; the tuplet supplies a time scale (`inSpaceOf / played`) applied only
+ * in beat math and handed to VexFlow for rendering. Stored on the measure (voice is
+ * implied by the members' `.voice`) and keyed by member event id so the group survives
+ * re-ordering and nesting. `parentId` points at the enclosing tuplet for nested tuplets.
+ */
+export interface Tuplet {
+  id: string
+  played: number          // notes printed (the "3" in a triplet)
+  inSpaceOf: number        // in the time of this many (the "2" in 3:2)
+  memberIds: string[]      // NoteEvent ids, in document order, all the same voice
+  placeholderIds?: string[] // subset of memberIds: reserved-but-unfilled slots (empty when full).
+                            // A committed rest is NOT listed, so it survives instead of being backfilled.
+  parentId?: string        // enclosing tuplet, for nesting
+  showBracket?: boolean    // engraving hint; undefined = VexFlow auto
+  showNumber?: boolean     // engraving hint; undefined = VexFlow auto
+}
+
 export interface Measure {
   id: string
   number: number
   notes: NoteEvent[]
+  tuplets?: Tuplet[]    // tuplet groups in this measure (voice implied by members)
   timeSig?: TimeSig     // only set when it changes from global
   keySig?: KeySig       // only set when it changes from global
 }

@@ -1,4 +1,4 @@
-import type { Score, Part, Measure, NoteEvent, Note, Rest, Pitch, Duration, Accidental, TimeSig, KeySig } from '../../types/score'
+import type { Score, Part, Measure, NoteEvent, Note, Rest, Pitch, Duration, Accidental, TimeSig, KeySig, Tuplet } from '../../types/score'
 import { newPitchId } from '../pitch'
 
 function parseTimeSig(el: Element): TimeSig | undefined {
@@ -46,11 +46,32 @@ function parseNote(el: Element): NoteEvent {
 
 function parseMeasure(el: Element): Measure {
   const number = parseInt(el.getAttribute('number') ?? '1')
-  const notes: NoteEvent[] = Array.from(el.querySelectorAll('note')).map(parseNote)
+  const noteEls = Array.from(el.querySelectorAll('note'))
+  const notes: NoteEvent[] = []
+  const tuplets: Tuplet[] = []
+  // Reconstruct tuplet groups from <tuplet type="start"|"stop"> markers, reading the ratio
+  // from the start note's <time-modification>. Members are the events between the markers.
+  let open: { played: number; inSpaceOf: number; memberIds: string[] } | null = null
+  for (const noteEl of noteEls) {
+    const ev = parseNote(noteEl)
+    notes.push(ev)
+    const startMarker = noteEl.querySelector('notations > tuplet[type="start"]')
+    const stopMarker = noteEl.querySelector('notations > tuplet[type="stop"]')
+    if (startMarker) {
+      const played = parseInt(noteEl.querySelector('time-modification > actual-notes')?.textContent ?? '3')
+      const inSpaceOf = parseInt(noteEl.querySelector('time-modification > normal-notes')?.textContent ?? '2')
+      open = { played, inSpaceOf, memberIds: [] }
+    }
+    if (open) open.memberIds.push(ev.id)
+    if (stopMarker && open) {
+      if (open.memberIds.length >= 2) tuplets.push({ id: crypto.randomUUID(), ...open })
+      open = null
+    }
+  }
   const timeSig = parseTimeSig(el)
   const keySig = parseKeySig(el)
 
-  return { id: crypto.randomUUID(), number, notes, timeSig, keySig }
+  return { id: crypto.randomUUID(), number, notes, timeSig, keySig, tuplets: tuplets.length ? tuplets : undefined }
 }
 
 export function musicXMLToScore(xml: string, existingScore: Score): Score {

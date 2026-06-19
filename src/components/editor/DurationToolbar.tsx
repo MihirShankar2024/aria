@@ -3,6 +3,8 @@ import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward, Music2 } 
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { Tooltip, TooltipTrigger, TooltipContent } from '../ui/tooltip'
+import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
+import { PolyrhythmPicker, type TupletSpec } from './PolyrhythmPicker'
 import { TimeSigPicker } from './TimeSigPicker'
 import { KeySigPicker } from './KeySigPicker'
 import { TempoPicker } from './TempoPicker'
@@ -15,6 +17,14 @@ const DURATIONS: { value: Duration; label: string; name: string; desc: string; k
   { value: 'quarter', label: 'Q', name: 'Quarter note', desc: 'Place quarter notes.', keys: 'Q' },
   { value: 'eighth', label: '8', name: 'Eighth note', desc: 'Place eighth notes.', keys: 'E / 8' },
   { value: 'sixteenth', label: '16', name: 'Sixteenth note', desc: 'Place sixteenth notes.', keys: 'X / 6' },
+]
+
+// Tuplet ratio presets: `played` notes in the time of `inSpaceOf`.
+const TUPLET_PRESETS: { played: number; inSpaceOf: number; label: string }[] = [
+  { played: 3, inSpaceOf: 2, label: 'triplet (3:2)' },
+  { played: 5, inSpaceOf: 4, label: 'quintuplet (5:4)' },
+  { played: 6, inSpaceOf: 4, label: 'sextuplet (6:4)' },
+  { played: 7, inSpaceOf: 8, label: 'septuplet (7:8)' },
 ]
 
 const ACCIDENTALS: { value: NonNullable<Accidental>; label: string; name: string; desc: string; keys: string }[] = [
@@ -66,6 +76,10 @@ interface DurationToolbarProps {
   onDottedChange: (v: boolean) => void
   isRest: boolean
   onRestChange: (v: boolean) => void
+  tupletEntry: boolean
+  onTupletEntryChange: (v: boolean) => void
+  tupletSpec: TupletSpec
+  onTupletSpecChange: (s: TupletSpec) => void
   activeVoice: VoiceNumber
   onActiveVoiceChange: (v: VoiceNumber) => void
   selectedAccidental: Accidental
@@ -90,6 +104,7 @@ interface DurationToolbarProps {
   onTransposedViewChange: (v: boolean) => void
   selectedNoteCount: number
   onDeleteSelected: () => void
+  onMakeTuplet: (played: number, inSpaceOf: number) => void
   hasPendingRests: boolean
   onCollapseRests: () => void
   // Score-level props for pickers
@@ -107,6 +122,10 @@ export function DurationToolbar({
   onDottedChange,
   isRest,
   onRestChange,
+  tupletEntry,
+  onTupletEntryChange,
+  tupletSpec,
+  onTupletSpecChange,
   activeVoice,
   onActiveVoiceChange,
   selectedAccidental,
@@ -131,6 +150,7 @@ export function DurationToolbar({
   onTransposedViewChange,
   selectedNoteCount,
   onDeleteSelected,
+  onMakeTuplet,
   hasPendingRests,
   onCollapseRests,
   globalTimeSig,
@@ -164,6 +184,23 @@ export function DurationToolbar({
         <DockTip name="Rest" desc="Place rests instead of notes." keys="Space">
           <Toggle pressed={isRest} onPressedChange={onRestChange} className={TOGGLE_ITEM_CLASS + ' font-serif'}>𝄽</Toggle>
         </DockTip>
+
+        {/* Polyrhythm entry — hover for the ratio panel (which carries its own description),
+            click to arm. The next notes flow into a reserved tuplet of the chosen ratio. */}
+        <PolyrhythmPicker
+          current={tupletSpec}
+          onChange={onTupletSpecChange}
+          onConfirm={spec => { onTupletSpecChange(spec); onTupletEntryChange(true) }}
+        >
+          <Toggle
+            pressed={tupletEntry}
+            onPressedChange={onTupletEntryChange}
+            className={TOGGLE_ITEM_CLASS + ' font-mono tabular-nums data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+          >
+            <span>{tupletSpec.played}</span>
+            <span className="text-[9px] text-white/40 ml-0.5">/{tupletSpec.beats}</span>
+          </Toggle>
+        </PolyrhythmPicker>
 
         <div className="w-px h-5 bg-white/15" />
 
@@ -260,13 +297,41 @@ export function DurationToolbar({
             </Toggle>
           </DockTip>
           {isSelectMode && selectedNoteCount > 0 && (
-            <button
-              onClick={onDeleteSelected}
-              title="Delete selected notes"
-              className="absolute left-1/2 -translate-x-1/2 top-full mt-1 z-30 flex h-6 w-6 items-center justify-center rounded-md bg-violet-500/30 text-violet-200 hover:bg-violet-500/50 ring-1 ring-violet-400/50 animate-in fade-in"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
+            <div className="absolute left-1/2 -translate-x-1/2 top-full mt-1 z-30 flex items-center gap-1 animate-in fade-in">
+              <button
+                onClick={onDeleteSelected}
+                title="Delete selected notes"
+                className="flex h-6 w-6 items-center justify-center rounded-md bg-violet-500/30 text-violet-200 hover:bg-violet-500/50 ring-1 ring-violet-400/50"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+              {selectedNoteCount >= 2 && (
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <button
+                      title="Group selection into a tuplet"
+                      className="flex h-6 min-w-6 items-center justify-center rounded-md bg-violet-500/30 px-1 text-[11px] font-semibold text-violet-200 hover:bg-violet-500/50 ring-1 ring-violet-400/50"
+                    >
+                      3
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent side="bottom" align="center" className="w-auto p-1.5">
+                    <div className="flex flex-col gap-0.5">
+                      {TUPLET_PRESETS.map(({ played, inSpaceOf, label }) => (
+                        <button
+                          key={label}
+                          onClick={() => onMakeTuplet(played, inSpaceOf)}
+                          className="flex items-center justify-between gap-3 rounded-md px-2 py-1 text-xs text-white/70 hover:bg-white/10 hover:text-white"
+                        >
+                          <span className="font-semibold">{played}</span>
+                          <span className="text-white/45">{label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </PopoverContent>
+                </Popover>
+              )}
+            </div>
           )}
         </div>
 

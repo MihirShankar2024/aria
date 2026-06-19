@@ -1,4 +1,5 @@
-import type { Score, Note, Rest, NoteEvent, Part, Measure, Pitch } from '../../types/score'
+import type { Score, Note, Rest, NoteEvent, Part, Measure, Pitch, Tuplet } from '../../types/score'
+import { eventBeats } from '../beats'
 
 function accidentalToAlter(acc: Pitch['accidental']): number {
   const map: Record<string, number> = { sharp: 1, flat: -1, natural: 0, double_sharp: 2, double_flat: -2 }
@@ -12,10 +13,26 @@ function durationToType(dur: NoteEvent['duration']): string {
   return map[dur]
 }
 
-function durationToDivisions(dur: NoteEvent['duration'], dots: number): number {
-  const base: Record<string, number> = { whole: 16, half: 8, quarter: 4, eighth: 2, sixteenth: 1 }
-  const b = base[dur]
-  return dots > 0 ? Math.round(b * 1.5) : b
+function gcd(a: number, b: number): number { while (b) { [a, b] = [b, a % b] } return a || 1 }
+function lcm(a: number, b: number): number { return (a * b) / gcd(a, b) }
+
+/**
+ * MusicXML <divisions> per quarter note for a part. A tuplet member's *sounded* duration is
+ * `written × inSpaceOf/played`, so divisions must be divisible by every `played` (and by 4, our
+ * sixteenth base) to keep every sounded duration an integer. = 4 × lcm(all played), = 4 when no
+ * tuplets (matching the previous fixed value).
+ */
+function partDivisions(part: Part): number {
+  let l = 1
+  for (const m of part.measures) for (const t of m.tuplets ?? []) l = lcm(l, t.played)
+  return 4 * l
+}
+
+/** The tuplet an event belongs to, plus whether it begins/ends the group. */
+function tupletContext(event: NoteEvent, tuplets?: Tuplet[]): { tuplet: Tuplet; isFirst: boolean; isLast: boolean } | null {
+  const tuplet = tuplets?.find(t => t.memberIds.includes(event.id))
+  if (!tuplet) return null
+  return { tuplet, isFirst: tuplet.memberIds[0] === event.id, isLast: tuplet.memberIds[tuplet.memberIds.length - 1] === event.id }
 }
 
 function pitchToXML(pitch: Pitch): string {
@@ -31,10 +48,22 @@ function pitchToXML(pitch: Pitch): string {
   ${accidentalTag}`
 }
 
-function noteToXML(event: NoteEvent): string {
+function noteToXML(event: NoteEvent, divisions: number, tuplets?: Tuplet[]): string {
+  // Sounded duration in divisions, tuplet-scaled (= written × inSpaceOf/played). divisions is
+  // sized so this is always an integer. <type> stays the written value.
+  const dur = Math.round(eventBeats(event, tuplets) * divisions)
+  const tctx = tupletContext(event, tuplets)
+  const timeMod = tctx
+    ? `<time-modification><actual-notes>${tctx.tuplet.played}</actual-notes><normal-notes>${tctx.tuplet.inSpaceOf}</normal-notes></time-modification>`
+    : ''
+  // <tuplet> bracket notation on the group's first/last member only.
+  const tupletNotation = tctx && (tctx.isFirst || tctx.isLast)
+    ? `<notations>${tctx.isFirst ? '<tuplet type="start" bracket="yes"/>' : ''}${tctx.isLast ? '<tuplet type="stop"/>' : ''}</notations>`
+    : ''
+
   if (event.type === 'rest') {
     const rest = event as Rest
-    return `<note><rest/><duration>${durationToDivisions(rest.duration, rest.dots)}</duration><type>${durationToType(rest.duration)}</type>${rest.dots > 0 ? '<dot/>' : ''}</note>`
+    return `<note><rest/><duration>${dur}</duration><type>${durationToType(rest.duration)}</type>${rest.dots > 0 ? '<dot/>' : ''}${timeMod}${tupletNotation}</note>`
   }
 
   const note = event as Note
@@ -42,15 +71,16 @@ function noteToXML(event: NoteEvent): string {
   // For the primary pitch we emit a normal note; additional pitches use <chord/>.
   const dots = note.dots > 0 ? '<dot/>' : ''
   const tie  = note.tied ? '<tie type="start"/>' : ''
-  const dur  = `<duration>${durationToDivisions(note.duration, note.dots)}</duration><type>${durationToType(note.duration)}</type>${dots}${tie}`
 
   return note.pitches.map((pitch, idx) => {
     const chord = idx > 0 ? '<chord/>' : ''
-    return `<note>${chord}\n  ${pitchToXML(pitch)}\n  ${dur}\n</note>`
+    // Tuplet bracket notation belongs on the primary notehead only; time-modification on all.
+    const tail = `<duration>${dur}</duration><type>${durationToType(note.duration)}</type>${dots}${tie}${timeMod}${idx === 0 ? tupletNotation : ''}`
+    return `<note>${chord}\n  ${pitchToXML(pitch)}\n  ${tail}\n</note>`
   }).join('\n')
 }
 
-function measureToXML(measure: Measure, number: number, timeSig?: Score['globalTimeSig'], keySig?: Score['globalKeySig']): string {
+function measureToXML(measure: Measure, number: number, divisions: number, timeSig?: Score['globalTimeSig'], keySig?: Score['globalKeySig']): string {
   const timeSigXML = timeSig
     ? `<time><beats>${timeSig.beats}</beats><beat-type>${timeSig.beatType}</beat-type></time>`
     : ''
@@ -58,19 +88,21 @@ function measureToXML(measure: Measure, number: number, timeSig?: Score['globalT
 
   return `<measure number="${number}">
   <attributes>
-    <divisions>4</divisions>
+    <divisions>${divisions}</divisions>
     ${keySigXML}
     ${timeSigXML}
   </attributes>
-  ${measure.notes.map(noteToXML).join('\n  ')}
+  ${measure.notes.map(n => noteToXML(n, divisions, measure.tuplets)).join('\n  ')}
 </measure>`
 }
 
 function partToXML(part: Part, score: Score): string {
+  const divisions = partDivisions(part)
   return `<part id="${part.id}">
   ${part.measures.map((m, i) => measureToXML(
     m,
     m.number,
+    divisions,
     i === 0 ? score.globalTimeSig : m.timeSig,
     i === 0 ? score.globalKeySig : m.keySig,
   )).join('\n  ')}

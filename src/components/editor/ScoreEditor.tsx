@@ -65,6 +65,11 @@ export function ScoreEditor() {
   const [isInsertMode, setIsInsertMode] = useState(false)
   const [isSelectMode, setIsSelectMode] = useState(false)
   const [isSharpshooterMode, setIsSharpshooterMode] = useState(false)
+  // Polyrhythm entry: when armed, placed notes flow into a reserved tuplet of `tupletSpec`.
+  // The ratio persists as the last-used so re-arming reuses it.
+  const [tupletEntry, setTupletEntry] = useState(false)
+  // `played` notes spanning `beats` quarter-note beats; the inner ratio/base unit is derived.
+  const [tupletSpec, setTupletSpec] = useState<{ played: number; beats: number }>({ played: 3, beats: 1 })
   // Keyboard placement: after placing a note, advance the cursor to the next beat (true,
   // default) or stay on the note just placed (false).
   const [advanceOnPlace, setAdvanceOnPlace] = useState(false)
@@ -271,6 +276,7 @@ export function ScoreEditor() {
         case 't': enterTieMode(prev => !prev); break
         case 'b': enterBroomMode(prev => !prev); break
         case 'i': enterInsertMode(prev => !prev); break
+        case 'p': enterTupletEntry(prev => !prev); break
         case 'ArrowUp':
         case 'ArrowDown': {
           // In select mode, arrows nudge the selected notes chromatically
@@ -349,42 +355,42 @@ export function ScoreEditor() {
   const enterTieMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsTieMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterFillMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsFillMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterDeleteMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsDeleteMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterBroomMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsBroomMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterInsertMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsInsertMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterSelectMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsSelectMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false); setTupletEntry(false) }
       if (!v) setSelectedNoteIds(new Set())
       return v
     })
@@ -392,7 +398,15 @@ export function ScoreEditor() {
   const enterSharpshooterMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsSharpshooterMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      return v
+    })
+  }
+  // Arming polyrhythm entry clears the exclusive tool modes so placement resumes.
+  const enterTupletEntry = (next: boolean | ((p: boolean) => boolean)) => {
+    setTupletEntry(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
@@ -411,6 +425,23 @@ export function ScoreEditor() {
     }
     if (edits.length) dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
     setSelectedNoteIds(new Set())
+  }
+
+  // Group the selected events into a tuplet. Requires ≥2 events within a single measure;
+  // the reducer enforces same-voice + contiguity and silently no-ops otherwise.
+  const makeSelectedTuplet = (played: number, inSpaceOf: number) => {
+    const ids = new Set(selectionByEvent(selectedNoteIds).keys())
+    if (ids.size < 2) return
+    for (const part of score.parts) {
+      for (const measure of part.measures) {
+        const inMeasure = measure.notes.filter(n => ids.has(n.id))
+        if (inMeasure.length === 0) continue
+        if (inMeasure.length !== ids.size) return // selection spans measures — bail
+        dispatch({ type: 'CREATE_TUPLET', partId: part.id, measureId: measure.id, memberIds: inMeasure.map(n => n.id), played, inSpaceOf })
+        setSelectedNoteIds(new Set())
+        return
+      }
+    }
   }
 
   const handleTieComplete = () => setIsTieMode(false)
@@ -458,6 +489,8 @@ export function ScoreEditor() {
     isInsertMode,
     isSelectMode,
     isSharpshooterMode,
+    tupletEntry,
+    tupletSpec,
     advanceOnPlace,
     transposedView,
     selectedNoteIds,
@@ -525,6 +558,10 @@ export function ScoreEditor() {
           onDottedChange={setIsDotted}
           isRest={isRest}
           onRestChange={setIsRest}
+          tupletEntry={tupletEntry}
+          onTupletEntryChange={enterTupletEntry}
+          tupletSpec={tupletSpec}
+          onTupletSpecChange={setTupletSpec}
           activeVoice={activeVoice}
           onActiveVoiceChange={setActiveVoice}
           selectedAccidental={selectedAccidental}
@@ -549,6 +586,7 @@ export function ScoreEditor() {
           onTransposedViewChange={setTransposedView}
           selectedNoteCount={selectedNoteIds.size}
           onDeleteSelected={deleteSelectedNotes}
+          onMakeTuplet={makeSelectedTuplet}
           hasPendingRests={!!pendingRests}
           onCollapseRests={collapsePending}
           globalTimeSig={score.globalTimeSig}

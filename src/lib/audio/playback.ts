@@ -1,7 +1,7 @@
 import * as Tone from 'tone'
 import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig, Tuplet } from '../../types/score'
 import { loadSoundFont } from './soundfonts'
-import { effectiveTimeSigAt, eventBeats } from '../beats'
+import { effectiveTimeSigAt, eventBeats, measureCapacity } from '../beats'
 
 const NOTE_MIDI: Record<string, number> = {
   C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11,
@@ -118,7 +118,9 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
       // Active key signature for this measure.
       const keyMap = keySigOffsets(effectiveKeySig(part.measures, mIdx, score.globalKeySig).fifths)
 
-      const measureDuration = timeSig.beats * (60 / tempo)
+      // Quarter-note beats per bar (NOT timeSig.beats — that's the numerator, which is
+      // eighths in 6/8). measureCapacity gives (beats/beatType)*4, matching eventBeats' units.
+      const measureDuration = measureCapacity(timeSig) * (60 / tempo)
       const measureStart = absTime
       if (measure && measure.notes.length > 0) {
         // Each voice is an independent timeline that starts at the barline, so they

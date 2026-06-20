@@ -23,34 +23,6 @@ export function noteBeatDuration(event: Pick<NoteEvent, 'duration' | 'dots'>): n
   return QUARTER_BEATS[event.duration] * (event.dots > 0 ? 1.5 : 1)
 }
 
-/**
- * Translate a polyrhythm entered as "`played` notes over `beats` beats" into the underlying
- * tuplet: the inner ratio (`inSpaceOf`) and the note value of one reserved slot (`baseDuration`).
- * The base unit is the regular note value whose count across `beats` (= `inSpaceOf`) is the
- * subdivision closest to `played`, so `3 over 1` → 3:2 (eighths), `2 over 1.5` → 2:3 (eighths,
- * a duplet), `5 over 1` → 5:4 (sixteenths). Returns inSpaceOf 0 if no base unit divides `beats`.
- */
-export function deriveTuplet(
-  played: number,
-  beats: number,
-): { inSpaceOf: number; baseDuration: Duration; baseDots: number } {
-  let best: { inSpaceOf: number; baseDuration: Duration } | null = null
-  for (const [duration, b] of Object.entries(QUARTER_BEATS) as [Duration, number][]) {
-    const i = beats / b
-    if (i < 1 || Math.abs(i - Math.round(i)) > 1e-9) continue // base unit must divide the span
-    const inSpaceOf = Math.round(i)
-    if (
-      !best ||
-      Math.abs(inSpaceOf - played) < Math.abs(best.inSpaceOf - played) ||
-      (Math.abs(inSpaceOf - played) === Math.abs(best.inSpaceOf - played) && inSpaceOf < best.inSpaceOf)
-    ) {
-      best = { inSpaceOf, baseDuration: duration }
-    }
-  }
-  if (!best) return { inSpaceOf: 0, baseDuration: 'quarter', baseDots: 0 }
-  return { inSpaceOf: best.inSpaceOf, baseDuration: best.baseDuration, baseDots: 0 }
-}
-
 /** Exact written beat duration of one event, ignoring any tuplet scaling. */
 function writtenBeatsR(event: Pick<NoteEvent, 'duration' | 'dots'>): Rational {
   const base = QUARTER_BEATS_R[event.duration]

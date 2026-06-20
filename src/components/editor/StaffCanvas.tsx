@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt, deriveTuplet } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import type { TupletSpec } from './PolyrhythmPicker'
 import { getClipboard, cloneWithFreshIds } from './clipboard'
 import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
@@ -48,7 +49,8 @@ const PLACE_DRAG_TOLERANCE_PX = 4  // px — press-and-release within this count
 
 const STAVE_TOP_Y    = STAVE_Y + STAVE_TOP_OFFSET
 const STAVE_BOTTOM_Y = STAVE_TOP_Y + 4 * LINE_SPACING
-const CARD_PAD = 16  // px — the card's p-4 padding; offsets content from the (unclipped) wrapper edge
+const CARD_PAD_X = 16  // px — the card's px-4 horizontal padding
+const CARD_PAD_Y = 32  // px — the card's py-8 vertical padding
 
 // Broom highlight box vertical offsets — tune these to align each rect with the actual glyph.
 const BROOM_KEY_SIG_DY  = 30  // key signature accidentals
@@ -81,7 +83,7 @@ interface StaffCanvasProps {
   isSharpshooterMode?: boolean
   /** When true, placed notes flow into a reserved tuplet of `tupletSpec` (polyrhythm entry). */
   tupletEntry?: boolean
-  tupletSpec?: { played: number; beats: number }
+  tupletSpec?: TupletSpec
   /** When true (default), placing a note in keyboard mode advances the cursor to the next
    * beat; when false, the cursor stays on the note just placed. */
   advanceOnPlace?: boolean
@@ -162,7 +164,7 @@ export function StaffCanvas({
   isInsertMode,
   isSharpshooterMode = false,
   tupletEntry = false,
-  tupletSpec = { played: 3, beats: 1 },
+  tupletSpec = { played: 3, inSpaceOf: 2, baseDuration: 'eighth' },
   advanceOnPlace = true,
   initialTempo,
   tempoChanges = [],
@@ -1166,10 +1168,9 @@ export function StaffCanvas({
       const newId = crypto.randomUUID()
       placementAppendedRef.current = true
       pendingCenterRef.current = idx
-      const { inSpaceOf, baseDuration, baseDots } = deriveTuplet(tupletSpec.played, tupletSpec.beats)
       dispatch({
         type: 'PLACE_TUPLET_NOTE', partId, measureId: measure.id, voice: targetVoice,
-        played: tupletSpec.played, inSpaceOf, beats: tupletSpec.beats, baseDuration, baseDots,
+        played: tupletSpec.played, inSpaceOf: tupletSpec.inSpaceOf, baseDuration: tupletSpec.baseDuration, baseDots: 0,
         duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId,
       })
       onNotePlaced?.()
@@ -1479,7 +1480,7 @@ export function StaffCanvas({
       ref={el => { scrollRef.current = el; scrollSync?.register(el) }}
       onScroll={() => { if (scrollRef.current) { scrollSync?.onScroll(scrollRef.current); setScrollLeft(scrollRef.current.scrollLeft) } }}
       className={
-        'relative bg-white rounded-lg p-4 block w-full select-none overflow-x-auto ' +
+        'relative bg-white rounded-lg px-4 py-8 block w-full select-none overflow-x-auto ' +
         (isTieMode || isFillMode || isDeleteMode || isInsertMode ? 'cursor-pointer' : 'cursor-crosshair')
       }
       onClick={handleClick}
@@ -1889,7 +1890,7 @@ export function StaffCanvas({
           className="empty-track-hint absolute pointer-events-none select-none flex flex-col items-end gap-2.5 text-right"
           style={{
             right: 32,
-            top: CARD_PAD + (STAVE_TOP_Y + STAVE_BOTTOM_Y) / 2,
+            top: CARD_PAD_Y + (STAVE_TOP_Y + STAVE_BOTTOM_Y) / 2,
             zIndex: 12,
           }}
         >
@@ -1938,8 +1939,8 @@ export function StaffCanvas({
           being clipped by the card's top edge; it tracks horizontal scroll via scrollLeft. */}
       {isInsertMode && insertSession && measures[insertSession.measureIndex] && (
         <InsertStaff
-          left={CARD_PAD - 4 + insertSession.anchorX - scrollLeft}
-          top={CARD_PAD + STAVE_TOP_Y - 96 - 16}
+          left={CARD_PAD_X - 4 + insertSession.anchorX - scrollLeft}
+          top={CARD_PAD_Y + STAVE_TOP_Y - 96 - 16}
           capacity={measureRemainingBeats(measures[insertSession.measureIndex], effectiveTimeSigAt(measures, insertSession.measureIndex, timeSig))}
           timeSig={timeSig}
           keySig={keySig}

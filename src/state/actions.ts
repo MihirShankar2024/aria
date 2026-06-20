@@ -47,13 +47,13 @@ export type ScoreAction =
   // reserve a fresh tuplet of `played` rests of the base unit (= duration/dots) at atIndex and fill
   // its first slot. A note longer than the base unit consumes that many whole slots. `pitches: null`
   // places a rest. `noteId` is the id given to the placed event so the caller can anchor the cursor.
-  // `beats` is the total span of the tuplet; `inSpaceOf`/`baseDuration`/`baseDots` are derived
-  // from (played, beats) by the caller and describe one reserved slot. `duration`/`dots` are the
+  // `played`/`inSpaceOf`/`baseDuration`/`baseDots` come straight from the user-stated tuplet spec
+  // and describe one reserved slot (e.g. 3 in the space of 2 eighths). `duration`/`dots` are the
   // placed event's own value (it may consume several base-unit slots, or split one). When
   // `targetRestId` is a reserved placeholder rest the placed event fills *that* slot (click
   // targeted a specific slot); otherwise a fresh tuplet is reserved at `atIndex` and its first
   // slot filled.
-  | { type: 'PLACE_TUPLET_NOTE'; partId: string; measureId: string; voice: VoiceNumber; played: number; inSpaceOf: number; beats: number; baseDuration: NoteEvent['duration']; baseDots: number; duration: NoteEvent['duration']; dots: number; pitches: Pitch[] | null; noteId: string; atIndex: number; targetRestId?: string }
+  | { type: 'PLACE_TUPLET_NOTE'; partId: string; measureId: string; voice: VoiceNumber; played: number; inSpaceOf: number; baseDuration: NoteEvent['duration']; baseDots: number; duration: NoteEvent['duration']; dots: number; pitches: Pitch[] | null; noteId: string; atIndex: number; targetRestId?: string }
   | { type: 'COMMIT_AI_SUGGESTION'; partId: string; measureNumbers: number[]; musicXML: string }
   | { type: 'UNDO' }
   | { type: 'REDO' }

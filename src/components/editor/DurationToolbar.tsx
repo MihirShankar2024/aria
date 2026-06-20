@@ -198,7 +198,7 @@ export function DurationToolbar({
             className={TOGGLE_ITEM_CLASS + ' font-mono tabular-nums data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
           >
             <span>{tupletSpec.played}</span>
-            <span className="text-[9px] text-white/40 ml-0.5">/{tupletSpec.beats}</span>
+            <span className="text-[9px] text-white/40 ml-0.5">:{tupletSpec.inSpaceOf}</span>
           </Toggle>
         </PolyrhythmPicker>
 

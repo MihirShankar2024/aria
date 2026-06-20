@@ -125,7 +125,7 @@ export function createDefaultScore(): Score {
     name: 'Trumpet in Bb',
     instrument: 'trumpet_bb',
     clef: 'treble',
-    measures: [createDefaultMeasure(1), createDefaultMeasure(2), createDefaultMeasure(3), createDefaultMeasure(4)],
+    measures: [1, 2, 3, 4, 5, 6, 7, 8].map(createDefaultMeasure),
   }
   return {
     id: crypto.randomUUID(),

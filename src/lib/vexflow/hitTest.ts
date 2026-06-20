@@ -4,7 +4,7 @@ import { newPitchId } from '../pitch'
 // VexFlow Stave internals: new Stave(x, y, width) places the TOP LINE at
 // y + spaceAboveStaffLn * lineSpacing = y + 4*12 = y + 48
 export const VEXFLOW_HEADROOM = 4    // spaceAboveStaffLn (VexFlow default)
-export const LINE_SPACING = 12       // px between staff lines
+export const LINE_SPACING = 14       // px between staff lines
 export const STAVE_TOP_OFFSET = VEXFLOW_HEADROOM * LINE_SPACING  // 48px
 
 // ── Treble clef ──────────────────────────────────────────────────────────────

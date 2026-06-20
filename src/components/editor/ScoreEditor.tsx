@@ -8,6 +8,7 @@ import { Button } from '../ui/button'
 import { StaffCanvas } from './StaffCanvas'
 import { GrandStaffCanvas } from './GrandStaffCanvas'
 import { DurationToolbar } from './DurationToolbar'
+import type { TupletSpec } from './PolyrhythmPicker'
 import { PartsSidebar } from './PartsSidebar'
 import { AddInstrumentButton } from './AddInstrumentButton'
 import { RemoveTrackDialog, AddMeasuresDialog } from './TrackDialogs'
@@ -68,8 +69,8 @@ export function ScoreEditor() {
   // Polyrhythm entry: when armed, placed notes flow into a reserved tuplet of `tupletSpec`.
   // The ratio persists as the last-used so re-arming reuses it.
   const [tupletEntry, setTupletEntry] = useState(false)
-  // `played` notes spanning `beats` quarter-note beats; the inner ratio/base unit is derived.
-  const [tupletSpec, setTupletSpec] = useState<{ played: number; beats: number }>({ played: 3, beats: 1 })
+  // `played` notes in the space of `inSpaceOf` notes of `baseDuration` — stated explicitly, not derived.
+  const [tupletSpec, setTupletSpec] = useState<TupletSpec>({ played: 3, inSpaceOf: 2, baseDuration: 'eighth' })
   // Keyboard placement: after placing a note, advance the cursor to the next beat (true,
   // default) or stay on the note just placed (false).
   const [advanceOnPlace, setAdvanceOnPlace] = useState(false)

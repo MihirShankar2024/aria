@@ -77,7 +77,7 @@ const MAX_NOTE_AREA = 400
 const SNAP_STEP = 32
 const SPACING_FACTOR = 1.5
 const BLEND_FACTOR = 0.35
-export const STAFF_HEIGHT = 192
+export const STAFF_HEIGHT = 208
 
 // Key signature: fifths → VexFlow key name
 const FIFTHS_TO_KEY = ['Cb', 'Gb', 'Db', 'Ab', 'Eb', 'Bb', 'F', 'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#']
@@ -178,7 +178,7 @@ function rawWidthFromVoice(realNotes: StaveNote[], voices: Voice[]): { min: numb
 function drawLedgerGuides(ctx: ReturnType<InstanceType<typeof Renderer>['getContext']>, stave: Stave): void {
   const x1 = stave.getNoteStartX()
   const x2 = stave.getX() + stave.getWidth()
-  const lines = [-1, -2, 5, 6]
+  const lines = [-1, -2, -3, 5, 6, 7]
   ctx.save()
   ctx.setLineWidth(1)
   ctx.setStrokeStyle('rgba(0,0,0,0.22)')
@@ -801,7 +801,7 @@ export function renderStaff({
     const prevKeySig  = idx > 0 ? effKeySigs[idx - 1] : null
     const prevTimeSig = idx > 0 ? effTimeSigs[idx - 1] : null
 
-    const stave = new Stave(x, staveY, staveWidth, { spacingBetweenLinesPx: 12 })
+    const stave = new Stave(x, staveY, staveWidth, { spacingBetweenLinesPx: 14 })
 
     if (idx === 0) {
       stave.addClef(clef)
@@ -883,8 +883,8 @@ function getTempoAtMeasure(
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const GRAND_TREBLE_Y = 36
-export const GRAND_BASS_Y = 192   // +36px gap vs prior 156 — more space between staves
-export const GRAND_STAFF_HEIGHT = 348
+export const GRAND_BASS_Y = 200   // +36px gap vs prior 156 — more space between staves
+export const GRAND_STAFF_HEIGHT = 372
 
 export interface GrandStaffLayout {
   width: number
@@ -994,9 +994,9 @@ export function renderGrandStaff({
     const prevTimeSig = idx > 0 ? effTimeSigs[idx - 1] : null
 
     // Treble stave
-    const trebleStave = new Stave(x, GRAND_TREBLE_Y, staveWidth, { spacingBetweenLinesPx: 12 })
+    const trebleStave = new Stave(x, GRAND_TREBLE_Y, staveWidth, { spacingBetweenLinesPx: 14 })
     // Bass stave
-    const bassStave   = new Stave(x, GRAND_BASS_Y, staveWidth, { spacingBetweenLinesPx: 12 })
+    const bassStave   = new Stave(x, GRAND_BASS_Y, staveWidth, { spacingBetweenLinesPx: 14 })
 
     if (idx === 0) {
       trebleStave.addClef('treble')

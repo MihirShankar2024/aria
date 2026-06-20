@@ -16,7 +16,7 @@ import {
   MetricsDefaults,
 } from 'vexflow'
 import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber, Tuplet as TupletDef } from '../../types/score'
-import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt, eventBeats } from '../beats'
+import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt, eventBeats, displayTupletRatio } from '../beats'
 import { newPitchId } from '../pitch'
 import { computeCurvePlacement } from './curvePlacement'
 
@@ -457,16 +457,21 @@ function buildVexTuplets(
 ): Tuplet[] {
   if (!tupletDefs || tupletDefs.length === 0) return []
   const vexByEventId = new Map<string, StaveNote>()
-  evs.forEach((ev, i) => vexByEventId.set(ev.id, vexNotes[i]))
+  const evByEventId = new Map<string, NoteEvent>()
+  evs.forEach((ev, i) => { vexByEventId.set(ev.id, vexNotes[i]); evByEventId.set(ev.id, ev) })
   const out: Tuplet[] = []
   for (const def of tupletDefs) {
     const notes = def.memberIds.map(id => vexByEventId.get(id)).filter((n): n is StaveNote => !!n)
     if (notes.length === 0) continue // members belong to a different voice
+    // Print the number that matches the notes actually under the bracket, not the reserved
+    // slot count: a 6:4 quarter tuplet filled with 3 half notes reads "3" (3:2), not "6".
+    const members = def.memberIds.map(id => evByEventId.get(id)).filter((e): e is NoteEvent => !!e)
+    const shown = displayTupletRatio(def, members)
     const location = voice === 2 ? Tuplet.LOCATION_BOTTOM : Tuplet.LOCATION_TOP
     out.push(
       new Tuplet(notes, {
-        numNotes: def.played,
-        notesOccupied: def.inSpaceOf,
+        numNotes: shown.played,
+        notesOccupied: shown.inSpaceOf,
         ratioed: false,   // engraving convention: print only the note count, never "6:4"/"5:3"
         bracketed: def.showBracket,
         location,

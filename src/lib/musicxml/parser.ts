@@ -1,4 +1,4 @@
-import type { Score, Part, Measure, NoteEvent, Note, Rest, Pitch, Duration, Accidental, TimeSig, KeySig, Tuplet } from '../../types/score'
+import type { Score, Part, Measure, NoteEvent, Note, Rest, Pitch, Duration, Accidental, TimeSig, KeySig, Tuplet, VoiceNumber } from '../../types/score'
 import { newPitchId } from '../pitch'
 
 function parseTimeSig(el: Element): TimeSig | undefined {
@@ -15,13 +15,20 @@ function parseKeySig(el: Element): KeySig | undefined {
   return undefined
 }
 
+// Our model has exactly two voices; map MusicXML <voice> (1..n) onto 1 or 2, defaulting to 1.
+function parseVoice(el: Element): VoiceNumber {
+  const raw = parseInt(el.querySelector('voice')?.textContent ?? '1')
+  return raw >= 2 ? 2 : 1
+}
+
 function parseNote(el: Element): NoteEvent {
   const isRest = !!el.querySelector('rest')
   const duration = (el.querySelector('type')?.textContent ?? 'quarter') as Duration
   const dots = el.querySelectorAll('dot').length
+  const voice = parseVoice(el)
 
   if (isRest) {
-    const rest: Rest = { id: crypto.randomUUID(), type: 'rest', duration, dots, voice: 1 }
+    const rest: Rest = { id: crypto.randomUUID(), type: 'rest', duration, dots, voice }
     return rest
   }
 
@@ -39,7 +46,7 @@ function parseNote(el: Element): NoteEvent {
     duration,
     dots,
     tied,
-    voice: 1,
+    voice,
   }
   return note
 }
@@ -49,23 +56,26 @@ function parseMeasure(el: Element): Measure {
   const noteEls = Array.from(el.querySelectorAll('note'))
   const notes: NoteEvent[] = []
   const tuplets: Tuplet[] = []
-  // Reconstruct tuplet groups from <tuplet type="start"|"stop"> markers, reading the ratio
-  // from the start note's <time-modification>. Members are the events between the markers.
-  let open: { played: number; inSpaceOf: number; memberIds: string[] } | null = null
+  // Reconstruct tuplet groups from <tuplet type="start"|"stop"> markers, reading the ratio from
+  // the start note's <time-modification>. A stack handles nested groups: every currently-open
+  // group collects each event, and an inner group records its enclosing group as `parentId`.
+  type Open = { id: string; played: number; inSpaceOf: number; memberIds: string[]; parentId?: string }
+  const stack: Open[] = []
   for (const noteEl of noteEls) {
     const ev = parseNote(noteEl)
     notes.push(ev)
-    const startMarker = noteEl.querySelector('notations > tuplet[type="start"]')
-    const stopMarker = noteEl.querySelector('notations > tuplet[type="stop"]')
-    if (startMarker) {
+    if (noteEl.querySelector('notations > tuplet[type="start"]')) {
       const played = parseInt(noteEl.querySelector('time-modification > actual-notes')?.textContent ?? '3')
       const inSpaceOf = parseInt(noteEl.querySelector('time-modification > normal-notes')?.textContent ?? '2')
-      open = { played, inSpaceOf, memberIds: [] }
+      stack.push({ id: crypto.randomUUID(), played, inSpaceOf, memberIds: [], parentId: stack.at(-1)?.id })
     }
-    if (open) open.memberIds.push(ev.id)
-    if (stopMarker && open) {
-      if (open.memberIds.length >= 2) tuplets.push({ id: crypto.randomUUID(), ...open })
-      open = null
+    for (const open of stack) open.memberIds.push(ev.id)
+    if (noteEl.querySelector('notations > tuplet[type="stop"]')) {
+      const open = stack.pop()
+      if (open && open.memberIds.length >= 2) {
+        const { id, played, inSpaceOf, memberIds, parentId } = open
+        tuplets.push({ id, played, inSpaceOf, memberIds, ...(parentId ? { parentId } : {}) })
+      }
     }
   }
   const timeSig = parseTimeSig(el)

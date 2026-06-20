@@ -9,7 +9,8 @@ export interface Rational {
   den: number
 }
 
-function gcd(a: number, b: number): number {
+/** Greatest common divisor of two integers (1 when both are 0). */
+export function gcd(a: number, b: number): number {
   a = Math.abs(a)
   b = Math.abs(b)
   while (b) {
@@ -39,6 +40,11 @@ export function sub(a: Rational, b: Rational): Rational {
 
 export function mul(a: Rational, b: Rational): Rational {
   return r(a.num * b.num, a.den * b.den)
+}
+
+export function div(a: Rational, b: Rational): Rational {
+  if (b.num === 0) throw new Error('rational division by zero')
+  return r(a.num * b.den, a.den * b.num)
 }
 
 export function toFloat(a: Rational): number {

@@ -1,5 +1,5 @@
 import type { Duration, Measure, NoteEvent, TimeSig, Tuplet, VoiceNumber } from '../types/score'
-import { type Rational, r, add, mul, toFloat, equals, lte } from './rational'
+import { type Rational, r, add, mul, div, toFloat, equals, lte, gcd } from './rational'
 
 const QUARTER_BEATS: Record<Duration, number> = {
   whole: 4,
@@ -30,6 +30,38 @@ function writtenBeatsR(event: Pick<NoteEvent, 'duration' | 'dots'>): Rational {
 }
 
 /**
+ * Printed tuplet number, which can differ from the stored `played`. `played:inSpaceOf` is
+ * the immutable time scale (it drives playback and beat math), but the *number drawn over
+ * the bracket* should match the notes actually present. A 6:4 quarter tuplet draws "6"
+ * while it holds six quarter slots, but once filled with three half notes the bracket only
+ * spans three equal notes, so it should read "3" (a 3:2 at the half-note level).
+ *
+ * Rule: measure every member's written length in base-unit slots (one slot = total written
+ * content / `played`). When every member spans a whole number of slots, reduce
+ * `played:inSpaceOf` by the GCD of those slot counts; a clean larger-value fill collapses the
+ * number (3 halves → 3) while a mixed fill (halves + quarters) reduces to GCD 1 and keeps the
+ * original count. Members spanning a fractional slot (a value finer than the base unit) can't
+ * reduce, so the stored ratio is returned unchanged.
+ */
+export function displayTupletRatio(
+  def: Pick<Tuplet, 'played' | 'inSpaceOf'>,
+  members: Pick<NoteEvent, 'duration' | 'dots'>[],
+): { played: number; inSpaceOf: number } {
+  const original = { played: def.played, inSpaceOf: def.inSpaceOf }
+  if (members.length === 0) return original
+  const totalWritten = members.reduce<Rational>((s, m) => add(s, writtenBeatsR(m)), r(0))
+  if (totalWritten.num === 0) return original
+  const baseUnit = mul(totalWritten, r(1, def.played)) // quarter-beats per slot
+  let g = def.inSpaceOf
+  for (const m of members) {
+    const slots = div(writtenBeatsR(m), baseUnit)
+    if (slots.den !== 1) return original // a member finer than one slot — can't reduce
+    g = gcd(g, slots.num)
+  }
+  return { played: def.played / g, inSpaceOf: def.inSpaceOf / g }
+}
+
+/**
  * Combined time scale a tuplet applies, walking up the `parentId` chain so nested
  * tuplets compose. A 3:2 tuplet scales each member by 2/3; a 3:2 inside another 3:2
  * scales by 4/9.
@@ -48,9 +80,16 @@ export function tupletScale(tuplet: Tuplet, tuplets: Tuplet[]): Rational {
   return scale
 }
 
-/** The tuplet (innermost) that contains `eventId`, or undefined. */
+/**
+ * The INNERMOST tuplet that contains `eventId`, or undefined. `tupletScale` composes from here
+ * UP the parent chain, so this must return the deepest group — the one that is not the parent of
+ * any other group also containing the event. Returning an outer group instead would drop every
+ * nested level's scaling (the outer has no parent to walk up to), mis-timing nested tuplets.
+ */
 function tupletForEvent(eventId: string, tuplets?: Tuplet[]): Tuplet | undefined {
-  return tuplets?.find(t => t.memberIds.includes(eventId))
+  const containing = tuplets?.filter(t => t.memberIds.includes(eventId))
+  if (!containing || containing.length === 0) return undefined
+  return containing.find(t => !containing.some(o => o.parentId === t.id)) ?? containing[0]
 }
 
 /** Exact sounded beat duration of an event, including any (possibly nested) tuplet scaling. */

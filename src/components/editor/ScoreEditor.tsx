@@ -1,17 +1,16 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Undo2, Redo2, Minus, Plus } from 'lucide-react'
+import { Minus, Plus } from 'lucide-react'
 import { useScore } from '../../hooks/useScore'
 import { usePlayback } from '../../hooks/usePlayback'
 import { useScrollSync } from '../../hooks/useScrollSync'
 import { usePlaybackScroll, scrollToStartIfNeeded } from '../../hooks/usePlaybackScroll'
-import { Button } from '../ui/button'
 import { StaffCanvas } from './StaffCanvas'
 import { GrandStaffCanvas } from './GrandStaffCanvas'
 import { DurationToolbar } from './DurationToolbar'
 import type { TupletSpec } from './PolyrhythmPicker'
 import { PartsSidebar } from './PartsSidebar'
 import { AddInstrumentButton } from './AddInstrumentButton'
-import { RemoveTrackDialog, AddMeasuresDialog } from './TrackDialogs'
+import { RemoveTrackDialog, MeasuresDialog } from './TrackDialogs'
 import { PlaybackBar } from '../playback/PlaybackBar'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
@@ -51,7 +50,7 @@ function groupParts(parts: Part[]): PartGroup[] {
 }
 
 export function ScoreEditor() {
-  const { score, dispatch, undo, redo, canUndo, canRedo } = useScore()
+  const { score, dispatch, undo, redo } = useScore()
   const { status, play, pause, reset } = usePlayback()
 
   const [selectedDuration, setSelectedDuration] = useState<Duration>('quarter')
@@ -523,33 +522,6 @@ export function ScoreEditor() {
         </div>
       )}
 
-      {/* Header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-white/10">
-        <h1 className="text-xl font-semibold tracking-tight"></h1>
-        <div className="flex items-center gap-1">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={undo}
-            disabled={!canUndo}
-            title="Undo"
-            className="h-8 w-8 text-white/60 hover:text-white hover:bg-white/10 disabled:opacity-25"
-          >
-            <Undo2 className="h-4 w-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={redo}
-            disabled={!canRedo}
-            title="Redo"
-            className="h-8 w-8 text-white/60 hover:text-white hover:bg-white/10 disabled:opacity-25"
-          >
-            <Redo2 className="h-4 w-4" />
-          </Button>
-        </div>
-      </header>
-
       {/* Toolbar — floats at the top of the viewport over the score while scrolling. */}
       <div className="sticky top-0 z-30 px-6 py-3 border-b border-white/10 bg-black/40 backdrop-blur-md">
         <DurationToolbar
@@ -611,7 +583,7 @@ export function ScoreEditor() {
           })}
         />
 
-        <main className="flex-1 px-6 py-8 space-y-8 overflow-y-auto">
+        <main className="flex-1 px-6 pt-3 pb-8 space-y-3 overflow-y-auto">
           {groups.map((group, groupIdx) => {
             const playbackLayoutProps = groupIdx === 0
               ? { onPlaybackLayoutChange: reportLayout }
@@ -683,10 +655,13 @@ export function ScoreEditor() {
         onOpenChange={open => { if (!open) setRemoveTarget(null) }}
         onConfirm={() => { if (removeTarget) dispatch({ type: 'REMOVE_PART', partId: removeTarget.partId }) }}
       />
-      <AddMeasuresDialog
+      <MeasuresDialog
         open={addMeasuresOpen}
         onOpenChange={setAddMeasuresOpen}
-        onConfirm={count => dispatch({ type: 'ADD_MEASURES', count })}
+        measureCount={measureCount}
+        onAppend={count => dispatch({ type: 'ADD_MEASURES', count })}
+        onInsert={(count, at) => dispatch({ type: 'INSERT_MEASURES', count, at })}
+        onRemove={(start, end) => dispatch({ type: 'REMOVE_MEASURES', start, end })}
       />
     </div>
   )
@@ -718,10 +693,13 @@ function TrackHeader({
       <div className="flex-1" />
       <button
         onClick={onAddMeasures}
-        title="Add measures"
+        title="Add or remove measures"
         className="flex items-center gap-1 rounded-md border border-white/15 bg-white/5 px-2.5 py-1 text-[10px] font-medium uppercase tracking-wider text-white/55 hover:border-white/30 hover:bg-white/10 hover:text-white transition"
       >
-        <Plus className="h-3 w-3" />
+        <span className="flex items-center -space-x-0.5">
+          <Plus className="h-3 w-3" />
+          <Minus className="h-3 w-3" />
+        </span>
         Measures
       </button>
     </div>

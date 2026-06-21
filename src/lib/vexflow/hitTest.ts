@@ -81,8 +81,9 @@ export function noteHasPitchAtStaffY(
 }
 
 /**
- * Pick treble vs bass for a grand-staff click/hover Y. Snaps to the nearer staff
- * line/space; ties in the gap split at the midpoint between the two staff bodies.
+ * Pick treble vs bass for a grand-staff click/hover Y. A hard split at the
+ * midpoint between the two staff bodies: anything from the top down to the
+ * midpoint is treble, anything from the midpoint down to the bottom is bass.
  */
 export function whichGrandStaffStave(
   y: number,
@@ -90,13 +91,6 @@ export function whichGrandStaffStave(
   bassStaveY: number,
   lineSpacing = LINE_SPACING,
 ): 'treble' | 'bass' {
-  const halfStep = lineSpacing / 2
-  const trebleSteps = Math.round((y - (trebleStaveY + VEXFLOW_HEADROOM * lineSpacing)) / halfStep)
-  const bassSteps = Math.round((y - (bassStaveY + VEXFLOW_HEADROOM * lineSpacing)) / halfStep)
-  const trebleDist = Math.abs(y - staffStepToY(trebleSteps, trebleStaveY, lineSpacing))
-  const bassDist = Math.abs(y - staffStepToY(bassSteps, bassStaveY, lineSpacing))
-  if (trebleDist < bassDist) return 'treble'
-  if (bassDist < trebleDist) return 'bass'
   const gapMid = (staffStepToY(8, trebleStaveY, lineSpacing) + staffStepToY(0, bassStaveY, lineSpacing)) / 2
   return y < gapMid ? 'treble' : 'bass'
 }

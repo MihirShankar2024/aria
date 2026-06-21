@@ -888,8 +888,8 @@ function getTempoAtMeasure(
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const GRAND_TREBLE_Y = 36
-export const GRAND_BASS_Y = 200   // +36px gap vs prior 156 — more space between staves
-export const GRAND_STAFF_HEIGHT = 372
+export const GRAND_BASS_Y = 284   // gap between staves ~192px
+export const GRAND_STAFF_HEIGHT = 456
 
 export interface GrandStaffLayout {
   width: number

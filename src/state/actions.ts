@@ -18,6 +18,11 @@ export type ScoreAction =
   | { type: 'UPDATE_NOTE'; partId: string; measureId: string; noteId: string; patch: Partial<Note> }
   | { type: 'ADD_MEASURE'; partId: string }
   | { type: 'ADD_MEASURES'; count: number }
+  // Insert `count` measures before measure number `at` (1-based) in every part.
+  // If `at` is beyond the last measure, they're appended.
+  | { type: 'INSERT_MEASURES'; count: number; at: number }
+  // Remove the inclusive range of measure numbers [start, end] from every part.
+  | { type: 'REMOVE_MEASURES'; start: number; end: number }
   | { type: 'DELETE_MEASURE'; partId: string; measureId: string }
   | { type: 'SET_TIME_SIG'; partId: string; measureId: string; timeSig: TimeSig }
   | { type: 'SET_KEY_SIG'; partId: string; measureId: string; keySig: KeySig }

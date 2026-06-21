@@ -510,6 +510,49 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         }
         break
       }
+      case 'INSERT_MEASURES': {
+        // Insert `count` blank measures before measure number `at` in every part, then
+        // renumber so barlines stay aligned. Time/key-sig overrides ride along with their
+        // own measure objects, so an insert never displaces a mid-score signature change.
+        const count = Math.max(1, Math.floor(action.count))
+        for (const part of draft.parts) {
+          // Clamp insertion index to [0, length]; `at` beyond the end appends.
+          const idx = Math.max(0, Math.min(part.measures.length, action.at - 1))
+          const fresh = Array.from({ length: count }, () => createDefaultMeasure(0))
+          part.measures.splice(idx, 0, ...fresh)
+          renumberMeasures(part)
+        }
+        // Shift score-level tempo changes at/after the insertion point forward.
+        for (const tc of draft.tempoChanges) {
+          if (tc.measureNumber >= action.at) tc.measureNumber += count
+        }
+        break
+      }
+      case 'REMOVE_MEASURES': {
+        // Remove the inclusive range of measure numbers [start, end] from every part,
+        // drop ties touching removed notes, then renumber the survivors.
+        const start = Math.max(1, Math.floor(action.start))
+        const end = Math.floor(action.end)
+        if (end < start) break
+        for (const part of draft.parts) {
+          const removed = part.measures.filter(m => m.number >= start && m.number <= end)
+          if (removed.length === 0) continue
+          part.measures = part.measures.filter(m => m.number < start || m.number > end)
+          // Never leave a part with zero measures.
+          if (part.measures.length === 0) part.measures.push(createDefaultMeasure(0))
+          if (part.ties) {
+            const goneIds = new Set(removed.flatMap(m => m.notes.map(n => n.id)))
+            part.ties = part.ties.filter(t => !goneIds.has(t.from.note) && !goneIds.has(t.to.note))
+          }
+          renumberMeasures(part)
+        }
+        // Drop tempo changes in the removed range; shift later ones back.
+        const span = end - start + 1
+        draft.tempoChanges = draft.tempoChanges
+          .filter(tc => tc.measureNumber < start || tc.measureNumber > end)
+          .map(tc => tc.measureNumber > end ? { ...tc, measureNumber: tc.measureNumber - span } : tc)
+        break
+      }
       case 'DELETE_MEASURE': {
         const part = draft.parts.find(p => p.id === action.partId)
         if (part) {
@@ -654,6 +697,11 @@ export { pitchArraysEqual }
 
 function getMeasureCount(score: Score): number {
   return Math.max(0, ...score.parts.map(p => p.measures.length))
+}
+
+// Re-stamp a part's measures with sequential 1-based numbers after an insert/remove.
+function renumberMeasures(part: Part): void {
+  part.measures.forEach((m, i) => { m.number = i + 1 })
 }
 
 function effectiveTimeSig(score: Score, measure: Measure): TimeSig {

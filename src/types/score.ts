@@ -190,7 +190,15 @@ export interface TextAnnotation {
   style: TextAnnotationStyle
 }
 
-export type Annotation = GlyphAnnotation | LineAnnotation | TextAnnotation
+/** A measure-number box. Carries no number of its own — it renders the `number` of whichever
+ *  measure it is anchored to (re-anchored to the measure under it when dragged). */
+export interface MeasureNumberAnnotation {
+  id: string
+  kind: 'measureNumber'
+  anchor: AnnotationAnchor
+}
+
+export type Annotation = GlyphAnnotation | LineAnnotation | TextAnnotation | MeasureNumberAnnotation
 
 export interface Part {
   id: string

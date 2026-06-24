@@ -1280,7 +1280,7 @@ export function StaffCanvas({
           // Same rhythm in the same voice → add this tone to the chord. A different duration
           // is a distinct rhythmic event within the voice, placed right after the target.
           if (targetEv.duration === selectedDuration && targetEv.dots === (isDotted ? 1 : 0)) {
-            dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch })
+            dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch, articulation: selectedArticulation ?? undefined })
             onNotePlaced?.()
             return nearNote.id
           }
@@ -1580,6 +1580,13 @@ export function StaffCanvas({
             measureX={mId => {
               const i = measures.findIndex(m => m.id === mId)
               return i >= 0 && layout.measures[i] ? layout.measures[i].x : null
+            }}
+            measureNumber={mId => measures.find(m => m.id === mId)?.number ?? null}
+            measureAtX={x => {
+              const i = getMeasureIndexAtX(x)
+              const m = measures[i]
+              const g = layout.measures[i]
+              return m && g ? { measureId: m.id, measureX: g.x } : null
             }}
             staveY={STAVE_Y}
             isSharpshooterMode={isSharpshooterMode}

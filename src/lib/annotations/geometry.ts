@@ -28,6 +28,11 @@ export function annotationBounds(ann: Annotation, mx: number, staveY: number): R
     return { x: ax - w / 2, y: ay - h / 2, w, h }
   }
 
+  if (ann.kind === 'measureNumber') {
+    // Small boxed number centred on its anchor.
+    return { x: ax - 12, y: ay - 10, w: 24, h: 20 }
+  }
+
   // text — centred on its anchor
   const fs = ann.style.fontSize
   const w = Math.max(20, (ann.text.length || 1) * fs * 0.6)

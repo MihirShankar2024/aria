@@ -72,6 +72,7 @@ interface DurationToolbarProps {
   annotationEntry: boolean
   onAnnotationEntryChange: (v: boolean) => void
   onAnnotationPick: (entry: CatalogEntry) => void
+  onAddMeasureNumbers: (every: number, start: number) => void
   activeVoice: VoiceNumber
   onActiveVoiceChange: (v: VoiceNumber) => void
   selectedAccidental: Accidental
@@ -123,6 +124,7 @@ export function DurationToolbar({
   annotationEntry,
   onAnnotationEntryChange,
   onAnnotationPick,
+  onAddMeasureNumbers,
   activeVoice,
   onActiveVoiceChange,
   selectedAccidental,
@@ -195,7 +197,7 @@ export function DurationToolbar({
 
         {/* Annotations — hover for the multi-slide panel (dynamics / ornaments / symbols / text),
             click an entry to arm, then click the score to spawn the mark. */}
-        <AnnotationPicker onPick={onAnnotationPick}>
+        <AnnotationPicker onPick={onAnnotationPick} onAddMeasureNumbers={onAddMeasureNumbers}>
           <Toggle
             pressed={annotationEntry}
             onPressedChange={onAnnotationEntryChange}

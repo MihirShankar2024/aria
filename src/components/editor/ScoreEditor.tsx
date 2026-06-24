@@ -298,6 +298,7 @@ export function ScoreEditor() {
         case 'b': enterBroomMode(prev => !prev); break
         case 'i': enterInsertMode(prev => !prev); break
         case 'p': enterTupletEntry(prev => !prev); break
+        case '+': case '=': toggleAnnotationModeRef.current(); break
         case 'ArrowUp':
         case 'ArrowDown': {
           // In select mode, arrows nudge the selected notes chromatically
@@ -444,6 +445,25 @@ export function ScoreEditor() {
     setSelectedAnnotation(entry)
     enterAnnotationEntry(true)
   }
+  // Bulk-place measure-number boxes on the top part: one on every `every`-th measure starting
+  // at measure `start`. Each box anchors to its measure near the left edge, above the staff, so
+  // it renders that measure's number.
+  const handleAddMeasureNumbers = (every: number, start: number) => {
+    const part = score.parts[0]
+    if (!part) return
+    let added = 0
+    for (const measure of part.measures) {
+      if (measure.number < start) continue
+      if ((measure.number - start) % every !== 0) continue
+      dispatch({
+        type: 'ADD_ANNOTATION',
+        partId: part.id,
+        annotation: { id: crypto.randomUUID(), kind: 'measureNumber', anchor: { measureId: measure.id, dx: 6, dy: -30 } },
+      })
+      added++
+    }
+    showToast(added ? `Added ${added} measure ${added === 1 ? 'number' : 'numbers'}` : 'No measures matched')
+  }
   // Clicking the bare + toggle (no panel pick) re-arms the last-used mark; with none chosen
   // yet this session, prompt the user to pick one from the panel instead of arming nothing.
   const handleAnnotationToggle = (next: boolean) => {
@@ -453,6 +473,11 @@ export function ScoreEditor() {
     }
     enterAnnotationEntry(next)
   }
+  // The "+" key flips the Annotations tool (mirrors the dock toggle). Ref-backed so the keydown
+  // handler — created once with [undo, redo] deps — always sees the current state.
+  const toggleAnnotationMode = () => handleAnnotationToggle(!annotationEntry)
+  const toggleAnnotationModeRef = useRef(toggleAnnotationMode)
+  toggleAnnotationModeRef.current = toggleAnnotationMode
   const deleteSelectedNotes = () => {
     if (selectedNoteIds.size === 0) return
     const byEvent = selectionByEvent(selectedNoteIds)
@@ -593,6 +618,7 @@ export function ScoreEditor() {
           annotationEntry={annotationEntry}
           onAnnotationEntryChange={handleAnnotationToggle}
           onAnnotationPick={handleAnnotationPick}
+          onAddMeasureNumbers={handleAddMeasureNumbers}
           activeVoice={activeVoice}
           onActiveVoiceChange={setActiveVoice}
           selectedAccidental={selectedAccidental}

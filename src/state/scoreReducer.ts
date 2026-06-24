@@ -399,6 +399,11 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
           if (!occupied) {
             note.pitches = sortPitches([...note.pitches, action.pitch])
           }
+          // A selected articulation chord-stacks onto the whole event (mirrors the accidental
+          // riding the new tone): add it to the event's set if not already present.
+          if (action.articulation && !note.articulations?.some(a => a.type === action.articulation)) {
+            note.articulations = [...(note.articulations ?? []), { type: action.articulation }]
+          }
         }
         break
       }

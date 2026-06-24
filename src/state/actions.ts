@@ -43,7 +43,7 @@ export type ScoreAction =
   | { type: 'ADD_PIANO_PART' }
   | { type: 'REMOVE_PART'; partId: string }
   | { type: 'SET_PART_INSTRUMENT'; partId: string; instrument: string }
-  | { type: 'ADD_CHORD_NOTE'; partId: string; measureId: string; noteId: string; pitch: Pitch }
+  | { type: 'ADD_CHORD_NOTE'; partId: string; measureId: string; noteId: string; pitch: Pitch; articulation?: ArticulationType }
   | { type: 'REMOVE_CHORD_NOTE'; partId: string; measureId: string; noteId: string; pitch: Pitch }
   // Group the selected contiguous events of one voice into a tuplet (e.g. played:3 / inSpaceOf:2
   // for a triplet). If every member already sits inside one existing tuplet, the new group nests

@@ -16,6 +16,11 @@ interface AnnotationsLayerProps {
   annotations: Annotation[]
   /** Resolve a measure id to its current left-edge x (px). Returns null if the measure is gone. */
   measureX: (measureId: string) => number | null
+  /** Resolve a measure id to its 1-based measure number (for measure-number boxes). */
+  measureNumber: (measureId: string) => number | null
+  /** Find the measure under an absolute x (its id + left-edge x), for re-anchoring a dragged
+   *  measure-number box to whichever measure it lands in. */
+  measureAtX: (x: number) => { measureId: string; measureX: number } | null
   /** Staff-top y the annotation dy offsets are measured from. */
   staveY: number
   isSharpshooterMode: boolean
@@ -51,7 +56,7 @@ const FONT_OPTIONS = ['serif', 'sans-serif', 'monospace']
  * stretch behaviour (reusing the same model as tie handles).
  */
 export function AnnotationsLayer({
-  partId, annotations, measureX, staveY, isSharpshooterMode, editingId, setEditingId, dispatch,
+  partId, annotations, measureX, measureNumber, measureAtX, staveY, isSharpshooterMode, editingId, setEditingId, dispatch,
 }: AnnotationsLayerProps) {
   const [drag, setDrag] = useState<DragState | null>(null)
   // Live cursor delta while dragging, applied on top of the base position for smooth feedback.
@@ -78,6 +83,18 @@ export function AnnotationsLayer({
         } else if (drag.kind === 'end' && ann.kind === 'line') {
           // Stretch: only the end endpoint moves.
           dispatch({ type: 'STRETCH_ANNOTATION', partId, id: drag.id, endDX: drag.baseEndDX + dx, endDY: drag.baseEndDY + dy })
+        } else if (ann.kind === 'measureNumber') {
+          // Re-anchor a measure-number box to whichever measure it lands over, so it always
+          // shows that measure's number ("assess where they are horizontally"). dx is rebased
+          // onto the new measure's left edge.
+          const mx = measureX(ann.anchor.measureId)
+          const absX = (mx ?? 0) + drag.baseDx + dx
+          const target = measureAtX(absX)
+          if (target) {
+            dispatch({ type: 'MOVE_ANNOTATION', partId, id: drag.id, anchor: { measureId: target.measureId, dx: absX - target.measureX, dy: drag.baseDy + dy } })
+          } else {
+            dispatch({ type: 'MOVE_ANNOTATION', partId, id: drag.id, anchor: { measureId: ann.anchor.measureId, dx: drag.baseDx + dx, dy: drag.baseDy + dy } })
+          }
         } else {
           // Move the anchor (start). For a line body-drag both endpoints travel together, so
           // shift the end by the same delta; a start-handle drag moves only the anchor.
@@ -93,7 +110,7 @@ export function AnnotationsLayer({
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
     return () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp) }
-  }, [drag, annotations, dispatch, partId])
+  }, [drag, annotations, dispatch, partId, measureX, measureAtX])
 
   const beginDrag = (e: React.PointerEvent, ann: Annotation, kind: DragKind) => {
     if (!isSharpshooterMode) return
@@ -173,6 +190,29 @@ export function AnnotationsLayer({
           )
         }
 
+        if (ann.kind === 'measureNumber') {
+          const num = measureNumber(ann.anchor.measureId)
+          return (
+            <div
+              key={ann.id}
+              className="absolute"
+              style={{ left: x, top: y, transform: 'translate(-50%, -50%)', pointerEvents: isSharpshooterMode ? 'auto' : 'none', cursor: isSharpshooterMode ? 'move' : 'default' }}
+              onPointerDown={e => beginDrag(e, ann, 'body')}
+            >
+              <span
+                style={{
+                  display: 'inline-block', minWidth: 16, padding: '1px 4px', textAlign: 'center',
+                  border: '1px solid #18181b', borderRadius: 2, fontFamily: 'serif', fontSize: 13,
+                  fontWeight: 700, lineHeight: 1.1, color: '#18181b', background: 'rgba(255,255,255,0.6)',
+                  userSelect: 'none',
+                }}
+              >
+                {num ?? '?'}
+              </span>
+            </div>
+          )
+        }
+
         if (ann.kind === 'text') {
           return (
             <TextAnnotationView
@@ -247,6 +287,16 @@ function TextAnnotationView({
   const boxRef = useRef<HTMLDivElement>(null)
   useEffect(() => { if (editing) inputRef.current?.focus() }, [editing])
 
+  // Local buffer for the font-size field so it can be fully cleared while typing. Mirrors the
+  // committed style.fontSize, but holds raw digits ('' allowed) until the field loses focus.
+  const [fsText, setFsText] = useState(String(style.fontSize))
+  useEffect(() => { setFsText(String(style.fontSize)) }, [style.fontSize])
+  const commitFontSize = () => {
+    const n = Math.max(8, Math.min(72, Number(fsText) || style.fontSize))
+    setFsText(String(n))
+    if (n !== style.fontSize) onChangeStyle({ ...style, fontSize: n })
+  }
+
   // End editing on a click outside the box (not on blur — clicking the format bar blurs the
   // input, and a blur-to-close would dismiss the bar before the click registers).
   useEffect(() => {
@@ -287,8 +337,16 @@ function TextAnnotationView({
               {FONT_OPTIONS.map(f => <option key={f} value={f} className="bg-zinc-900">{f}</option>)}
             </select>
             <input
-              type="number" min={8} max={72} value={style.fontSize}
-              onChange={e => onChangeStyle({ ...style, fontSize: Math.max(8, Math.min(72, Number(e.target.value) || style.fontSize)) })}
+              type="text" inputMode="numeric"
+              value={fsText}
+              onChange={e => {
+                const v = e.target.value.replace(/\D/g, '')
+                setFsText(v)
+                const n = Number(v)
+                if (v !== '' && n >= 8 && n <= 72) onChangeStyle({ ...style, fontSize: n })
+              }}
+              onBlur={commitFontSize}
+              onKeyDown={e => { if (e.key === 'Enter') commitFontSize() }}
               className="h-6 w-12 rounded bg-white/10 px-1 text-[11px] text-white"
             />
             <button onClick={() => onChangeStyle({ ...style, bold: !style.bold })}

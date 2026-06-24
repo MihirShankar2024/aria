@@ -9,7 +9,7 @@ import type { LineAnnotationType, TextAnnotationStyle } from '../../types/score'
  * editable, restyleable text box.
  */
 
-export type SpawnKind = 'glyph' | 'line' | 'text'
+export type SpawnKind = 'glyph' | 'line' | 'text' | 'measureNumber'
 
 export interface CatalogEntry {
   symbolId: string
@@ -146,6 +146,8 @@ export const ANNOTATION_CATALOG: CatalogCategory[] = [
       text('text.expr', 'Expression (italic)', 'espressivo', { italic: true }),
       text('text.heading', 'Heading (bold)', 'Heading', { bold: true, fontSize: 22 }),
       text('text.tempo', 'Tempo', 'Allegro', { bold: true, fontSize: 18 }),
+      // Measure-number box — renders the number of the measure it sits in (no seed text).
+      { symbolId: 'text.measureNum', label: 'Measure number box', spawn: 'measureNumber', preview: '7', previewFont: 'text' },
     ],
   },
 ]

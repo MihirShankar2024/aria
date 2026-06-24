@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import { Popover, PopoverContent, PopoverAnchor } from '../ui/popover'
 import { Input } from '../ui/input'
 import { Label } from '../ui/label'
+import { NoteGlyph } from './DockPickers'
 import type { Duration } from '../../types/score'
 
 /** A polyrhythm stated explicitly as `played` notes in the space of `inSpaceOf` notes of
@@ -13,15 +14,17 @@ export interface TupletSpec {
   baseDuration: Duration
 }
 
-/** Note-value choices for one tuplet slot, with a compact glyph. Only values with a real
- *  single-character glyph (♩ ♪ ♬) are offered — whole/half notes have no BMP symbol. */
-const VALUES: { value: Duration; glyph: string }[] = [
-  { value: 'quarter', glyph: '♩' },
-  { value: 'eighth', glyph: '♪' },
-  { value: 'sixteenth', glyph: '♬' },
+/** Note-value choices for one tuplet slot. Each renders as an SVG note glyph (whole/half have
+ *  no usable Unicode symbol), so every value down to a whole note can be picked. */
+const VALUES: { value: Duration; name: string }[] = [
+  { value: 'whole', name: 'Whole' },
+  { value: 'half', name: 'Half' },
+  { value: 'quarter', name: 'Quarter' },
+  { value: 'eighth', name: 'Eighth' },
+  { value: 'sixteenth', name: 'Sixteenth' },
 ]
 
-const glyphFor = (d: Duration) => VALUES.find(v => v.value === d)?.glyph ?? ''
+const nameFor = (d: Duration) => VALUES.find(v => v.value === d)?.name.toLowerCase() ?? ''
 
 const PRESETS: { spec: TupletSpec; label: string; name: string }[] = [
   { spec: { played: 3, inSpaceOf: 2, baseDuration: 'eighth' }, label: '3:2 ♪', name: 'Triplet (eighths)' },
@@ -133,7 +136,7 @@ export function PolyrhythmPicker({ current, onChange, onConfirm, children }: Pol
             ))}
           </div>
 
-          <div className="flex items-end gap-2">
+          <div className="flex items-end justify-center gap-2">
             <div className="w-12">
               <Label className="text-[10px] text-white/40 uppercase tracking-wider">Notes</Label>
               <Input
@@ -159,29 +162,33 @@ export function PolyrhythmPicker({ current, onChange, onConfirm, children }: Pol
                 className="h-8 bg-white/5 border-white/15 text-white text-sm text-center"
               />
             </div>
-            <div className="flex-1">
-              <Label className="text-[10px] text-white/40 uppercase tracking-wider">Value</Label>
-              <select
-                value={baseDuration}
-                onChange={e => {
-                  const v = e.target.value as Duration
-                  setBaseDuration(v)
-                  onChange({ ...readSpec(), baseDuration: v })
-                }}
-                className="h-8 w-full rounded-md bg-white/5 border border-white/15 text-white text-base text-center px-1"
-              >
-                {VALUES.map(({ value, glyph }) => (
-                  <option key={value} value={value} className="bg-zinc-900">
-                    {glyph}
-                  </option>
-                ))}
-              </select>
+          </div>
+
+          <div>
+            <Label className="text-[10px] text-white/40 uppercase tracking-wider">Value</Label>
+            <div className="mt-1 flex items-stretch gap-1">
+              {VALUES.map(({ value, name }) => (
+                <button
+                  key={value}
+                  title={name}
+                  onClick={() => {
+                    setBaseDuration(value)
+                    onChange({ ...readSpec(), baseDuration: value })
+                  }}
+                  className={`flex flex-1 items-center justify-center rounded-md py-1.5 transition-colors ${
+                    baseDuration === value
+                      ? 'bg-violet-500/30 text-violet-200 ring-1 ring-violet-400/40'
+                      : 'bg-white/5 text-white/60 hover:bg-white/10 hover:text-white'
+                  }`}
+                >
+                  <NoteGlyph dur={value} className="h-5 w-5" />
+                </button>
+              ))}
             </div>
           </div>
 
-          <div className="text-center text-[11px] font-mono text-violet-300/90">
-            {preview.played}:{preview.inSpaceOf} {glyphFor(baseDuration)}
-            <span className="text-white/40"> — {preview.played} in the time of {preview.inSpaceOf}</span>
+          <div className="text-center text-[11px] text-white/40">
+            {preview.played} {nameFor(baseDuration)} note{preview.played === 1 ? '' : 's'} in the space of {preview.inSpaceOf}
           </div>
 
           <button
@@ -193,8 +200,8 @@ export function PolyrhythmPicker({ current, onChange, onConfirm, children }: Pol
 
           <div className="flex items-start justify-between gap-3 border-t border-white/10 pt-3">
             <p className="text-[11px] leading-snug text-white/45">
-              Play the first number of notes in the time the second number would normally take, at the
-              chosen note value (3 in the space of 2 eighths = a triplet). Click Enter, then place notes
+              Play the a number of notes in the time the second number would normally take, with a
+              chosen note value (3 eights in the space of 2 eighths = a triplet). Choose a common polyrhythm, or write your own and press enter, then place notes
               to fill it.
             </p>
             <kbd className="shrink-0 rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/70">P</kbd>

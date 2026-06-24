@@ -6,6 +6,8 @@ import { ANNOTATION_CATALOG, type CatalogEntry } from '../../lib/annotations/cat
 interface AnnotationPickerProps {
   /** Fires when an entry is chosen: arms the Annotations tool with that entry and closes the panel. */
   onPick: (entry: CatalogEntry) => void
+  /** Bulk-place a measure-number box on every `every` measures, starting from measure `start`. */
+  onAddMeasureNumbers: (every: number, start: number) => void
   children: React.ReactNode
 }
 
@@ -15,9 +17,13 @@ interface AnnotationPickerProps {
  * between them. Glyph cells render in Bravura so they match standard engraving; clicking an entry
  * arms the tool (mirrors PolyrhythmPicker's onConfirm) so the next score click spawns the mark.
  */
-export function AnnotationPicker({ onPick, children }: AnnotationPickerProps) {
+export function AnnotationPicker({ onPick, onAddMeasureNumbers, children }: AnnotationPickerProps) {
   const [open, setOpen] = useState(false)
   const [page, setPage] = useState(0)
+  const [bulkOpen, setBulkOpen] = useState(false)
+  // Kept as strings so the field can be fully cleared while typing; coerced to ≥1 only on submit.
+  const [every, setEvery] = useState('1')
+  const [start, setStart] = useState('1')
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const scheduleClose = () => {
@@ -87,7 +93,11 @@ export function AnnotationPicker({ onPick, children }: AnnotationPickerProps) {
                 onClick={() => { onPick(entry); setOpen(false) }}
                 className="group relative flex h-11 items-center justify-center overflow-visible rounded bg-white/5 text-white/80 transition-colors hover:bg-violet-500/25 hover:text-white"
               >
-                {entry.previewFont === 'bravura' ? (
+                {entry.spawn === 'measureNumber' ? (
+                  <span style={{ display: 'inline-block', minWidth: 16, padding: '1px 4px', textAlign: 'center', border: '1px solid currentColor', borderRadius: 2, fontFamily: 'serif', fontSize: 12, fontWeight: 700, lineHeight: 1.1 }}>
+                    {entry.preview ?? '#'}
+                  </span>
+                ) : entry.previewFont === 'bravura' ? (
                   <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 36, width: '100%', overflow: 'hidden' }}>
                     <span style={{ fontFamily: 'Bravura, serif', fontSize: 22 * (entry.previewScale ?? 1), lineHeight: 1 }}>{entry.glyph}</span>
                   </span>
@@ -104,10 +114,60 @@ export function AnnotationPicker({ onPick, children }: AnnotationPickerProps) {
             ))}
           </div>
 
-          <p className="border-t border-white/10 pt-2 text-[11px] leading-snug text-white/45">
-            Pick a mark, then click the score to place it. Drag — and stretch the brackets/lines —
-            in sharpshooter mode.
-          </p>
+          {/* Bulk measure-numbering — full-width button (matches cell height) that toggles an
+              inline "every X measures, starting from Y" form. Only on the Text page. */}
+          {category.id === 'text' && (
+            <div className="space-y-2">
+              <button
+                onClick={() => setBulkOpen(o => !o)}
+                className={`flex h-11 w-full items-center justify-center rounded text-[11px] font-medium transition-colors ${
+                  bulkOpen ? 'bg-violet-500/30 text-violet-200' : 'bg-white/5 text-white/70 hover:bg-violet-500/25 hover:text-white'
+                }`}
+              >
+                Add measure numbers every X measures
+              </button>
+              {bulkOpen && (
+                <div className="space-y-2 rounded border border-white/10 bg-white/5 p-2">
+                  <label className="flex items-center justify-between text-[11px] text-white/70">
+                    <span>Every</span>
+                    <input
+                      type="text" inputMode="numeric"
+                      value={every}
+                      onChange={e => setEvery(e.target.value.replace(/\D/g, ''))}
+                      className="h-6 w-16 rounded bg-white/10 px-1 text-right text-[11px] text-white"
+                    />
+                    <span>measures</span>
+                  </label>
+                  <label className="flex items-center justify-between text-[11px] text-white/70">
+                    <span>Starting from measure</span>
+                    <input
+                      type="text" inputMode="numeric"
+                      value={start}
+                      onChange={e => setStart(e.target.value.replace(/\D/g, ''))}
+                      className="h-6 w-16 rounded bg-white/10 px-1 text-right text-[11px] text-white"
+                    />
+                  </label>
+                  <button
+                    onClick={() => { onAddMeasureNumbers(Math.max(1, Number(every) || 1), Math.max(1, Number(start) || 1)); setBulkOpen(false); setOpen(false) }}
+                    className="h-7 w-full rounded bg-violet-500/40 text-[11px] font-medium text-white transition-colors hover:bg-violet-500/60"
+                  >
+                    Add
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="border-t border-white/10 pt-2">
+            <p className="text-[11px] leading-snug text-white/45">
+              Pick a mark, then click the score to place it. Drag — and stretch the brackets/lines —
+              in sharpshooter mode.
+            </p>
+            <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-white/45">
+              <kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-white/70">+</kbd>
+              toggles this tool, defaults to last selected mark.
+            </p>
+          </div>
         </div>
       </PopoverContent>
     </Popover>

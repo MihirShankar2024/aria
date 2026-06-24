@@ -107,7 +107,7 @@ const LENGTHS: { value: Duration; name: string; keys: string }[] = [
 
 /** A note-value glyph drawn as SVG (the Musical-Symbol Unicode codepoints for whole/half
  *  render as tofu in system fonts). Inherits the surrounding text colour via currentColor. */
-function NoteGlyph({ dur, className = '' }: { dur: Duration; className?: string }) {
+export function NoteGlyph({ dur, className = '' }: { dur: Duration; className?: string }) {
   const filled = dur === 'quarter' || dur === 'eighth' || dur === 'sixteenth'
   return (
     <svg viewBox="0 0 24 24" className={className} fill="none" aria-hidden="true">

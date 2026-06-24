@@ -24,6 +24,9 @@ export function buildAnnotation(
       edit: false,
     }
   }
+  if (entry.spawn === 'measureNumber') {
+    return { annotation: { id, kind: 'measureNumber', anchor }, edit: false }
+  }
   if (entry.spawn === 'text') {
     return {
       annotation: {

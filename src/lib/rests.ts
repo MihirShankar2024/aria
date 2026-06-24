@@ -169,21 +169,26 @@ export function normalizeMeasureRests(notes: NoteEvent[], timeSig: TimeSig): Not
   const compound = isCompound(timeSig)
   const result: NoteEvent[] = []
 
+  // A rest carrying an articulation (e.g. a fermata over a rest) is a meaningful authored
+  // event: keep it intact like a note instead of coalescing/re-notating its run, so the mark
+  // (and the rest's identity) survives normalization.
+  const isFixed = (ev: NoteEvent) => ev.type === 'note' || (ev.articulations?.length ?? 0) > 0
+
   let offset = 0 // sixteenth units from measure start
   let i = 0
   while (i < notes.length) {
     const ev = notes[i]
-    if (ev.type === 'note') {
+    if (isFixed(ev)) {
       result.push(ev)
       offset += Math.round(noteBeatDuration(ev) * U)
       i++
       continue
     }
 
-    // Maximal run of consecutive rests.
+    // Maximal run of consecutive plain (unarticulated) rests.
     const runStart = offset
     let j = i
-    while (j < notes.length && notes[j].type === 'rest') {
+    while (j < notes.length && notes[j].type === 'rest' && !isFixed(notes[j])) {
       offset += Math.round(noteBeatDuration(notes[j]) * U)
       j++
     }

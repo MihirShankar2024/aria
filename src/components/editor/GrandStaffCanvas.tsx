@@ -23,7 +23,13 @@ import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { TimeSig, KeySig, Duration, Accidental, Part, Note, NoteEvent, VoiceNumber, Pitch } from '../../types/score'
+import type { TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Part, Note, NoteEvent, VoiceNumber, Pitch, Annotation } from '../../types/score'
+import { AnnotationsLayer } from './AnnotationsLayer'
+import { annotationBounds, rectHit } from '../../lib/annotations/geometry'
+import { buildAnnotation } from './annotationSpawn'
+import type { CatalogEntry } from '../../lib/annotations/catalog'
+
+const EMPTY_ANNOTATIONS: Annotation[] = []
 import type { ScoreAction } from '../../state/actions'
 
 const DOT_R = 7
@@ -67,11 +73,12 @@ interface TieDrag { partId: string; fromId: string; fromPitchId: string; fromX: 
 
 // An auxiliary glyph (accidental/dot) or tie swept by the broom, removed on release.
 type BroomTarget =
-  | { kind: 'glyph'; key: string; partId: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
+  | { kind: 'glyph'; key: string; partId: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot' | 'articulation'; artType?: ArticulationType; x: number; y: number }
   | { kind: 'tie'; key: string; partId: string; tieId: string; x: number; y: number }
   | { kind: 'keySig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
   | { kind: 'timeSig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
   | { kind: 'tempo'; key: string; measureNumber: number; x: number; y: number }
+  | { kind: 'annotation'; key: string; partId: string; annotationId: string; x: number; y: number; w: number; h: number }
 
 // A chosen insertion point on a specific stave.
 interface InsertSession {
@@ -98,6 +105,7 @@ interface GrandStaffCanvasProps {
   dispatch: (action: ScoreAction) => void
   selectedDuration: Duration
   selectedAccidental: Accidental
+  selectedArticulation: ArticulationType | null
   isDotted: boolean
   isRest: boolean
   activeVoice?: VoiceNumber
@@ -110,6 +118,13 @@ interface GrandStaffCanvasProps {
   /** When true, placed notes flow into a reserved tuplet of `tupletSpec` (polyrhythm entry). */
   tupletEntry?: boolean
   tupletSpec?: TupletSpec
+  /** Free-floating expressive marks per stave + the armed Annotations tool state. */
+  trebleAnnotations?: Annotation[]
+  bassAnnotations?: Annotation[]
+  annotationEntry?: boolean
+  selectedAnnotation?: CatalogEntry | null
+  editingAnnotationId?: string | null
+  onAnnotationSpawned?: (id: string | null) => void
   /** When true (default), placing a note in keyboard mode advances the cursor to the next
    * beat; when false, the cursor stays on the note just placed. */
   advanceOnPlace?: boolean
@@ -138,6 +153,7 @@ export function GrandStaffCanvas({
   dispatch,
   selectedDuration,
   selectedAccidental,
+  selectedArticulation,
   isDotted,
   isRest,
   activeVoice = 1,
@@ -149,6 +165,12 @@ export function GrandStaffCanvas({
   isSharpshooterMode = false,
   tupletEntry = false,
   tupletSpec = { played: 3, inSpaceOf: 2, baseDuration: 'eighth' },
+  trebleAnnotations = EMPTY_ANNOTATIONS,
+  bassAnnotations = EMPTY_ANNOTATIONS,
+  annotationEntry = false,
+  selectedAnnotation = null,
+  editingAnnotationId = null,
+  onAnnotationSpawned,
   advanceOnPlace = false,
   initialTempo,
   tempoChanges = [],
@@ -263,7 +285,7 @@ export function GrandStaffCanvas({
   // Re-render the grey cursor ghost only when the selected note params change.
   // Clef-independent glyph, so one render serves both staves.
   useEffect(() => {
-    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode) {
+    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode || annotationEntry) {
       setGhost(null)
       return
     }
@@ -279,7 +301,7 @@ export function GrandStaffCanvas({
     })
     setGhost(nextGhost)
   }, [selectedDuration, isDotted, selectedAccidental, isRest, timeSig, keySig, activeVoice,
-      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
+      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode, annotationEntry])
 
   // Smoothly recenter the active measure once it drifts into the right quarter.
   useEffect(() => {
@@ -497,6 +519,18 @@ export function GrandStaffCanvas({
   // Apply the active modifier tool(s) — dot and/or accidental — to an existing note,
   // the accidental landing on the chord tone at the clicked staff position. onNotePlaced
   // then clears the tool selection so it doesn't carry to the next placement.
+  // The sticky articulation as a fresh single-mark list for a new event (undefined when none).
+  const selArt = (): NoteArticulation[] | undefined =>
+    selectedArticulation ? [{ type: selectedArticulation }] : undefined
+
+  // Toggle the sticky articulation in an event's set (stacking: add if absent, remove if present).
+  const toggledArticulations = (cur: NoteArticulation[] | undefined): NoteArticulation[] => {
+    const list = cur ?? []
+    return list.some(a => a.type === selectedArticulation)
+      ? list.filter(a => a.type !== selectedArticulation)
+      : [...list, { type: selectedArticulation! }]
+  }
+
   const applyModifierToExistingNote = (part: Part, staveY: number, clef: 'treble' | 'bass', target: NoteGeometry, clickY: number, pitchIndex?: number) => {
     const measure = part.measures[target.measureIndex]
     if (!measure) return
@@ -504,6 +538,7 @@ export function GrandStaffCanvas({
     if (!ev || ev.type !== 'note') return
     const patch: Partial<Note> = {}
     if (isDotted) patch.dots = 1
+    if (selectedArticulation !== null) patch.articulations = toggledArticulations(ev.articulations)
     if (selectedAccidental !== null) {
       if (pitchIndex !== undefined && ev.pitches[pitchIndex]) {
         patch.pitches = ev.pitches.map((p, i) =>
@@ -617,9 +652,9 @@ export function GrandStaffCanvas({
     for (const { part, glyphs } of allGlyphHandles()) {
       for (const g of glyphs) {
         if (Math.hypot(g.x - x, g.y - y) > BRUSH_R) continue
-        const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}`
+        const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}:${g.artType ?? ''}`
         if (broomRef.current.has(key)) continue
-        broomRef.current.set(key, { kind: 'glyph', key, partId: part.id, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, x: g.x, y: g.y })
+        broomRef.current.set(key, { kind: 'glyph', key, partId: part.id, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, artType: g.artType, x: g.x, y: g.y })
         added = true
       }
     }
@@ -653,6 +688,24 @@ export function GrandStaffCanvas({
       broomRef.current.set(key, { kind: 'tempo', key, measureNumber: tm.measureNumber, x: tmBroomX, y: tmBroomY })
       added = true
     }
+    // Annotations on either stave. Register when the brush touches anywhere within the mark's
+    // full bounding box, and highlight that whole area.
+    for (const { part, anns, staveY } of [
+      { part: treblePart, anns: trebleAnnotations, staveY: GRAND_TREBLE_Y },
+      { part: bassPart, anns: bassAnnotations, staveY: GRAND_BASS_Y },
+    ]) {
+      for (const ann of anns) {
+        const idx = part.measures.findIndex(m => m.id === ann.anchor.measureId)
+        const g = idx >= 0 ? layout.measures[idx] : undefined
+        if (!g) continue
+        const r = annotationBounds(ann, g.x, staveY)
+        if (!rectHit(r, x, y, BRUSH_R)) continue
+        const key = `a:${ann.id}`
+        if (broomRef.current.has(key)) continue
+        broomRef.current.set(key, { kind: 'annotation', key, partId: part.id, annotationId: ann.id, x: r.x, y: r.y, w: r.w, h: r.h })
+        added = true
+      }
+    }
     if (added) setBroomMarks([...broomRef.current.values()])
   }
 
@@ -675,12 +728,17 @@ export function GrandStaffCanvas({
       const part = parts.find(p => p.id === partId)
       const measure = part?.measures.find(m => m.notes.some(n => n.id === noteId))
       const note = measure?.notes.find(n => n.id === noteId)
-      if (!part || !measure || !note || note.type !== 'note') continue
+      if (!part || !measure || !note) continue
       const patch: Partial<Note> = {}
-      if (gs.some(g => g.kind === 'glyph' && g.glyphKind === 'dot')) patch.dots = 0
-      const accIdx = new Set(gs.filter(g => g.kind === 'glyph' && g.glyphKind === 'accidental').map(g => (g as { pitchIndex: number }).pitchIndex))
-      if (accIdx.size > 0) {
-        patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+      // Articulations live on the event (note or rest); strip the swept types.
+      const artTypes = new Set(gs.filter(g => g.glyphKind === 'articulation').map(g => g.artType))
+      if (artTypes.size > 0 && note.articulations) patch.articulations = note.articulations.filter(a => !artTypes.has(a.type))
+      if (note.type === 'note') {
+        if (gs.some(g => g.glyphKind === 'dot')) patch.dots = 0
+        const accIdx = new Set(gs.filter(g => g.glyphKind === 'accidental').map(g => g.pitchIndex))
+        if (accIdx.size > 0) {
+          patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+        }
       }
       if (Object.keys(patch).length) dispatch({ type: 'UPDATE_NOTE', partId, measureId: measure.id, noteId, patch })
     }
@@ -695,6 +753,7 @@ export function GrandStaffCanvas({
       }
       if (t.kind === 'timeSig') dispatch({ type: 'CLEAR_MEASURE_TIME_SIG', measureNumber: t.measureNumber })
       if (t.kind === 'tempo') dispatch({ type: 'REMOVE_MEASURE_TEMPO', measureNumber: t.measureNumber })
+      if (t.kind === 'annotation') dispatch({ type: 'DELETE_ANNOTATION', partId: t.partId, id: t.annotationId })
     }
   }
 
@@ -893,7 +952,7 @@ export function GrandStaffCanvas({
         const measureId = part.measures.find(m => m.notes.some(n => n.id === g.noteId))?.id
         if (measureId) {
           setGlyphEdit({
-            partId: part.id, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind,
+            partId: part.id, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind, artType: g.artType,
             downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y,
           })
           return
@@ -932,11 +991,19 @@ export function GrandStaffCanvas({
       setGlyphEdit(null)
       suppressClickRef.current = true
       if (note && moved) {
-        dispatch({
-          type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
-          noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind,
-          ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
-        })
+        if (glyphEdit.kind === 'articulation' && glyphEdit.artType) {
+          dispatch({
+            type: 'UPDATE_ARTICULATION_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+            noteId: glyphEdit.noteId, artType: glyphEdit.artType,
+            dx: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+          })
+        } else {
+          dispatch({
+            type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+            noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind as 'accidental' | 'dot',
+            ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+          })
+        }
       }
       return
     }
@@ -1010,6 +1077,17 @@ export function GrandStaffCanvas({
       staveY,
     )
 
+    // Annotations tool: drop the armed mark on the stave under the cursor, anchored to its measure.
+    if (annotationEntry && selectedAnnotation) {
+      const measure = part.measures[idx]
+      const g = layout?.measures[idx]
+      if (!measure || !g) return null
+      const { annotation, edit } = buildAnnotation(selectedAnnotation, measure.id, x - g.x, y - staveY)
+      dispatch({ type: 'ADD_ANNOTATION', partId: part.id, annotation })
+      onAnnotationSpawned?.(edit ? annotation.id : null)
+      return annotation.id
+    }
+
     // Polyrhythm entry: a click on a reserved placeholder rest fills that exact slot (so other
     // slots can be left as rests, like normal entry); otherwise reserve a fresh tuplet here.
     if (tupletEntry) {
@@ -1031,13 +1109,13 @@ export function GrandStaffCanvas({
       dispatch({
         type: 'PLACE_TUPLET_NOTE', partId: part.id, measureId: measure.id, voice: targetVoice,
         played: tupletSpec.played, inSpaceOf: tupletSpec.inSpaceOf, baseDuration: tupletSpec.baseDuration, baseDots: 0,
-        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId,
+        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId, articulations: selArt(),
       })
       onNotePlaced?.()
       return newId
     }
 
-    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
+    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null || selectedArticulation !== null)) {
       const hit = noteHeadAt(notes, x, snapY)
       if (hit) { applyModifierToExistingNote(part, staveY, clef, hit.note, snapY, hit.pitchIndex); return hit.note.id }
       const nearNote = nearestNoteAtX(notes, x, CHORD_PROXIMITY_X)
@@ -1075,7 +1153,7 @@ export function GrandStaffCanvas({
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
             type: 'INSERT_EVENTS', partId: part.id, measureId: measure.id, index: insertIdx,
-            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice }],
+            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() }],
           })
           onNotePlaced?.()
           return newId
@@ -1095,7 +1173,7 @@ export function GrandStaffCanvas({
             partId: part.id,
             measureId: measure.id,
             restId: nearRest.id,
-            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice },
+            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() },
           })
           onNotePlaced?.()
           return newId
@@ -1114,7 +1192,7 @@ export function GrandStaffCanvas({
             partId: part.id,
             measureId: measure.id,
             eventId: nearNote.id,
-            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
+            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() },
           })
           onNotePlaced?.()
           return newId
@@ -1136,7 +1214,7 @@ export function GrandStaffCanvas({
         type: 'ADD_REST',
         partId: part.id,
         measureId: measure.id,
-        rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
+        rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() },
       })
       onNotePlaced?.()
       return newId
@@ -1156,6 +1234,7 @@ export function GrandStaffCanvas({
         dots: isDotted ? 1 : 0,
         tied: false,
         voice: targetVoice,
+        articulations: selArt(),
       },
     })
     onNotePlaced?.()
@@ -1499,6 +1578,27 @@ export function GrandStaffCanvas({
     >
       <div className="relative inline-block">
         <div ref={containerRef} />
+
+        {layout && [
+          { part: treblePart, anns: trebleAnnotations, staveY: GRAND_TREBLE_Y },
+          { part: bassPart, anns: bassAnnotations, staveY: GRAND_BASS_Y },
+        ].map(({ part, anns, staveY }) => (
+          <AnnotationsLayer
+            key={part.id}
+            partId={part.id}
+            annotations={anns}
+            measureX={mId => {
+              const i = part.measures.findIndex(m => m.id === mId)
+              return i >= 0 && layout.measures[i] ? layout.measures[i].x : null
+            }}
+            staveY={staveY}
+            isSharpshooterMode={isSharpshooterMode}
+            editingId={editingAnnotationId}
+            setEditingId={id => onAnnotationSpawned?.(id)}
+            dispatch={dispatch}
+          />
+        ))}
+
         {measureOverlays}
         {tempoOverlays}
 
@@ -1761,7 +1861,7 @@ export function GrandStaffCanvas({
             glyph being dragged follows the cursor. */}
         {isSharpshooterMode && allGlyphHandles().flatMap(({ glyphs, notes }) =>
           glyphs.map(g => {
-            const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
+            const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind && glyphEdit?.artType === g.artType
             const note = notes.find(n => n.id === g.noteId)
             const hovered = note != null && hoverMeasure === note.measureIndex
             if (!editing && !hovered) return null
@@ -1822,6 +1922,9 @@ export function GrandStaffCanvas({
                 }
                 if (t.kind === 'tempo') {
                   return <rect key={t.key} x={t.x - 30} y={t.y - 10 + BROOM_TEMPO_DY} width={60} height={20} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+                }
+                if (t.kind === 'annotation') {
+                  return <rect key={t.key} x={t.x} y={t.y} width={t.w} height={t.h} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
                 }
                 return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
               })
@@ -1926,6 +2029,7 @@ export function GrandStaffCanvas({
             clef={insertSession.stave === 'treble' ? 'treble' : 'bass'}
             selectedDuration={selectedDuration}
             selectedAccidental={selectedAccidental}
+            selectedArticulation={selectedArticulation}
             isDotted={isDotted}
             isRest={isRest}
             onCommit={commitInsert}

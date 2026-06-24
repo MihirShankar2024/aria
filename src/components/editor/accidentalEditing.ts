@@ -1,4 +1,5 @@
 import type { GlyphGeometry } from '../../lib/vexflow/renderer'
+import type { ArticulationType } from '../../types/score'
 
 // Shared logic for dragging a note's accidental/dot glyph to a new position. Mirrors
 // slurEditing.ts: handles only surface for glyphs in the hovered measure, and the drag
@@ -11,7 +12,8 @@ export interface GlyphEdit {
   measureId: string
   noteId: string
   pitchIndex: number
-  kind: 'accidental' | 'dot'
+  kind: 'accidental' | 'dot' | 'articulation'
+  artType?: ArticulationType   // set when kind === 'articulation'
   downX: number
   downY: number
   curX: number

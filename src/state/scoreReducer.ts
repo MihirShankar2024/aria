@@ -284,6 +284,42 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (tie) tie.curve = { ...tie.curve, ...action.curve }
         break
       }
+      case 'ADD_ANNOTATION': {
+        const part = draft.parts.find(p => p.id === action.partId)
+        if (part) {
+          if (!part.annotations) part.annotations = []
+          part.annotations.push(action.annotation)
+        }
+        break
+      }
+      case 'MOVE_ANNOTATION': {
+        const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
+        if (ann) ann.anchor = action.anchor
+        break
+      }
+      case 'STRETCH_ANNOTATION': {
+        const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
+        if (ann && ann.kind === 'line') { ann.endDX = action.endDX; ann.endDY = action.endDY }
+        break
+      }
+      case 'SCALE_ANNOTATION': {
+        const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
+        if (ann && ann.kind === 'glyph') { ann.scaleX = action.scaleX; ann.scaleY = action.scaleY }
+        break
+      }
+      case 'UPDATE_TEXT_ANNOTATION': {
+        const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
+        if (ann && ann.kind === 'text') {
+          if (action.text !== undefined) ann.text = action.text
+          if (action.style !== undefined) ann.style = action.style
+        }
+        break
+      }
+      case 'DELETE_ANNOTATION': {
+        const part = draft.parts.find(p => p.id === action.partId)
+        if (part?.annotations) part.annotations = part.annotations.filter(a => a.id !== action.id)
+        break
+      }
       case 'UPDATE_GLYPH_OFFSET': {
         const note = draft.parts
           .find(p => p.id === action.partId)
@@ -297,6 +333,18 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
             // X is anchored to the notehead (absolute), Y accumulates the drag delta.
             pitch[key] = { dx: action.ax, dy: (prev?.dy ?? 0) + action.dy }
           }
+        }
+        break
+      }
+      case 'UPDATE_ARTICULATION_OFFSET': {
+        const event = draft.parts
+          .find(p => p.id === action.partId)
+          ?.measures.find(m => m.id === action.measureId)
+          ?.notes.find(n => n.id === action.noteId)
+        const art = event?.articulations?.find(a => a.type === action.artType)
+        if (art) {
+          // X is anchored to the notehead (absolute); Y accumulates the drag delta.
+          art.offset = { dx: action.dx, dy: (art.offset?.dy ?? 0) + action.dy }
         }
         break
       }
@@ -423,8 +471,8 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
         if (!measure || action.played < 2 || action.inSpaceOf < 1) break
         const { voice } = action
         const placed: NoteEvent = action.pitches
-          ? { id: action.noteId, type: 'note', pitches: action.pitches, duration: action.duration, dots: action.dots, tied: false, voice }
-          : { id: action.noteId, type: 'rest', duration: action.duration, dots: action.dots, voice }
+          ? { id: action.noteId, type: 'note', pitches: action.pitches, duration: action.duration, dots: action.dots, tied: false, voice, articulations: action.articulations }
+          : { id: action.noteId, type: 'rest', duration: action.duration, dots: action.dots, voice, articulations: action.articulations }
         const W = noteBeatDuration(placed)
 
         // Resolve the target tuplet + the slot to start filling at. A click on a reserved

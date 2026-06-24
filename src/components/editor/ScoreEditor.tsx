@@ -8,6 +8,7 @@ import { StaffCanvas } from './StaffCanvas'
 import { GrandStaffCanvas } from './GrandStaffCanvas'
 import { DurationToolbar } from './DurationToolbar'
 import type { TupletSpec } from './PolyrhythmPicker'
+import type { CatalogEntry } from '../../lib/annotations/catalog'
 import { PartsSidebar } from './PartsSidebar'
 import { AddInstrumentButton } from './AddInstrumentButton'
 import { RemoveTrackDialog, MeasuresDialog } from './TrackDialogs'
@@ -16,12 +17,13 @@ import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { effectiveTimeSigAt } from '../../lib/beats'
 import { transposeChromatic } from '../../lib/transposition/transpose'
-import { selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
+import { selKey, selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
 import { setClipboard } from './clipboard'
 import type { PendingRest } from './useDeleteTrail'
-import type { Part, Duration, Accidental, NoteEvent, Tie, VoiceNumber } from '../../types/score'
+import type { Part, Duration, Accidental, ArticulationType, NoteEvent, Tie, Annotation, VoiceNumber } from '../../types/score'
 
 const EMPTY_TIES: Tie[] = []
+const EMPTY_ANNOTATIONS: Annotation[] = []
 
 type PartGroup =
   | { type: 'single'; part: Part }
@@ -58,6 +60,7 @@ export function ScoreEditor() {
   const [isRest, setIsRest] = useState(false)
   const [activeVoice, setActiveVoice] = useState<VoiceNumber>(1)
   const [selectedAccidental, setSelectedAccidental] = useState<Accidental>(null)
+  const [selectedArticulation, setSelectedArticulation] = useState<ArticulationType | null>(null)
   const [isTieMode, setIsTieMode] = useState(false)
   const [isFillMode, setIsFillMode] = useState(false)
   const [isDeleteMode, setIsDeleteMode] = useState(false)
@@ -70,6 +73,11 @@ export function ScoreEditor() {
   const [tupletEntry, setTupletEntry] = useState(false)
   // `played` notes in the space of `inSpaceOf` notes of `baseDuration` — stated explicitly, not derived.
   const [tupletSpec, setTupletSpec] = useState<TupletSpec>({ played: 3, inSpaceOf: 2, baseDuration: 'eighth' })
+  // Annotations entry: when armed with `selectedAnnotation`, clicking the score spawns that mark.
+  const [annotationEntry, setAnnotationEntry] = useState(false)
+  const [selectedAnnotation, setSelectedAnnotation] = useState<CatalogEntry | null>(null)
+  // The text annotation that just spawned and should mount in edit mode (focused).
+  const [editingAnnotationId, setEditingAnnotationId] = useState<string | null>(null)
   // Keyboard placement: after placing a note, advance the cursor to the next beat (true,
   // default) or stay on the note just placed (false).
   const [advanceOnPlace, setAdvanceOnPlace] = useState(false)
@@ -236,18 +244,23 @@ export function ScoreEditor() {
         setSelectedNoteIds(new Set())
         return
       }
-      if (e.metaKey || e.ctrlKey) return
-      // Shift key alone toggles select mode (sticky).
-      if (e.key === 'Shift') {
+      // Select all: turn on select mode and select every notehead (and rest) in the score.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'a') {
         e.preventDefault()
-        setIsSelectMode(prev => {
-          const v = !prev
-          if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false) }
-          if (!v) setSelectedNoteIds(new Set())
-          return v
-        })
+        const keys = new Set<string>()
+        for (const part of scoreRef.current.parts) {
+          for (const measure of part.measures) {
+            for (const ev of measure.notes) {
+              if (ev.type === 'rest') { keys.add(selKey(ev.id)); continue }
+              ev.pitches.forEach((_, i) => keys.add(selKey(ev.id, i)))
+            }
+          }
+        }
+        setIsSelectMode(true)
+        setSelectedNoteIds(keys)
         return
       }
+      if (e.metaKey || e.ctrlKey) return
       // Tab toggles Sharpshooter mode. Shift+Tab keeps quick collapse for pending rests.
       if (e.key === 'Tab') {
         e.preventDefault()
@@ -264,14 +277,22 @@ export function ScoreEditor() {
         case 'q': setSelectedDuration('quarter'); break
         case 'e': case '8': setSelectedDuration('eighth'); break
         case 'x': case '1': case '6': setSelectedDuration('sixteenth'); break
-        case 'd': case '.': setIsDotted(prev => !prev); break
+        case 'd': setIsDotted(prev => !prev); break
         case ' ':
           e.preventDefault()
           setIsRest(prev => !prev)
           break
         case 'f': setSelectedAccidental(prev => { const next = prev === 'flat' ? null : 'flat'; if (next) setIsRest(false); return next }); break
-        case 's': setSelectedAccidental(prev => { const next = prev === 'sharp' ? null : 'sharp'; if (next) setIsRest(false); return next }); break
+        case '#': setSelectedAccidental(prev => { const next = prev === 'sharp' ? null : 'sharp'; if (next) setIsRest(false); return next }); break
+        case 's': enterSelectMode(prev => !prev); break
         case 'n': setSelectedAccidental(prev => { const next = prev === 'natural' ? null : 'natural'; if (next) setIsRest(false); return next }); break
+        // Articulation shortcuts. Each toggles the sticky articulation mode (set, or clear if
+        // already selected). Fermata applies to rests too, so these never force note mode.
+        case '.': setSelectedArticulation(prev => prev === 'staccato' ? null : 'staccato'); break
+        case '-': case '_': setSelectedArticulation(prev => prev === 'tenuto' ? null : 'tenuto'); break
+        case '~': setSelectedArticulation(prev => prev === 'fermata' ? null : 'fermata'); break
+        case '>': setSelectedArticulation(prev => prev === 'accent' ? null : 'accent'); break
+        case '^': setSelectedArticulation(prev => prev === 'marcato' ? null : 'marcato'); break
         case 'v': setActiveVoice(prev => (prev === 1 ? 2 : 1)); break
         case 't': enterTieMode(prev => !prev); break
         case 'b': enterBroomMode(prev => !prev); break
@@ -355,42 +376,42 @@ export function ScoreEditor() {
   const enterTieMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsTieMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterFillMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsFillMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterDeleteMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsDeleteMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterBroomMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsBroomMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterInsertMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsInsertMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
   const enterSelectMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsSelectMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false); setTupletEntry(false) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setAnnotationEntry(false) }
       if (!v) setSelectedNoteIds(new Set())
       return v
     })
@@ -398,7 +419,7 @@ export function ScoreEditor() {
   const enterSharpshooterMode = (next: boolean | ((p: boolean) => boolean)) => {
     setIsSharpshooterMode(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setTupletEntry(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
   }
@@ -406,9 +427,31 @@ export function ScoreEditor() {
   const enterTupletEntry = (next: boolean | ((p: boolean) => boolean)) => {
     setTupletEntry(prev => {
       const v = typeof next === 'function' ? next(prev) : next
-      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setSelectedNoteIds(new Set()) }
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setAnnotationEntry(false); setSelectedNoteIds(new Set()) }
       return v
     })
+  }
+  // Arming the Annotations tool clears the other exclusive modes; the next score click spawns
+  // `selectedAnnotation`. Clearing it also drops the armed entry so the dock toggle stays in sync.
+  const enterAnnotationEntry = (next: boolean | ((p: boolean) => boolean)) => {
+    setAnnotationEntry(prev => {
+      const v = typeof next === 'function' ? next(prev) : next
+      if (v) { setIsTieMode(false); setIsFillMode(false); setIsDeleteMode(false); setIsBroomMode(false); setIsInsertMode(false); setIsSelectMode(false); setIsSharpshooterMode(false); setTupletEntry(false); setSelectedNoteIds(new Set()) }
+      return v
+    })
+  }
+  const handleAnnotationPick = (entry: CatalogEntry) => {
+    setSelectedAnnotation(entry)
+    enterAnnotationEntry(true)
+  }
+  // Clicking the bare + toggle (no panel pick) re-arms the last-used mark; with none chosen
+  // yet this session, prompt the user to pick one from the panel instead of arming nothing.
+  const handleAnnotationToggle = (next: boolean) => {
+    if (next && !selectedAnnotation) {
+      showToast('Pick an annotation from the panel first')
+      return
+    }
+    enterAnnotationEntry(next)
   }
   const deleteSelectedNotes = () => {
     if (selectedNoteIds.size === 0) return
@@ -479,6 +522,7 @@ export function ScoreEditor() {
     dispatch,
     selectedDuration,
     selectedAccidental,
+    selectedArticulation,
     isDotted,
     isRest,
     activeVoice,
@@ -491,6 +535,17 @@ export function ScoreEditor() {
     isSharpshooterMode,
     tupletEntry,
     tupletSpec,
+    annotationEntry,
+    selectedAnnotation,
+    editingAnnotationId,
+    // Called when a mark is placed (id to edit, or null). Disarms the tool so it behaves like
+    // the accidental picker — one placement, then back to normal. `selectedAnnotation` is kept
+    // as the "last used" so clicking the bare + toggle re-arms it. Also used by the layer to
+    // toggle text editing (already disarmed by then, so the disarm is a harmless no-op).
+    onAnnotationSpawned: (id: string | null) => {
+      setEditingAnnotationId(id)
+      setAnnotationEntry(false)
+    },
     advanceOnPlace,
     transposedView,
     selectedNoteIds,
@@ -535,10 +590,15 @@ export function ScoreEditor() {
           onTupletEntryChange={enterTupletEntry}
           tupletSpec={tupletSpec}
           onTupletSpecChange={setTupletSpec}
+          annotationEntry={annotationEntry}
+          onAnnotationEntryChange={handleAnnotationToggle}
+          onAnnotationPick={handleAnnotationPick}
           activeVoice={activeVoice}
           onActiveVoiceChange={setActiveVoice}
           selectedAccidental={selectedAccidental}
           onAccidentalChange={handleAccidentalChange}
+          selectedArticulation={selectedArticulation}
+          onArticulationChange={setSelectedArticulation}
           isTieMode={isTieMode}
           onTieModeChange={enterTieMode}
           isFillMode={isFillMode}
@@ -600,6 +660,8 @@ export function ScoreEditor() {
                   <GrandStaffCanvas
                     treblePart={group.treble}
                     bassPart={group.bass}
+                    trebleAnnotations={group.treble.annotations ?? EMPTY_ANNOTATIONS}
+                    bassAnnotations={group.bass.annotations ?? EMPTY_ANNOTATIONS}
                     timeSig={score.globalTimeSig}
                     keySig={score.globalKeySig}
                     {...playbackLayoutProps}
@@ -625,6 +687,7 @@ export function ScoreEditor() {
                   keySig={score.globalKeySig}
                   clef={part.clef}
                   ties={part.ties ?? EMPTY_TIES}
+                  annotations={part.annotations ?? EMPTY_ANNOTATIONS}
                   {...playbackLayoutProps}
                   {...commonCanvasProps}
                 />

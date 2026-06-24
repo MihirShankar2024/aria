@@ -1,23 +1,18 @@
 import type { ReactNode } from 'react'
-import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward, Music2 } from 'lucide-react'
+import { Trash2, Eraser, MousePointer2, Brush, Crosshair, StepForward, Music2, Plus } from 'lucide-react'
 import { Toggle } from '../ui/toggle'
 import { ToggleGroup, ToggleGroupItem } from '../ui/toggle-group'
 import { Tooltip, TooltipTrigger, TooltipContent } from '../ui/tooltip'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
 import { PolyrhythmPicker, type TupletSpec } from './PolyrhythmPicker'
+import { AnnotationPicker } from './AnnotationPicker'
+import type { CatalogEntry } from '../../lib/annotations/catalog'
+import { LengthPicker, AccidentalPicker, ArticulationPicker } from './DockPickers'
 import { TimeSigPicker } from './TimeSigPicker'
 import { KeySigPicker } from './KeySigPicker'
 import { TempoPicker } from './TempoPicker'
-import type { Duration, Accidental, TimeSig, KeySig, VoiceNumber } from '../../types/score'
+import type { Duration, Accidental, ArticulationType, TimeSig, KeySig, VoiceNumber } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
-
-const DURATIONS: { value: Duration; label: string; name: string; desc: string; keys: string }[] = [
-  { value: 'whole', label: 'W', name: 'Whole note', desc: 'Place whole notes.', keys: 'W' },
-  { value: 'half', label: 'H', name: 'Half note', desc: 'Place half notes.', keys: 'H' },
-  { value: 'quarter', label: 'Q', name: 'Quarter note', desc: 'Place quarter notes.', keys: 'Q' },
-  { value: 'eighth', label: '8', name: 'Eighth note', desc: 'Place eighth notes.', keys: 'E / 8' },
-  { value: 'sixteenth', label: '16', name: 'Sixteenth note', desc: 'Place sixteenth notes.', keys: 'X / 6' },
-]
 
 // Tuplet ratio presets: `played` notes in the time of `inSpaceOf`.
 const TUPLET_PRESETS: { played: number; inSpaceOf: number; label: string }[] = [
@@ -25,12 +20,6 @@ const TUPLET_PRESETS: { played: number; inSpaceOf: number; label: string }[] = [
   { played: 5, inSpaceOf: 4, label: 'quintuplet (5:4)' },
   { played: 6, inSpaceOf: 4, label: 'sextuplet (6:4)' },
   { played: 7, inSpaceOf: 8, label: 'septuplet (7:8)' },
-]
-
-const ACCIDENTALS: { value: NonNullable<Accidental>; label: string; name: string; desc: string; keys: string }[] = [
-  { value: 'natural', label: '♮', name: 'Natural', desc: 'Cancel the key signature on placed notes.', keys: 'N' },
-  { value: 'sharp', label: '♯', name: 'Sharp', desc: 'Raise placed notes a semitone.', keys: 'S' },
-  { value: 'flat', label: '♭', name: 'Flat', desc: 'Lower placed notes a semitone.', keys: 'F' },
 ]
 
 /** Rich hover bubble for a dock tool: bold name, keybind chip, one-line description. */
@@ -80,10 +69,15 @@ interface DurationToolbarProps {
   onTupletEntryChange: (v: boolean) => void
   tupletSpec: TupletSpec
   onTupletSpecChange: (s: TupletSpec) => void
+  annotationEntry: boolean
+  onAnnotationEntryChange: (v: boolean) => void
+  onAnnotationPick: (entry: CatalogEntry) => void
   activeVoice: VoiceNumber
   onActiveVoiceChange: (v: VoiceNumber) => void
   selectedAccidental: Accidental
   onAccidentalChange: (a: Accidental) => void
+  selectedArticulation: ArticulationType | null
+  onArticulationChange: (a: ArticulationType | null) => void
   isTieMode: boolean
   onTieModeChange: (v: boolean) => void
   isFillMode: boolean
@@ -126,10 +120,15 @@ export function DurationToolbar({
   onTupletEntryChange,
   tupletSpec,
   onTupletSpecChange,
+  annotationEntry,
+  onAnnotationEntryChange,
+  onAnnotationPick,
   activeVoice,
   onActiveVoiceChange,
   selectedAccidental,
   onAccidentalChange,
+  selectedArticulation,
+  onArticulationChange,
   isTieMode,
   onTieModeChange,
   isFillMode,
@@ -162,21 +161,8 @@ export function DurationToolbar({
   return (
     <div className="flex items-center flex-wrap gap-2">
       <div className="inline-flex items-center gap-2 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
-        {/* Duration group */}
-        <ToggleGroup
-          type="single"
-          value={selectedDuration}
-          onValueChange={(v) => { if (v) onDurationChange(v as Duration) }}
-          className="gap-0.5"
-        >
-          {DURATIONS.map(({ value, label, name, desc, keys }) => (
-            <DockTip key={value} name={name} desc={desc} keys={keys}>
-              <ToggleGroupItem value={value} className={TOGGLE_ITEM_CLASS}>
-                {label}
-              </ToggleGroupItem>
-            </DockTip>
-          ))}
-        </ToggleGroup>
+        {/* Note length — one button that hovers open to the value choices */}
+        <LengthPicker selected={selectedDuration} onChange={onDurationChange} />
 
         <div className="w-px h-5 bg-white/15" />
 
@@ -202,28 +188,31 @@ export function DurationToolbar({
           </Toggle>
         </PolyrhythmPicker>
 
+        {/* Dotted — augmentation dot, sits with rests + polyrhythm */}
+        <DockTip name="Dotted" desc="Add an augmentation dot (×1.5 duration)." keys="D">
+          <Toggle pressed={isDotted} onPressedChange={onDottedChange} className={TOGGLE_ITEM_CLASS}>·</Toggle>
+        </DockTip>
+
+        {/* Annotations — hover for the multi-slide panel (dynamics / ornaments / symbols / text),
+            click an entry to arm, then click the score to spawn the mark. */}
+        <AnnotationPicker onPick={onAnnotationPick}>
+          <Toggle
+            pressed={annotationEntry}
+            onPressedChange={onAnnotationEntryChange}
+            className={TOGGLE_ITEM_CLASS + ' data-[state=on]:bg-violet-500/25 data-[state=on]:text-violet-300'}
+            aria-label="Annotations"
+          >
+            <Plus className="h-4 w-4" />
+          </Toggle>
+        </AnnotationPicker>
+
         <div className="w-px h-5 bg-white/15" />
 
-        {/* Dot + accidentals — one group */}
-        <div className="flex items-center gap-0.5">
-          <DockTip name="Dotted" desc="Add an augmentation dot (×1.5 duration)." keys="D / .">
-            <Toggle pressed={isDotted} onPressedChange={onDottedChange} className={TOGGLE_ITEM_CLASS}>·</Toggle>
-          </DockTip>
-          <ToggleGroup
-            type="single"
-            value={selectedAccidental ?? ''}
-            onValueChange={(v) => onAccidentalChange(v ? (v as NonNullable<Accidental>) : null)}
-            className="gap-0.5"
-          >
-            {ACCIDENTALS.map(({ value, label, name, desc, keys }) => (
-              <DockTip key={value} name={name} desc={desc} keys={keys}>
-                <ToggleGroupItem value={value} className={TOGGLE_ITEM_CLASS + ' text-base'}>
-                  {label}
-                </ToggleGroupItem>
-              </DockTip>
-            ))}
-          </ToggleGroup>
-        </div>
+        {/* Accidentals — one button that hovers open to the accidental choices */}
+        <AccidentalPicker selected={selectedAccidental} onChange={onAccidentalChange} />
+
+        {/* Articulations — sticky picker; applies to a whole event (chord/voice at a beat) */}
+        <ArticulationPicker selected={selectedArticulation} onChange={onArticulationChange} />
 
         <div className="w-px h-5 bg-white/15" />
 
@@ -276,7 +265,7 @@ export function DurationToolbar({
         <div className="relative">
           <DockTip
             name="Select"
-            keys="⇧"
+            keys="S"
             desc={
               <>
                 Drag a box to select notes. Esc to clear.

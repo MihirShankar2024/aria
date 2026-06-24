@@ -1,4 +1,4 @@
-import type { Note, Rest, NoteEvent, TimeSig, KeySig, Clef, Tie, TieCurveOverride, Pitch, VoiceNumber } from '../types/score'
+import type { Note, Rest, NoteEvent, TimeSig, KeySig, Clef, Tie, TieCurveOverride, Pitch, VoiceNumber, Annotation, AnnotationAnchor, TextAnnotationStyle, NoteArticulation, ArticulationType } from '../types/score'
 
 export type ScoreAction =
   | { type: 'ADD_NOTE'; partId: string; measureId: string; note: Note }
@@ -13,6 +13,9 @@ export type ScoreAction =
   // ax = glyph-center X relative to the notehead anchor (absolute; replaces). dy = vertical
   // drag delta (accumulates). Pins the glyph to its notehead so chord edits don't move it.
   | { type: 'UPDATE_GLYPH_OFFSET'; partId: string; measureId: string; noteId: string; pitchIndex: number; kind: 'accidental' | 'dot'; ax: number; dy: number }
+  // Articulation nudge (Sharpshooter). dx = glyph-center X relative to the notehead anchor
+  // (absolute; replaces). dy = vertical drag delta (accumulates). Keyed by articulation type.
+  | { type: 'UPDATE_ARTICULATION_OFFSET'; partId: string; measureId: string; noteId: string; artType: ArticulationType; dx: number; dy: number }
   | { type: 'FILL_MEASURE_RESTS'; partId: string; measureId: string }
   | { type: 'APPLY_MEASURE_NOTES'; edits: { partId: string; measureId: string; notes: NoteEvent[] }[]; removedIds?: string[] }
   | { type: 'UPDATE_NOTE'; partId: string; measureId: string; noteId: string; patch: Partial<Note> }
@@ -58,7 +61,14 @@ export type ScoreAction =
   // `targetRestId` is a reserved placeholder rest the placed event fills *that* slot (click
   // targeted a specific slot); otherwise a fresh tuplet is reserved at `atIndex` and its first
   // slot filled.
-  | { type: 'PLACE_TUPLET_NOTE'; partId: string; measureId: string; voice: VoiceNumber; played: number; inSpaceOf: number; baseDuration: NoteEvent['duration']; baseDots: number; duration: NoteEvent['duration']; dots: number; pitches: Pitch[] | null; noteId: string; atIndex: number; targetRestId?: string }
+  | { type: 'PLACE_TUPLET_NOTE'; partId: string; measureId: string; voice: VoiceNumber; played: number; inSpaceOf: number; baseDuration: NoteEvent['duration']; baseDots: number; duration: NoteEvent['duration']; dots: number; pitches: Pitch[] | null; noteId: string; atIndex: number; targetRestId?: string; articulations?: NoteArticulation[] }
+  // Free-floating expressive marks placed with the Annotations tool (dynamics/ornaments/symbols/text).
+  | { type: 'ADD_ANNOTATION'; partId: string; annotation: Annotation }
+  | { type: 'MOVE_ANNOTATION'; partId: string; id: string; anchor: AnnotationAnchor }
+  | { type: 'STRETCH_ANNOTATION'; partId: string; id: string; endDX: number; endDY: number }
+  | { type: 'SCALE_ANNOTATION'; partId: string; id: string; scaleX: number; scaleY: number }
+  | { type: 'UPDATE_TEXT_ANNOTATION'; partId: string; id: string; text?: string; style?: TextAnnotationStyle }
+  | { type: 'DELETE_ANNOTATION'; partId: string; id: string }
   | { type: 'COMMIT_AI_SUGGESTION'; partId: string; measureNumbers: number[]; musicXML: string }
   | { type: 'UNDO' }
   | { type: 'REDO' }

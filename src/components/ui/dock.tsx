@@ -44,8 +44,8 @@ const DockIconButton = React.forwardRef<HTMLButtonElement, DockIconButtonProps>(
       <Icon className="w-5 h-5 text-foreground" />
       <span
         className={cn(
-          "absolute -top-8 left-1/2 -translate-x-1/2",
-          "px-2 py-1 rounded text-xs",
+          "absolute -top-10 left-1/2 -translate-x-1/2",
+          "px-3 py-1.5 rounded-md text-sm font-medium",
           "bg-popover text-popover-foreground",
           "opacity-0 group-hover:opacity-100",
           "transition-opacity whitespace-nowrap pointer-events-none",

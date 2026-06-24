@@ -6,6 +6,7 @@ import {
   Voice,
   Formatter,
   Accidental as VexAccidental,
+  Articulation,
   Dot,
   Modifier,
   Beam,
@@ -15,7 +16,7 @@ import {
   StaveConnector,
   MetricsDefaults,
 } from 'vexflow'
-import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber, Tuplet as TupletDef } from '../../types/score'
+import type { Measure, Note, Pitch, TimeSig, KeySig, Tie, Clef, NoteEvent, Part, GlyphOffset, VoiceNumber, Tuplet as TupletDef, ArticulationType } from '../../types/score'
 import { measureCapacity, measureBeatCount, occupiedVoices, voiceEvents, effectiveTimeSigAt, eventBeats, displayTupletRatio } from '../beats'
 import { newPitchId } from '../pitch'
 import { computeCurvePlacement } from './curvePlacement'
@@ -280,6 +281,47 @@ function accidentalToVex(acc: Pitch['accidental']): string | null {
   return acc ? (map[acc] ?? null) : null
 }
 
+// Each articulation maps to its real Bravura/SMuFL glyph codepoint. VexFlow's Articulation
+// renders the type via the music font ONLY when it's a codepoint character — a glyph NAME is
+// drawn as literal text ("articStaccatoAbove"). VexFlow's `Glyphs` enum isn't an ESM export,
+// so the codepoints are inlined here (the names are noted alongside). The above/below variants
+// flip the few asymmetric glyphs (fermata, marcato, staccatissimo); symmetric marks reuse one
+// glyph. Keep in sync with ARTICULATIONS in DockPickers.tsx.
+const cp = (code: number): string => String.fromCodePoint(code)
+const ARTICULATION_GLYPHS: Record<ArticulationType, { above: string; below: string }> = {
+  staccato: { above: cp(0xe4a2), below: cp(0xe4a3) }, // articStaccatoAbove / Below
+  tenuto:   { above: cp(0xe4a4), below: cp(0xe4a5) }, // articTenutoAbove / Below
+  accent:   { above: cp(0xe4a0), below: cp(0xe4a1) }, // articAccentAbove / Below
+  marcato:  { above: cp(0xe4ac), below: cp(0xe4ad) }, // articMarcatoAbove / Below
+  fermata:  { above: cp(0xe4c0), below: cp(0xe4c1) }, // fermataAbove / Below
+  spiccato: { above: cp(0xe4a6), below: cp(0xe4a7) }, // articStaccatissimoAbove / Below
+  upBow:    { above: cp(0xe612), below: cp(0xe612) }, // stringsUpBow
+  downBow:  { above: cp(0xe610), below: cp(0xe610) }, // stringsDownBow
+  lhPizz:   { above: cp(0xe633), below: cp(0xe633) }, // pluckedLeftHandPizzicato
+  snapPizz: { above: cp(0xe631), below: cp(0xe630) }, // pluckedSnapPizzicatoAbove / Below
+  open:     { above: cp(0xe614), below: cp(0xe614) }, // stringsHarmonic
+}
+
+// Which side an articulation sits on: fermata always above; otherwise it follows the event's
+// stem side (voice 1 up → above, voice 2 down → below), per notation-engraving-spec §Stem.
+function articulationPosition(event: NoteEvent, type: ArticulationType): number {
+  if (type === 'fermata') return Modifier.Position.ABOVE
+  return event.voice === 2 ? Modifier.Position.BELOW : Modifier.Position.ABOVE
+}
+
+// Attach an event's articulation marks as VexFlow modifiers (in event order, so geometry and
+// offset application can zip back to event.articulations by filtering the modifier list).
+function addArticulations(vn: StaveNote, event: NoteEvent): void {
+  if (!event.articulations) return
+  for (const art of event.articulations) {
+    const pos = articulationPosition(event, art.type)
+    const glyphName = pos === Modifier.Position.BELOW ? ARTICULATION_GLYPHS[art.type].below : ARTICULATION_GLYPHS[art.type].above
+    const mod = new Articulation(glyphName)
+    mod.setPosition(pos)
+    vn.addModifier(mod)
+  }
+}
+
 const GHOST_SLOTS: Array<{ dur: string; beats: number }> = [
   { dur: 'w', beats: 4 },
   { dur: 'h', beats: 2 },
@@ -307,6 +349,7 @@ function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
     const restKey = clef === 'bass' ? 'd/3' : clef === 'alto' ? 'c/4' : 'b/4'
     const vn = new StaveNote({ keys: [restKey], duration: durationToVex(event.duration, event.dots) + 'r', clef })
     if (event.dots > 0) Dot.buildAndAttach([vn], { all: true })
+    addArticulations(vn, event)
     return vn
   }
   const note = event as Note
@@ -323,6 +366,7 @@ function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
     if (vexAcc) vn.addModifier(new VexAccidental(vexAcc), idx)
   })
   if (note.dots > 0) Dot.buildAndAttach([vn], { all: true })
+  addArticulations(vn, note)
   return vn
 }
 
@@ -362,6 +406,30 @@ function applyGlyphOffsets(vn: StaveNote, note: Note): void {
   }
 }
 
+// Pin a manually-moved articulation. Articulations center on the notehead (no LEFT/RIGHT
+// column), so offset.dx is the desired glyph-center X relative to the notehead anchor and
+// offset.dy is an accumulated vertical nudge from the auto position — mirroring pinGlyph.
+function pinArticulation(vn: StaveNote, mod: Articulation, noteheadX: number, offset: GlyphOffset): void {
+  const start = vn.getModifierStartXY(mod.getPosition(), 0)
+  mod.setXShift((noteheadX + offset.dx) - start.x)
+  mod.setYShift(mod.getYShift() + offset.dy)
+}
+
+// The articulation modifiers on a note, in event.articulations order (add order = filter order).
+function articulationModifiers(vn: StaveNote): Articulation[] {
+  return vn.getModifiers().filter((m): m is Articulation => m instanceof Articulation)
+}
+
+// Apply stored articulation offsets. Call alongside applyGlyphOffsets (pre-draw). Works for
+// notes and rests since articulations live on the event, not a pitch.
+function applyArticulationOffsets(vn: StaveNote, event: NoteEvent): void {
+  const arts = event.articulations
+  if (!arts) return
+  const noteheadX = vn.getAbsoluteX()
+  const mods = articulationModifiers(vn)
+  arts.forEach((art, i) => { if (art.offset && mods[i]) pinArticulation(vn, mods[i], noteheadX, art.offset) })
+}
+
 // Read the drawn center of each accidental/dot glyph for drag-handle placement. Call after
 // voice.draw() so bounding boxes reflect the rendered (and nudged) positions.
 function collectGlyphGeometry(vn: StaveNote, note: Note, out: GlyphGeometry[]): void {
@@ -373,6 +441,20 @@ function collectGlyphGeometry(vn: StaveNote, note: Note, out: GlyphGeometry[]): 
     const bb = mod.getBoundingBox()
     out.push({ noteId: note.id, pitchIndex: idx, kind, x: bb.getX() + bb.getW() / 2, y: bb.getY() + bb.getH() / 2, w: bb.getW(), h: bb.getH() })
   }
+}
+
+// Read the drawn center of each articulation glyph (notes and rests) for Sharpshooter/Broom
+// handles. Keyed by articulation type rather than pitch index. Call after voice.draw().
+function collectArticulationGeometry(vn: StaveNote, event: NoteEvent, out: GlyphGeometry[]): void {
+  const arts = event.articulations
+  if (!arts) return
+  const mods = articulationModifiers(vn)
+  arts.forEach((art, i) => {
+    const mod = mods[i]
+    if (!mod) return
+    const bb = mod.getBoundingBox()
+    out.push({ noteId: event.id, pitchIndex: -1, kind: 'articulation', artType: art.type, x: bb.getX() + bb.getW() / 2, y: bb.getY() + bb.getH() / 2, w: bb.getW(), h: bb.getH() })
+  })
 }
 
 // Detect accidental glyphs that intrude into any notehead zone of the same chord.
@@ -610,8 +692,11 @@ function formatDrawCollect(
       Beam.generateBeams(seg, multi ? { stemDirection: voiceNumbers[vi] === 1 ? Stem.UP : Stem.DOWN } : undefined),
     ),
   )
-  // Apply manual accidental/dot nudges on top of auto layout before drawing.
-  events.forEach((ev, k) => { if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev) })
+  // Apply manual accidental/dot/articulation nudges on top of auto layout before drawing.
+  events.forEach((ev, k) => {
+    if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev)
+    applyArticulationOffsets(realNotes[k], ev)
+  })
   voices.forEach(v => v.draw(ctx, stave))
   beams.forEach(b => b.setContext(ctx).draw())
   // Tuplet brackets/numbers ride on top of the formatted notes and beams.
@@ -640,6 +725,7 @@ function formatDrawCollect(
       collectGlyphGeometry(vn, ev, out.glyphGeometry)
       collectIntraChordAccidentalConflicts(vn, ev, idx, out.intraChordConflicts)
     }
+    collectArticulationGeometry(vn, ev, out.glyphGeometry)
   })
 }
 
@@ -680,8 +766,9 @@ export interface TempoMarkGeometry {
 // when adjusting it. Center point in SVG px (same space as NoteGeometry).
 export interface GlyphGeometry {
   noteId: string
-  pitchIndex: number
-  kind: 'accidental' | 'dot'
+  pitchIndex: number          // pitch the accidental/dot belongs to; -1 for articulations
+  kind: 'accidental' | 'dot' | 'articulation'
+  artType?: ArticulationType  // set when kind === 'articulation'
   x: number
   y: number
   w?: number

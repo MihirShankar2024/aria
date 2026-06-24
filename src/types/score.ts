@@ -26,6 +26,19 @@ export interface Pitch {
   dotOffset?: GlyphOffset          // manual nudge of this pitch's dot(s)
 }
 
+/** Articulation marks. Attach to a whole event (a chord / all notes of one voice at a beat),
+ *  not a single pitch. Multiple may stack on one event (e.g. staccato + accent). */
+export type ArticulationType =
+  | 'staccato' | 'tenuto' | 'fermata' | 'accent' | 'marcato'
+  | 'spiccato' | 'upBow' | 'downBow' | 'lhPizz' | 'snapPizz' | 'open'
+
+/** One articulation mark on an event. `offset` is a manual Sharpshooter nudge (like
+ *  `accidentalOffset`); once set the glyph is fully user-controlled. */
+export interface NoteArticulation {
+  type: ArticulationType
+  offset?: GlyphOffset
+}
+
 export interface Note {
   id: string
   type: 'note'
@@ -34,6 +47,7 @@ export interface Note {
   dots: number
   tied: boolean
   voice: VoiceNumber
+  articulations?: NoteArticulation[]   // event-level marks; set has at most one entry per type
 }
 
 export interface Rest {
@@ -42,6 +56,7 @@ export interface Rest {
   duration: Duration
   dots: number
   voice: VoiceNumber
+  articulations?: NoteArticulation[]   // event-level marks (e.g. fermata over a rest)
 }
 
 export type NoteEvent = Note | Rest
@@ -122,6 +137,61 @@ export interface Tie {
   curve?: TieCurveOverride  // manual drag adjustments, if any
 }
 
+/**
+ * A free-floating expressive mark (dynamic, ornament, engraving symbol, or text) placed by
+ * the user with the Annotations tool. Pinned to a measure by `measureId` + pixel offset so it
+ * travels with that measure when the score reflows. Stored at the Part level like `ties`.
+ */
+export interface AnnotationAnchor {
+  measureId: string   // measure the mark is pinned to (resolved to current x via layout)
+  dx: number          // px from the measure's left edge (layout.measures[i].x)
+  dy: number          // px from the staff top (staveY) — vertical position
+}
+
+/** A glyph mark drawn with one or more Bravura/SMuFL codepoints (dynamics, ornaments, single symbols). */
+export interface GlyphAnnotation {
+  id: string
+  kind: 'glyph'
+  glyph: string            // SMuFL codepoint string (may be composed of several, e.g. "sfz")
+  symbolId: string         // catalog key, e.g. 'dyn.sfz', 'orn.trill', 'sym.coda'
+  anchor: AnnotationAnchor
+  scale?: number           // base size multiplier (default 1)
+  scaleX?: number          // sharpshooter horizontal stretch (default 1)
+  scaleY?: number          // sharpshooter vertical stretch (default 1; arpeggio height, repeat-sign size)
+}
+
+export type LineAnnotationType =
+  | 'gliss' | 'trillExt' | 'cresc' | 'decresc' | 'ottava8va'
+  | 'ottava8vb' | 'ending1' | 'ending2' | 'pedalBracket'
+
+/** A stretchable line/bracket mark with two free endpoints (hairpins, 8va, endings, pedal, gliss). */
+export interface LineAnnotation {
+  id: string
+  kind: 'line'
+  lineType: LineAnnotationType
+  anchor: AnnotationAnchor  // start endpoint (measure-anchored)
+  endDX: number             // end endpoint, px from the SAME measure's left edge
+  endDY: number             // end endpoint, px from the staff top
+}
+
+export interface TextAnnotationStyle {
+  fontFamily: string
+  fontSize: number
+  bold: boolean
+  italic: boolean
+}
+
+/** A free editable text mark. */
+export interface TextAnnotation {
+  id: string
+  kind: 'text'
+  text: string
+  anchor: AnnotationAnchor
+  style: TextAnnotationStyle
+}
+
+export type Annotation = GlyphAnnotation | LineAnnotation | TextAnnotation
+
 export interface Part {
   id: string
   name: string
@@ -129,6 +199,7 @@ export interface Part {
   clef: Clef
   measures: Measure[]
   ties?: Tie[]
+  annotations?: Annotation[]    // free-floating expressive marks placed with the Annotations tool
   grandStaffPartnerId?: string  // ID of the linked part (piano: treble ↔ bass)
 }
 

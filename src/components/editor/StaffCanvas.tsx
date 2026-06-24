@@ -15,8 +15,14 @@ import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { diatonicStep, writtenPitchToConcert, concertPitchToWritten, transposeMeasuresForDisplay, transposeKeySigForDisplay } from '../../lib/transposition/transpose'
 import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
-import type { Measure, TimeSig, KeySig, Duration, Accidental, Tie, Clef, Note, NoteEvent, VoiceNumber, Pitch } from '../../types/score'
+import type { Measure, TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Tie, Clef, Note, NoteEvent, VoiceNumber, Pitch, Annotation } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
+import { AnnotationsLayer } from './AnnotationsLayer'
+import { annotationBounds, rectHit } from '../../lib/annotations/geometry'
+import { buildAnnotation } from './annotationSpawn'
+import type { CatalogEntry } from '../../lib/annotations/catalog'
+
+const EMPTY_ANNOTATIONS: Annotation[] = []
 
 const STAVE_Y = 48
 const DOT_R = 7
@@ -71,6 +77,7 @@ interface StaffCanvasProps {
   dispatch: (action: ScoreAction) => void
   selectedDuration: Duration
   selectedAccidental: Accidental
+  selectedArticulation: ArticulationType | null
   isDotted: boolean
   isRest: boolean
   activeVoice?: VoiceNumber
@@ -84,6 +91,12 @@ interface StaffCanvasProps {
   /** When true, placed notes flow into a reserved tuplet of `tupletSpec` (polyrhythm entry). */
   tupletEntry?: boolean
   tupletSpec?: TupletSpec
+  /** Free-floating expressive marks for this part + the armed Annotations tool state. */
+  annotations?: Annotation[]
+  annotationEntry?: boolean
+  selectedAnnotation?: CatalogEntry | null
+  editingAnnotationId?: string | null
+  onAnnotationSpawned?: (id: string | null) => void
   /** When true (default), placing a note in keyboard mode advances the cursor to the next
    * beat; when false, the cursor stays on the note just placed. */
   advanceOnPlace?: boolean
@@ -136,11 +149,12 @@ interface TieDrag {
 
 // An auxiliary glyph (accidental/dot) or tie swept by the broom, removed on release.
 type BroomTarget =
-  | { kind: 'glyph'; key: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot'; x: number; y: number }
+  | { kind: 'glyph'; key: string; noteId: string; pitchIndex: number; glyphKind: 'accidental' | 'dot' | 'articulation'; artType?: ArticulationType; x: number; y: number }
   | { kind: 'tie'; key: string; tieId: string; x: number; y: number }
   | { kind: 'keySig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
   | { kind: 'timeSig'; key: string; measureIndex: number; measureNumber: number; x: number; y: number }
   | { kind: 'tempo'; key: string; measureNumber: number; x: number; y: number }
+  | { kind: 'annotation'; key: string; annotationId: string; x: number; y: number; w: number; h: number }
 
 export function StaffCanvas({
   partId,
@@ -153,6 +167,7 @@ export function StaffCanvas({
   dispatch,
   selectedDuration,
   selectedAccidental,
+  selectedArticulation,
   isDotted,
   isRest,
   activeVoice = 1,
@@ -165,6 +180,11 @@ export function StaffCanvas({
   isSharpshooterMode = false,
   tupletEntry = false,
   tupletSpec = { played: 3, inSpaceOf: 2, baseDuration: 'eighth' },
+  annotations = EMPTY_ANNOTATIONS,
+  annotationEntry = false,
+  selectedAnnotation = null,
+  editingAnnotationId = null,
+  onAnnotationSpawned,
   advanceOnPlace = true,
   initialTempo,
   tempoChanges = [],
@@ -313,7 +333,7 @@ export function StaffCanvas({
   // Re-render the grey cursor ghost only when the selected note params change.
   // Suppressed in every non-placement mode (no held note to preview there).
   useEffect(() => {
-    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode) {
+    if (isTieMode || isDeleteMode || isBroomMode || isInsertMode || isSelectMode || isFillMode || isSharpshooterMode || annotationEntry) {
       setGhost(null)
       return
     }
@@ -329,7 +349,7 @@ export function StaffCanvas({
     })
     setGhost(nextGhost)
   }, [selectedDuration, isDotted, selectedAccidental, isRest, clef, timeSig, keySig, activeVoice,
-      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode])
+      isTieMode, isDeleteMode, isBroomMode, isInsertMode, isSelectMode, isFillMode, isSharpshooterMode, annotationEntry])
 
   // After a reflow (e.g. first note in a bar, or adding a chord tone) a note's
   // visual center shifts. If the keyboard cursor is anchored to that note, snap its
@@ -673,9 +693,21 @@ export function StaffCanvas({
     return { noteId: note.id, pitchId: pitch.id, x: note.xs[bi] ?? note.x, y: note.ys[bi] ?? note.y }
   }
 
-  // Apply the active modifier tool(s) — dot and/or accidental — to an existing note.
-  // The accidental lands on the chord tone at the clicked staff position. onNotePlaced
-  // then clears the tool selection (so it doesn't carry to the next placement).
+  // The sticky articulation as a fresh single-mark list for a new event (undefined when none).
+  const selArt = (): NoteArticulation[] | undefined =>
+    selectedArticulation ? [{ type: selectedArticulation }] : undefined
+
+  // Toggle the sticky articulation in an event's set (stacking: add if absent, remove if present).
+  const toggledArticulations = (cur: NoteArticulation[] | undefined): NoteArticulation[] => {
+    const list = cur ?? []
+    return list.some(a => a.type === selectedArticulation)
+      ? list.filter(a => a.type !== selectedArticulation)
+      : [...list, { type: selectedArticulation! }]
+  }
+
+  // Apply the active modifier tool(s) — dot, accidental, and/or articulation — to an existing
+  // note. The accidental lands on the chord tone at the clicked staff position; the articulation
+  // toggles on the whole event. onNotePlaced clears dot/accidental (articulation is sticky).
   const applyModifierToExistingNote = (target: NoteGeometry, clickY: number, pitchIndex?: number) => {
     const measure = measures[target.measureIndex]
     if (!measure) return
@@ -683,6 +715,7 @@ export function StaffCanvas({
     if (!ev || ev.type !== 'note') return
     const patch: Partial<Note> = {}
     if (isDotted) patch.dots = 1
+    if (selectedArticulation !== null) patch.articulations = toggledArticulations(ev.articulations)
     if (selectedAccidental !== null) {
       if (pitchIndex !== undefined && ev.pitches[pitchIndex]) {
         patch.pitches = ev.pitches.map((p, i) =>
@@ -758,9 +791,9 @@ export function StaffCanvas({
     let added = false
     for (const g of layout.glyphs) {
       if (Math.hypot(g.x - x, g.y - y) > BRUSH_R) continue
-      const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}`
+      const key = `g:${g.noteId}:${g.pitchIndex}:${g.kind}:${g.artType ?? ''}`
       if (broomRef.current.has(key)) continue
-      broomRef.current.set(key, { kind: 'glyph', key, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, x: g.x, y: g.y })
+      broomRef.current.set(key, { kind: 'glyph', key, noteId: g.noteId, pitchIndex: g.pitchIndex, glyphKind: g.kind, artType: g.artType, x: g.x, y: g.y })
       added = true
     }
     for (const geo of layout.ties) {
@@ -792,6 +825,19 @@ export function StaffCanvas({
       broomRef.current.set(key, { kind: 'tempo', key, measureNumber: tm.measureNumber, x: tmBroomX, y: tmBroomY })
       added = true
     }
+    // Annotations (dynamics / ornaments / symbols / text). Register when the brush touches
+    // anywhere within the mark's full bounding box, and highlight that whole area.
+    for (const ann of annotations) {
+      const idx = measures.findIndex(m => m.id === ann.anchor.measureId)
+      const g = idx >= 0 ? layout.measures[idx] : undefined
+      if (!g) continue
+      const r = annotationBounds(ann, g.x, STAVE_Y)
+      if (!rectHit(r, x, y, BRUSH_R)) continue
+      const key = `a:${ann.id}`
+      if (broomRef.current.has(key)) continue
+      broomRef.current.set(key, { kind: 'annotation', key, annotationId: ann.id, x: r.x, y: r.y, w: r.w, h: r.h })
+      added = true
+    }
     if (added) setBroomMarks([...broomRef.current.values()])
   }
 
@@ -804,7 +850,7 @@ export function StaffCanvas({
     if (targets.length === 0) return
     // Group glyph removals per note so one note's accidental + dot collapse into a
     // single patch built off its current pitches/dots.
-    const glyphsByNote = new Map<string, BroomTarget[]>()
+    const glyphsByNote = new Map<string, Extract<BroomTarget, { kind: 'glyph' }>[]>()
     for (const t of targets) {
       if (t.kind !== 'glyph') continue
       const arr = glyphsByNote.get(t.noteId) ?? []
@@ -814,12 +860,17 @@ export function StaffCanvas({
       const measureId = measureIdForNote(noteId)
       if (!measureId) continue
       const note = measures.flatMap(m => m.notes).find(n => n.id === noteId)
-      if (!note || note.type !== 'note') continue
+      if (!note) continue
       const patch: Partial<Note> = {}
-      if (gs.some(g => g.kind === 'glyph' && g.glyphKind === 'dot')) patch.dots = 0
-      const accIdx = new Set(gs.filter(g => g.kind === 'glyph' && g.glyphKind === 'accidental').map(g => (g as { pitchIndex: number }).pitchIndex))
-      if (accIdx.size > 0) {
-        patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+      // Articulations live on the event (note or rest); strip the swept types.
+      const artTypes = new Set(gs.filter(g => g.glyphKind === 'articulation').map(g => g.artType))
+      if (artTypes.size > 0 && note.articulations) patch.articulations = note.articulations.filter(a => !artTypes.has(a.type))
+      if (note.type === 'note') {
+        if (gs.some(g => g.glyphKind === 'dot')) patch.dots = 0
+        const accIdx = new Set(gs.filter(g => g.glyphKind === 'accidental').map(g => g.pitchIndex))
+        if (accIdx.size > 0) {
+          patch.pitches = note.pitches.map((p, i) => accIdx.has(i) ? { ...p, accidental: null, accidentalOffset: undefined } : p)
+        }
       }
       if (Object.keys(patch).length) dispatch({ type: 'UPDATE_NOTE', partId, measureId, noteId, patch })
     }
@@ -834,6 +885,7 @@ export function StaffCanvas({
       }
       if (t.kind === 'timeSig') dispatch({ type: 'CLEAR_MEASURE_TIME_SIG', measureNumber: t.measureNumber })
       if (t.kind === 'tempo') dispatch({ type: 'REMOVE_MEASURE_TEMPO', measureNumber: t.measureNumber })
+      if (t.kind === 'annotation') dispatch({ type: 'DELETE_ANNOTATION', partId, id: t.annotationId })
     }
   }
 
@@ -1048,7 +1100,7 @@ export function StaffCanvas({
       const measureId = g ? measureIdForNote(g.noteId) : null
       if (g && measureId) {
         setGlyphEdit({
-          partId, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind,
+          partId, measureId, noteId: g.noteId, pitchIndex: g.pitchIndex, kind: g.kind, artType: g.artType,
           downX: coords.x, downY: coords.y, curX: coords.x, curY: coords.y,
         })
         return
@@ -1081,11 +1133,19 @@ export function StaffCanvas({
       setGlyphEdit(null)
       suppressClickRef.current = true
       if (note && moved) {
-        dispatch({
-          type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
-          noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind,
-          ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
-        })
+        if (glyphEdit.kind === 'articulation' && glyphEdit.artType) {
+          dispatch({
+            type: 'UPDATE_ARTICULATION_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+            noteId: glyphEdit.noteId, artType: glyphEdit.artType,
+            dx: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+          })
+        } else {
+          dispatch({
+            type: 'UPDATE_GLYPH_OFFSET', partId: glyphEdit.partId, measureId: glyphEdit.measureId,
+            noteId: glyphEdit.noteId, pitchIndex: glyphEdit.pitchIndex, kind: glyphEdit.kind as 'accidental' | 'dot',
+            ax: coords.x - note.x, dy: coords.y - glyphEdit.downY,
+          })
+        }
       }
       return
     }
@@ -1146,6 +1206,17 @@ export function StaffCanvas({
   const placeAt = (x: number, y: number, forceNew = false, altKey = false): string | null => {
     placementAppendedRef.current = false
     if (measures.length === 0) return null
+    // Annotations tool: drop the armed mark at the click, anchored to the measure under it.
+    if (annotationEntry && selectedAnnotation) {
+      const idx = getMeasureIndexAtX(x)
+      const measure = measures[idx]
+      const g = layoutRef.current?.measures[idx]
+      if (!measure || !g) return null
+      const { annotation, edit } = buildAnnotation(selectedAnnotation, measure.id, x - g.x, y - STAVE_Y)
+      dispatch({ type: 'ADD_ANNOTATION', partId, annotation })
+      onAnnotationSpawned?.(edit ? annotation.id : null)
+      return annotation.id
+    }
     // Alt cycles down to the lower voice (voice 2); otherwise the toolbar's active voice.
     const targetVoice: VoiceNumber = altKey ? 2 : activeVoice
     const stepsDown = Math.round((y - STAVE_TOP_Y) / (LINE_SPACING / 2))
@@ -1171,7 +1242,7 @@ export function StaffCanvas({
       dispatch({
         type: 'PLACE_TUPLET_NOTE', partId, measureId: measure.id, voice: targetVoice,
         played: tupletSpec.played, inSpaceOf: tupletSpec.inSpaceOf, baseDuration: tupletSpec.baseDuration, baseDots: 0,
-        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId,
+        duration: selectedDuration, dots: isDotted ? 1 : 0, pitches, noteId: newId, atIndex, targetRestId, articulations: selArt(),
       })
       onNotePlaced?.()
       return newId
@@ -1179,7 +1250,7 @@ export function StaffCanvas({
     // Dot/accidental tool: apply to an existing note when aimed at one of its tones.
     // 1) precise notehead hit; 2) chord column + same staff line/space as a chord tone.
     // Otherwise fall through (e.g. chord column on a new line → ADD_CHORD_NOTE below).
-    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null)) {
+    if (!forceNew && !isRest && (isDotted || selectedAccidental !== null || selectedArticulation !== null)) {
       const hit = noteHeadAt(x, snapY)
       if (hit) {
         applyModifierToExistingNote(hit.note, snapY, hit.pitchIndex); return hit.note.id
@@ -1219,7 +1290,7 @@ export function StaffCanvas({
           const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
           dispatch({
             type: 'INSERT_EVENTS', partId, measureId: measure.id, index: insertIdx,
-            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice }],
+            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() }],
           })
           onNotePlaced?.()
           return newId
@@ -1239,7 +1310,7 @@ export function StaffCanvas({
             partId,
             measureId: measure.id,
             restId: nearRest.id,
-            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice },
+            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() },
           })
           onNotePlaced?.()
           return newId
@@ -1260,7 +1331,7 @@ export function StaffCanvas({
             partId,
             measureId: measure.id,
             eventId: nearNote.id,
-            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice },
+            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() },
           })
           onNotePlaced?.()
           return newId
@@ -1280,12 +1351,12 @@ export function StaffCanvas({
     pendingCenterRef.current = idx
     const newId = crypto.randomUUID()
     if (isRest) {
-      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice } })
+      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() } })
       onNotePlaced?.()
     } else {
       const pitch = staffYToPitch(snapY, STAVE_Y, clef)
       const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
-      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice } })
+      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() } })
       onNotePlaced?.()
     }
     return newId
@@ -1501,6 +1572,22 @@ export function StaffCanvas({
     >
       <div className="relative inline-block">
         <div ref={containerRef} />
+
+        {layout && (
+          <AnnotationsLayer
+            partId={partId}
+            annotations={annotations}
+            measureX={mId => {
+              const i = measures.findIndex(m => m.id === mId)
+              return i >= 0 && layout.measures[i] ? layout.measures[i].x : null
+            }}
+            staveY={STAVE_Y}
+            isSharpshooterMode={isSharpshooterMode}
+            editingId={editingAnnotationId}
+            setEditingId={id => onAnnotationSpawned?.(id)}
+            dispatch={dispatch}
+          />
+        )}
 
         {measureOverlays}
         {tempoOverlays}
@@ -1790,7 +1877,7 @@ export function StaffCanvas({
         {/* Accidental/dot adjust handles — only for glyphs in the hovered measure, so they
             don't clutter the rest of the staff. The glyph being dragged follows the cursor. */}
         {isSharpshooterMode && layout?.glyphs.map(g => {
-          const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind
+          const editing = glyphEdit?.noteId === g.noteId && glyphEdit?.pitchIndex === g.pitchIndex && glyphEdit?.kind === g.kind && glyphEdit?.artType === g.artType
           const note = layout.notes.find(n => n.id === g.noteId)
           const hovered = note != null && hoverMeasure === note.measureIndex
           if (!editing && !hovered) return null
@@ -1853,6 +1940,9 @@ export function StaffCanvas({
               }
               if (t.kind === 'tempo') {
                 return <rect key={t.key} x={t.x - 30} y={t.y - 10 + BROOM_TEMPO_DY} width={60} height={20} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
+              }
+              if (t.kind === 'annotation') {
+                return <rect key={t.key} x={t.x} y={t.y} width={t.w} height={t.h} rx={4} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
               }
               return <circle key={t.key} cx={t.x} cy={t.y} r={9} fill={hl} stroke={hlStroke} strokeWidth={1.5} />
             })}
@@ -1947,6 +2037,7 @@ export function StaffCanvas({
           clef={clef}
           selectedDuration={selectedDuration}
           selectedAccidental={selectedAccidental}
+          selectedArticulation={selectedArticulation}
           isDotted={isDotted}
           isRest={isRest}
           onCommit={commitInsert}

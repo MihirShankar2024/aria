@@ -3,7 +3,7 @@ import { Check, X } from 'lucide-react'
 import { renderStaff, type StaffLayout, type NoteGeometry, STAFF_HEIGHT } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
 import { noteBeatDuration } from '../../lib/beats'
-import type { Measure, TimeSig, KeySig, Duration, Accidental, Clef, NoteEvent, Pitch } from '../../types/score'
+import type { Measure, TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Clef, NoteEvent, Pitch } from '../../types/score'
 
 const STAVE_Y = 48
 const DOT_R = 7
@@ -37,6 +37,7 @@ interface InsertStaffProps {
   clef: Clef
   selectedDuration: Duration
   selectedAccidental: Accidental
+  selectedArticulation: ArticulationType | null
   isDotted: boolean
   isRest: boolean
   onCommit: (events: NoteEvent[]) => void
@@ -60,6 +61,7 @@ export function InsertStaff({
   clef,
   selectedDuration,
   selectedAccidental,
+  selectedArticulation,
   isDotted,
   isRest,
   onCommit,
@@ -195,12 +197,13 @@ export function InsertStaff({
     if (beats + noteBeatDuration(candidate) > capacity + EPS) { onPlaceFailed?.(); return null }
 
     const newId = crypto.randomUUID()
+    const articulations: NoteArticulation[] | undefined = selectedArticulation ? [{ type: selectedArticulation }] : undefined
     if (isRest) {
-      setScratch(s => [...s, { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: 1 }])
+      setScratch(s => [...s, { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: 1, articulations }])
     } else {
       const pitch = staffYToPitch(y, STAVE_Y, clef)
       const finalPitch = selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
-      setScratch(s => [...s, { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: 1 }])
+      setScratch(s => [...s, { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: 1, articulations }])
     }
     return newId
   }

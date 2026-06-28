@@ -1,44 +1,11 @@
 import * as Tone from 'tone'
-import type { Score, Note, NoteEvent, Pitch, NoteName, Measure, KeySig, Tuplet } from '../../types/score'
+import type { Score, Note, NoteEvent, Tuplet } from '../../types/score'
 import { loadSoundFont } from './soundfonts'
 import { effectiveTimeSigAt, eventBeats, measureCapacity } from '../beats'
+import { resolvePartAccidentals } from '../accidentals'
 
 const NOTE_MIDI: Record<string, number> = {
   C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11,
-}
-
-// Standard order accidentals are added by a key signature.
-const SHARP_ORDER: NoteName[] = ['F', 'C', 'G', 'D', 'A', 'E', 'B']
-const FLAT_ORDER: NoteName[]  = ['B', 'E', 'A', 'D', 'G', 'C', 'F']
-
-// fifths → per-letter semitone offset implied by the key signature.
-// e.g. D major (fifths 2) → { F: +1, C: +1 }.
-function keySigOffsets(fifths: number): Partial<Record<NoteName, number>> {
-  const map: Partial<Record<NoteName, number>> = {}
-  if (fifths > 0) for (let i = 0; i < fifths; i++) map[SHARP_ORDER[i]] = 1
-  else for (let i = 0; i < -fifths; i++) map[FLAT_ORDER[i]] = -1
-  return map
-}
-
-// Semitone offset of a written accidental. Natural cancels to 0.
-function explicitOffset(acc: Pitch['accidental']): number {
-  switch (acc) {
-    case 'double_sharp': return 2
-    case 'sharp': return 1
-    case 'natural': return 0
-    case 'flat': return -1
-    case 'double_flat': return -2
-    default: return 0
-  }
-}
-
-// Most recent keySig override at/before idx, else global. Mirrors the renderer's
-// effectiveKeySigAt so playback matches what's drawn.
-function effectiveKeySig(measures: Measure[], idx: number, global: KeySig): KeySig {
-  for (let i = idx; i >= 0; i--) {
-    if (measures[i]?.keySig) return measures[i].keySig!
-  }
-  return global
 }
 
 // Sounded seconds for an event, including any tuplet scaling (a triplet member sounds
@@ -97,16 +64,9 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
     const scheduled: ScheduledNote[] = []
     let absTime = 0
 
-    // A tie continuation note (the `to`) inherits the sounding pitch of its
-    // `from`, even across a barline where the accidental isn't re-written.
-    // Keyed by note id (ties are per-notehead now; accidental carry is matched below by
-    // pitch identity, so a slur to a different pitch still won't inherit anything).
-    const tieFromOf = new Map<string, string>()
-    for (const tie of part.ties ?? []) tieFromOf.set(tie.to.note, tie.from.note)
-    // note id → resolved accidental offset per `${step}${octave}`. We carry the
-    // *accidental* across a tie, keyed by pitch identity, so only a genuine tie
-    // (same letter + octave) inherits it — a slur to a different pitch does not.
-    const resolvedNoteOffsets = new Map<string, Map<string, number>>()
+    // Sounding accidental per notehead (key sig + measure carry + tie carry), resolved once
+    // so playback, rendering, and serialization all derive the same pitch. Keyed by Pitch.id.
+    const resolved = resolvePartAccidentals(part.measures, part.ties, score.globalKeySig)
 
     for (let mIdx = 0; mIdx < measureCount; mIdx++) {
       // Effective time sig: most recent override at/before this measure, else global.
@@ -115,49 +75,24 @@ export async function buildAndPlayScore(score: Score, onStop?: () => void, selec
       const measureNum = measure?.number ?? (mIdx + 1)
       const tempo    = getEffectiveTempo(score, measureNum)
 
-      // Active key signature for this measure.
-      const keyMap = keySigOffsets(effectiveKeySig(part.measures, mIdx, score.globalKeySig).fifths)
-
       // Quarter-note beats per bar (NOT timeSig.beats — that's the numerator, which is
       // eighths in 6/8). measureCapacity gives (beats/beatType)*4, matching eventBeats' units.
       const measureDuration = measureCapacity(timeSig) * (60 / tempo)
       const measureStart = absTime
       if (measure && measure.notes.length > 0) {
         // Each voice is an independent timeline that starts at the barline, so they
-        // sound concurrently. Accidental memory is per-measure AND per-voice (the spec
-        // forbids accidental leakage between voices), so it resets for each voice.
+        // sound concurrently.
         for (const voice of [1, 2] as const) {
           const voiceNotes = measure.notes.filter(e => e.voice === voice)
           if (voiceNotes.length === 0) continue
-          const measureAcc = new Map<string, number>()  // `${step}${octave}` → semitone offset
           let voiceTime = measureStart
           for (const event of voiceNotes) {
             const dur = eventDurationSeconds(event, tempo, measure.tuplets)
             if (event.type === 'note') {
-              const fromId = tieFromOf.get(event.id)
-              const fromOffsets = fromId ? resolvedNoteOffsets.get(fromId) : undefined
-              const offsets = new Map<string, number>()
               const midis = event.pitches.map(pitch => {
-                const memKey = `${pitch.step}${pitch.octave}`
-                let offset: number
-                if (pitch.accidental !== null) {
-                  offset = explicitOffset(pitch.accidental)
-                  measureAcc.set(memKey, offset)
-                } else if (measureAcc.has(memKey)) {
-                  offset = measureAcc.get(memKey)!
-                } else if (fromOffsets?.has(memKey)) {
-                  // Genuine tie continuation (same letter + octave, no written
-                  // accidental): carry the from-note's accidental. Per spec this does
-                  // NOT establish accidental memory for later notes, so don't set
-                  // measureAcc here. A slur to a different pitch won't match memKey.
-                  offset = fromOffsets.get(memKey)!
-                } else {
-                  offset = keyMap[pitch.step] ?? 0
-                }
-                offsets.set(memKey, offset)
+                const offset = resolved.get(pitch.id) ?? 0
                 return (pitch.octave + 1) * 12 + NOTE_MIDI[pitch.step] + offset
               })
-              resolvedNoteOffsets.set(event.id, offsets)
               if (!selectedNoteIds || selectedNoteIds.size === 0 || selectedNoteIds.has(event.id)) {
                 scheduled.push({ note: event, time: voiceTime, duration: dur, tempo, midis })
               }

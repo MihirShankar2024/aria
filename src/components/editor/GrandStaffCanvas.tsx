@@ -21,8 +21,7 @@ import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEdit
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
-import { diatonicStep } from '../../lib/transposition/transpose'
-import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
+import { selKey, selectionByEvent, isPitchSelected, type SelectionDrag } from './noteSelection'
 import type { TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Part, Note, NoteEvent, VoiceNumber, Pitch, Annotation } from '../../types/score'
 import { AnnotationsLayer } from './AnnotationsLayer'
 import { annotationBounds, rectHit } from '../../lib/annotations/geometry'
@@ -136,6 +135,14 @@ interface GrandStaffCanvasProps {
   isSelectMode?: boolean
   selectedNoteIds?: Set<string>
   onSelectionChange?: (ids: Set<string>) => void
+  // Cross-track rubber band shared across canvases (see StaffCanvas / ScoreEditor).
+  selectionDrag?: SelectionDrag | null
+  onSelectDragStart?: (clientX: number, clientY: number) => void
+  onSelectContribute?: (sourceId: string, keys: Set<string>) => void
+  onMoveSelectionSteps?: (deltaSteps: number, keys: string[]) => void
+  moveDragKeys?: Set<string>
+  moveDragSteps?: number
+  onMoveDragActive?: (keys: Set<string> | null, steps: number) => void
   onNotePlaced?: () => void
   onTieComplete?: () => void
   onFillComplete?: () => void
@@ -180,6 +187,13 @@ export function GrandStaffCanvas({
   isSelectMode = false,
   selectedNoteIds,
   onSelectionChange,
+  selectionDrag,
+  onSelectDragStart,
+  onSelectContribute,
+  onMoveSelectionSteps,
+  moveDragKeys,
+  moveDragSteps,
+  onMoveDragActive,
   onNotePlaced,
   onTieComplete,
   onFillComplete,
@@ -204,11 +218,13 @@ export function GrandStaffCanvas({
   const [insertHover, setInsertHover] = useState<InsertSession | null>(null)
   const [insertSession, setInsertSession] = useState<InsertSession | null>(null)
   const [scrollLeft, setScrollLeft] = useState(0)
-  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
-  const isSelectingRef = useRef(false)
   // Drag-move of selected notes in select mode (started on a notehead). deltaSteps is
   // the snapped vertical staff-position offset (down = positive) since the press.
   const [moveDrag, setMoveDrag] = useState<{ keys: string[]; hitKey: string; startY: number; deltaSteps: number } | null>(null)
+  // Broadcast this canvas's active drag up so every track previews the move together.
+  useEffect(() => {
+    onMoveDragActive?.(moveDrag ? new Set(moveDrag.keys) : null, moveDrag ? moveDrag.deltaSteps : 0)
+  }, [moveDrag, onMoveDragActive])
   // Grey "held note/rest" glyph that rides the cursor in placement mode.
   const [ghost, setGhost] = useState<GhostRender | null>(null)
   const [keyboardCursor, setKeyboardCursor] = useState<KeyboardCursor | null>(null)
@@ -757,18 +773,20 @@ export function GrandStaffCanvas({
     }
   }
 
-  const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
-    isSelectingRef.current = false
-    setSelectionBox(null)
-    if (!layout) return
-    const minX = Math.min(box.startX, box.endX)
-    const maxX = Math.max(box.startX, box.endX)
-    const minY = Math.min(box.startY, box.endY)
-    const maxY = Math.max(box.startY, box.endY)
-    if (maxX - minX < 3 && maxY - minY < 3) {
-      onSelectionChange?.(new Set())
+  // Cross-track rubber band (owned by ScoreEditor): hit-test both staves against the shared box
+  // and report the hits up for merging. Keyed by the treble part id (unique per grand staff).
+  useEffect(() => {
+    // Only contribute while a drag is active; otherwise leave the committed selection untouched.
+    if (!isSelectMode || !onSelectContribute || !selectionDrag) return
+    if (!layout || !containerRef.current) {
+      onSelectContribute(treblePart.id, new Set())
       return
     }
+    const rect = containerRef.current.getBoundingClientRect()
+    const minX = Math.min(selectionDrag.sx, selectionDrag.cx) - rect.left
+    const maxX = Math.max(selectionDrag.sx, selectionDrag.cx) - rect.left
+    const minY = Math.min(selectionDrag.sy, selectionDrag.cy) - rect.top
+    const maxY = Math.max(selectionDrag.sy, selectionDrag.cy) - rect.top
     const ids = new Set<string>()
     for (const notes of [layout.trebleNotes, layout.bassNotes]) {
       for (const n of notes) {
@@ -782,8 +800,8 @@ export function GrandStaffCanvas({
         })
       }
     }
-    onSelectionChange?.(ids)
-  }
+    onSelectContribute(treblePart.id, ids)
+  }, [selectionDrag, isSelectMode, layout, treblePart.id, onSelectContribute])
 
   // A notehead hit on either stave (for click-select / drag-move in select mode).
   const noteHeadAtAny = (x: number, y: number): { note: NoteGeometry; pitchIndex: number } | null =>
@@ -794,24 +812,10 @@ export function GrandStaffCanvas({
     Math.round((y - startY) / (LINE_SPACING / 2))
 
   // Commit a drag-move: shift every selected notehead diatonically by the snapped delta
-  // (dragging down lowers pitch) across both parts, in one undo-able edit.
+  // (dragging down lowers pitch). Routed through ScoreEditor so a cross-track selection moves
+  // in every track, not just this grand staff.
   const commitMove = (drag: { keys: string[]; deltaSteps: number }) => {
-    if (drag.deltaSteps === 0) return
-    const byEvent = selectionByEvent(new Set(drag.keys))
-    const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
-    const newKeys: string[] = []
-    for (const part of [treblePart, bassPart]) {
-      for (const measure of part.measures) {
-        if (!measure.notes.some(n => byEvent.has(n.id))) continue
-        const res = moveSelectedPitches(measure.notes, byEvent, p => diatonicStep(p, -drag.deltaSteps))
-        edits.push({ partId: part.id, measureId: measure.id, notes: res.notes })
-        newKeys.push(...res.newKeys)
-      }
-    }
-    if (edits.length) {
-      dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
-      onSelectionChange?.(new Set(newKeys))  // re-key: heads kept selected at sorted indices
-    }
+    onMoveSelectionSteps?.(drag.deltaSteps, drag.keys)
   }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -824,7 +828,7 @@ export function GrandStaffCanvas({
         if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
         return
       }
-      if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
+      // The rubber band is tracked at the window level in ScoreEditor; nothing to do here.
       return
     }
     if (isDeleteMode) {
@@ -921,8 +925,9 @@ export function GrandStaffCanvas({
         setMoveDrag({ keys, hitKey, startY: coords.y, deltaSteps: 0 })
         return
       }
-      isSelectingRef.current = true
-      setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
+      // Empty staff: begin a cross-track rubber band (owned by ScoreEditor, in client coords).
+      e.preventDefault()
+      onSelectDragStart?.(e.clientX, e.clientY)
       return
     }
     if (isDeleteMode) {
@@ -1025,7 +1030,7 @@ export function GrandStaffCanvas({
         setMoveDrag(null)
         return
       }
-      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      // A rubber-band drag is committed at the window level in ScoreEditor.
       return
     }
     if (isDeleteMode) { endErase(); return }
@@ -1554,6 +1559,7 @@ export function GrandStaffCanvas({
     <div className="relative">
     <div
       ref={el => { scrollRef.current = el; scrollSync?.register(el) }}
+      data-staff-card="grand"
       onScroll={() => { if (scrollRef.current) { scrollSync?.onScroll(scrollRef.current); setScrollLeft(scrollRef.current.scrollLeft) } }}
       className={
         'relative bg-white rounded-lg px-4 py-8 block w-full select-none overflow-x-auto ' +
@@ -1573,7 +1579,6 @@ export function GrandStaffCanvas({
         endErase()
         if (broomingRef.current) commitBroom()
         if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
-        if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
     >
       <div className="relative inline-block">
@@ -1630,8 +1635,10 @@ export function GrandStaffCanvas({
         {/* Violet highlights for selected noteheads (per-pitch). */}
         {selectedNoteIds && layout && (() => {
           const byEvent = selectionByEvent(selectedNoteIds)
-          const moveByEvent = moveDrag ? selectionByEvent(new Set(moveDrag.keys)) : null
-          const moveDy = moveDrag ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+          // Drag preview broadcast from the grabbed canvas, so this grand staff shifts its selected
+          // heads in sync even when the grabbed note lives in another track.
+          const moveByEvent = moveDragKeys && moveDragKeys.size > 0 ? selectionByEvent(moveDragKeys) : null
+          const moveDy = (moveDragSteps ?? 0) * (LINE_SPACING / 2)
           return [...layout.trebleNotes, ...layout.bassNotes].flatMap(n => {
             const sel = byEvent.get(n.id)
             if (!sel) return []
@@ -1656,10 +1663,11 @@ export function GrandStaffCanvas({
           })
         })()}
 
-        {/* Grey ghost noteheads while dragging selected heads up/down (real displaced x). */}
-        {moveDrag && layout && (() => {
-          const byEvent = selectionByEvent(new Set(moveDrag.keys))
-          const dy = moveDrag.deltaSteps * (LINE_SPACING / 2)
+        {/* Grey ghost noteheads while dragging selected heads up/down (real displaced x). Driven
+            by the broadcast drag so every track previews, not just the grabbed one. */}
+        {moveDragKeys && moveDragKeys.size > 0 && layout && (() => {
+          const byEvent = selectionByEvent(moveDragKeys)
+          const dy = (moveDragSteps ?? 0) * (LINE_SPACING / 2)
           return (
             <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 19, overflow: 'visible' }}>
               {[...layout.trebleNotes, ...layout.bassNotes].flatMap(n => {
@@ -1681,21 +1689,7 @@ export function GrandStaffCanvas({
           )
         })()}
 
-        {/* Rubber-band selection box */}
-        {isSelectMode && selectionBox && (
-          <svg className="absolute pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}>
-            <rect
-              x={Math.min(selectionBox.startX, selectionBox.endX)}
-              y={Math.min(selectionBox.startY, selectionBox.endY)}
-              width={Math.abs(selectionBox.endX - selectionBox.startX)}
-              height={Math.abs(selectionBox.endY - selectionBox.startY)}
-              fill="rgba(139,92,246,0.08)"
-              stroke="rgba(139,92,246,0.8)"
-              strokeWidth={1.5}
-              strokeDasharray="5 3"
-            />
-          </svg>
-        )}
+        {/* The rubber-band box is rendered once by ScoreEditor (client coords) so it spans tracks. */}
 
         {/* Red highlights: marked-for-delete (during drag) and pending rests (after release) */}
         {layout && [...layout.trebleNotes, ...layout.bassNotes].map(n => {

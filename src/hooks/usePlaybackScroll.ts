@@ -3,7 +3,7 @@ import * as Tone from 'tone'
 import type { Score } from '../types/score'
 import type { PlaybackStatus } from '../types/audio'
 import type { ScrollSync } from './useScrollSync'
-import { buildPlaybackTimeline, xAtTime, type PlaybackLayout } from '../lib/playback/timeline'
+import { buildPlaybackTimeline, xAtTime, xAtTimeSmooth, type PlaybackLayout } from '../lib/playback/timeline'
 
 export type { PlaybackLayout }
 
@@ -36,6 +36,25 @@ export function usePlaybackScroll({ scrollSync, score, status }: UsePlaybackScro
     }
   }, [score])
 
+  // Per-frame playhead readout for visual overlays (the comet). Returns the playhead's
+  // x in card-content coordinates (same space as the scroll math below) plus a 0–1
+  // `pulse` that spikes to 1 on each note onset and decays, so the orb can throb in time.
+  const getPlaybackVisual = useCallback((): { contentX: number; startX: number; pulse: number } | null => {
+    if (!layoutRef.current) return null
+    const t = Tone.getTransport().seconds
+    const points = timelineRef.current
+    let lastOnset = 0
+    for (const p of points) {
+      if (p.time > t) break
+      lastOnset = p.time
+    }
+    return {
+      contentX: CARD_PAD + xAtTimeSmooth(points, t),
+      startX: CARD_PAD + (points[0]?.x ?? 0),
+      pulse: Math.exp(-(t - lastOnset) / 0.12),
+    }
+  }, [])
+
   useEffect(() => {
     if (status !== 'playing') return
 
@@ -63,7 +82,7 @@ export function usePlaybackScroll({ scrollSync, score, status }: UsePlaybackScro
     return () => cancelAnimationFrame(raf)
   }, [status, scrollSync, score])
 
-  return { reportLayout }
+  return { reportLayout, getPlaybackVisual }
 }
 
 /** Scroll back to the start when beginning a fresh play from a scrolled-away view. */

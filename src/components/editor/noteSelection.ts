@@ -6,6 +6,16 @@ import type { NoteEvent, Pitch } from '../../types/score'
 //   - a whole event (rest, which has no pitches) → `"<eventId>"`
 // `pitchIndex` aligns with `Note.pitches[i]` (and the renderer's `ys[i]`/`xs[i]`).
 
+// A rubber-band selection drag in *client* (viewport) coordinates. Lives in ScoreEditor so a
+// single drag can span multiple track canvases; each canvas converts it to its own local space
+// via its container rect. `s` = start (mousedown), `c` = current (last pointer position).
+export interface SelectionDrag {
+  sx: number
+  sy: number
+  cx: number
+  cy: number
+}
+
 export function selKey(id: string, pitchIndex?: number): string {
   return pitchIndex === undefined ? id : `${id}#${pitchIndex}`
 }

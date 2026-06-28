@@ -1,10 +1,6 @@
 import type { Score, Note, Rest, NoteEvent, Part, Measure, Pitch, Tuplet, VoiceNumber } from '../../types/score'
 import { eventBeatsR } from '../beats'
-
-function accidentalToAlter(acc: Pitch['accidental']): number {
-  const map: Record<string, number> = { sharp: 1, flat: -1, natural: 0, double_sharp: 2, double_flat: -2 }
-  return acc ? (map[acc] ?? 0) : 0
-}
+import { resolvePartAccidentals } from '../accidentals'
 
 function durationToType(dur: NoteEvent['duration']): string {
   const map: Record<string, string> = {
@@ -68,8 +64,11 @@ function tupletContext(
   }
 }
 
-function pitchToXML(pitch: Pitch): string {
-  const alter = accidentalToAlter(pitch.accidental)
+function pitchToXML(pitch: Pitch, offset?: number): string {
+  // `<alter>` is the *sounding* alteration (key sig + carried/tied accidentals applied), so a
+  // carried F♯ exports as alter=1 even with no glyph. `<accidental>` is the notated glyph —
+  // emitted whenever the user explicitly entered one (we never drop those).
+  const alter = offset ?? (pitch.accidental ? ({ sharp: 1, flat: -1, natural: 0, double_sharp: 2, double_flat: -2 }[pitch.accidental] ?? 0) : 0)
   const accidentalTag = pitch.accidental
     ? `<accidental>${pitch.accidental.replace('_', '-')}</accidental>`
     : ''
@@ -81,7 +80,7 @@ function pitchToXML(pitch: Pitch): string {
   ${accidentalTag}`
 }
 
-function noteToXML(event: NoteEvent, divisions: number, tuplets?: Tuplet[]): string {
+function noteToXML(event: NoteEvent, divisions: number, tuplets?: Tuplet[], resolved?: Map<string, number>): string {
   // Sounded duration in divisions, tuplet-scaled. divisions is sized (partDivisions) so this is
   // always an exact integer for any nesting/dotting. <type> stays the written value.
   const beatsR = eventBeatsR(event, tuplets)
@@ -112,11 +111,11 @@ function noteToXML(event: NoteEvent, divisions: number, tuplets?: Tuplet[]): str
     const chord = idx > 0 ? '<chord/>' : ''
     // Tuplet bracket notation belongs on the primary notehead only; time-modification + voice on all.
     const tail = `<duration>${dur}</duration>${voiceTag}<type>${durationToType(note.duration)}</type>${dots}${tie}${timeMod}${idx === 0 ? tupletNotation : ''}`
-    return `<note>${chord}\n  ${pitchToXML(pitch)}\n  ${tail}\n</note>`
+    return `<note>${chord}\n  ${pitchToXML(pitch, resolved?.get(pitch.id))}\n  ${tail}\n</note>`
   }).join('\n')
 }
 
-function measureToXML(measure: Measure, number: number, divisions: number, timeSig?: Score['globalTimeSig'], keySig?: Score['globalKeySig']): string {
+function measureToXML(measure: Measure, number: number, divisions: number, timeSig?: Score['globalTimeSig'], keySig?: Score['globalKeySig'], resolved?: Map<string, number>): string {
   const timeSigXML = timeSig
     ? `<time><beats>${timeSig.beats}</beats><beat-type>${timeSig.beatType}</beat-type></time>`
     : ''
@@ -135,7 +134,7 @@ function measureToXML(measure: Measure, number: number, divisions: number, timeS
     .map((v, vi) => {
       const xml = measure.notes
         .filter(n => n.voice === v)
-        .map(n => noteToXML(n, divisions, measure.tuplets))
+        .map(n => noteToXML(n, divisions, measure.tuplets, resolved))
         .join('\n  ')
       // Rewind before every voice after the first.
       const prevDur = vi > 0 ? voicedSounded(voices[vi - 1]) : 0
@@ -156,6 +155,9 @@ function measureToXML(measure: Measure, number: number, divisions: number, timeS
 
 function partToXML(part: Part, score: Score): string {
   const divisions = partDivisions(part)
+  // Sounding accidental per notehead, so <alter> reflects carried/tied/key-implied pitch and
+  // <accidental> glyphs aren't repeated. Shared with playback/renderer.
+  const resolved = resolvePartAccidentals(part.measures, part.ties, score.globalKeySig)
   return `<part id="${part.id}">
   ${part.measures.map((m, i) => measureToXML(
     m,
@@ -163,6 +165,7 @@ function partToXML(part: Part, score: Score): string {
     divisions,
     i === 0 ? score.globalTimeSig : m.timeSig,
     i === 0 ? score.globalKeySig : m.keySig,
+    resolved,
   )).join('\n  ')}
 </part>`
 }

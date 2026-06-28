@@ -161,8 +161,8 @@ export function DurationToolbar({
   dispatch,
 }: DurationToolbarProps) {
   return (
-    <div className="flex items-center flex-wrap gap-2">
-      <div className="inline-flex items-center gap-2 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
+    <div className="flex items-center flex-wrap gap-1.5">
+      <div className="inline-flex items-center gap-1.5 px-2.5 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         {/* Note length — one button that hovers open to the value choices */}
         <LengthPicker selected={selectedDuration} onChange={onDurationChange} />
 
@@ -235,7 +235,7 @@ export function DurationToolbar({
       </div>
 
       {/* Modes bubble */}
-      <div className="inline-flex items-center gap-2 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
+      <div className="inline-flex items-center gap-1.5 px-2.5 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         {/* Tie / slur */}
         <DockTip name="Tie / slur" desc="Drag between two notes to connect them with a tie or slur." keys="T">
           <Toggle pressed={isTieMode} onPressedChange={onTieModeChange} className={TOGGLE_ITEM_CLASS + ' text-base'}>
@@ -376,7 +376,7 @@ export function DurationToolbar({
       </div>
 
       {/* Notation controls */}
-      <div className="inline-flex items-center gap-1 px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
+      <div className="inline-flex items-center gap-1 px-2.5 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         <TimeSigPicker current={globalTimeSig} measureCount={measureCount} dispatch={dispatch}>
           <button className={TOOLBAR_BTN_CLASS} title="Time signature">
             <span className="font-mono">{globalTimeSig.beats}/{globalTimeSig.beatType}</span>
@@ -401,7 +401,7 @@ export function DurationToolbar({
       </div>
 
       {/* Auto-advance — keyboard placement cursor behaviour, its own bubble on the right */}
-      <div className="inline-flex items-center px-3 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
+      <div className="inline-flex items-center px-2.5 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-xl">
         <DockTip
           name="Auto-advance"
           desc="After placing a note with the keyboard, skip the cursor to the next beat. Turn off to stay on the note you just placed. Only works while you're locked onto a note (use the ← / → arrows to lock on)."

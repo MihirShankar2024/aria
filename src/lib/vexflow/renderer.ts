@@ -360,7 +360,9 @@ function buildVexNote(event: NoteEvent, clef: Clef = 'treble'): StaveNote {
     duration: durationToVex(note.duration, note.dots),
     clef,
   })
-  // Attach accidentals per key index, then dots.
+  // Attach accidentals per key index, then dots. Always draw what the user explicitly entered —
+  // even when redundant (key-implied or carried within the measure) — since musicians add those
+  // for reading clarity. A plain note (no accidental) draws nothing and still carries in playback.
   note.pitches.forEach((pitch, idx) => {
     const vexAcc = accidentalToVex(pitch.accidental)
     if (vexAcc) vn.addModifier(new VexAccidental(vexAcc), idx)

@@ -38,6 +38,26 @@ export function xAtTime(points: PlaybackTimelinePoint[], t: number): number {
 }
 
 /**
+ * Like `xAtTime`, but linearly interpolates x between the surrounding onsets so a playhead
+ * glides continuously instead of jumping note-to-note. Because consecutive points are spaced
+ * by each note's duration (time) and engraved position (x), the resulting speed automatically
+ * tracks how densely a measure is packed.
+ */
+export function xAtTimeSmooth(points: PlaybackTimelinePoint[], t: number): number {
+  if (points.length === 0) return 0
+  if (t <= points[0].time) return points[0].x
+  for (let i = 1; i < points.length; i++) {
+    if (points[i].time >= t) {
+      const a = points[i - 1]
+      const b = points[i]
+      const span = b.time - a.time
+      return span > 0 ? a.x + (b.x - a.x) * ((t - a.time) / span) : b.x
+    }
+  }
+  return points[points.length - 1].x
+}
+
+/**
  * Build a time → x timeline from the first part's rhythm and rendered note positions.
  * Measure widths are system-aligned, so any staff's geometry works.
  */

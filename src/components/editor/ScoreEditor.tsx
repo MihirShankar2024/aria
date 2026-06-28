@@ -13,11 +13,12 @@ import { PartsSidebar } from './PartsSidebar'
 import { AddInstrumentButton } from './AddInstrumentButton'
 import { RemoveTrackDialog, MeasuresDialog } from './TrackDialogs'
 import { PlaybackBar } from '../playback/PlaybackBar'
+import { PlaybackComet } from '../playback/PlaybackComet'
 import { computeSystemStaveWidths } from '../../lib/vexflow/renderer'
 import { normalizeMeasureRests } from '../../lib/rests'
 import { effectiveTimeSigAt } from '../../lib/beats'
-import { transposeChromatic } from '../../lib/transposition/transpose'
-import { selKey, selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey } from './noteSelection'
+import { transposeChromatic, diatonicStep } from '../../lib/transposition/transpose'
+import { selKey, selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey, type SelectionDrag } from './noteSelection'
 import { setClipboard } from './clipboard'
 import type { PendingRest } from './useDeleteTrail'
 import type { Part, Duration, Accidental, ArticulationType, NoteEvent, Tie, Annotation, VoiceNumber } from '../../types/score'
@@ -85,6 +86,38 @@ export function ScoreEditor() {
   // (concert pitch is still the stored source of truth). Session-only, defaults on.
   const [transposedView, setTransposedView] = useState(true)
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
+  // Cross-track rubber band. Owned here (in client coords) and tracked at the window level so a
+  // single drag can span multiple track canvases and survive the pointer crossing between them.
+  // Each canvas reports the hits inside the box keyed by a source id; we union them live.
+  const [selectionDrag, setSelectionDrag] = useState<SelectionDrag | null>(null)
+  const selectionDragRef = useRef<SelectionDrag | null>(null)
+  selectionDragRef.current = selectionDrag
+  const selContribRef = useRef<Map<string, Set<string>>>(new Map())
+  const handleSelectDragStart = useCallback((clientX: number, clientY: number) => {
+    selContribRef.current = new Map()
+    setSelectionDrag({ sx: clientX, sy: clientY, cx: clientX, cy: clientY })
+  }, [])
+  const handleSelectContribute = useCallback((sourceId: string, keys: Set<string>) => {
+    selContribRef.current.set(sourceId, keys)
+    const union = new Set<string>()
+    for (const set of selContribRef.current.values()) for (const k of set) union.add(k)
+    setSelectedNoteIds(union)
+  }, [])
+  const isDragging = selectionDrag !== null
+  useEffect(() => {
+    if (!isDragging) return
+    const onMove = (e: MouseEvent) => setSelectionDrag(d => (d ? { ...d, cx: e.clientX, cy: e.clientY } : d))
+    const onUp = (e: MouseEvent) => {
+      const d = selectionDragRef.current
+      setSelectionDrag(null)
+      // A tiny box = a click on empty staff: clear the selection across all tracks. Otherwise
+      // the union built by handleSelectContribute during the drag is the final selection.
+      if (d && Math.abs(e.clientX - d.sx) < 3 && Math.abs(e.clientY - d.sy) < 3) setSelectedNoteIds(new Set())
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+  }, [isDragging])
   // Per-part playback volume (gain 0–1, default 1 = unity). A mixer setting, kept out of
   // score state so dragging a slider doesn't churn the undo history.
   const [volumes, setVolumes] = useState<Record<string, number>>({})
@@ -103,7 +136,8 @@ export function ScoreEditor() {
   const [removeTarget, setRemoveTarget] = useState<{ partId: string; name: string } | null>(null)
   const [addMeasuresOpen, setAddMeasuresOpen] = useState(false)
   const scrollSync = useScrollSync()
-  const { reportLayout } = usePlaybackScroll({ scrollSync, score, status })
+  const { reportLayout, getPlaybackVisual } = usePlaybackScroll({ scrollSync, score, status })
+  const mainRef = useRef<HTMLElement>(null)
 
   const volumesRef = useRef(volumes)
   volumesRef.current = volumes
@@ -134,6 +168,36 @@ export function ScoreEditor() {
   isSelectModeRef.current = isSelectMode
   const selectedNoteIdsRef = useRef(selectedNoteIds)
   selectedNoteIdsRef.current = selectedNoteIds
+
+  // Drag-move of a selection: shift every selected notehead diatonically across ALL parts (not
+  // just the dragged staff), mirroring how Arrow-key nudges move the whole cross-track selection.
+  // `deltaSteps` is the snapped staff-position delta (down = positive); dragging down lowers pitch.
+  const moveSelectionDiatonic = useCallback((deltaSteps: number, keys: string[]) => {
+    if (deltaSteps === 0 || keys.length === 0) return
+    const sc = scoreRef.current
+    const byEvent = selectionByEvent(new Set(keys))
+    const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
+    const newKeys: string[] = []
+    for (const part of sc.parts) {
+      for (const measure of part.measures) {
+        if (!measure.notes.some(n => byEvent.has(n.id))) continue
+        const res = moveSelectedPitches(measure.notes, byEvent, p => diatonicStep(p, -deltaSteps))
+        edits.push({ partId: part.id, measureId: measure.id, notes: res.notes })
+        newKeys.push(...res.newKeys)
+      }
+    }
+    if (edits.length) {
+      dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
+      setSelectedNoteIds(new Set(newKeys))
+    }
+  }, [dispatch])
+
+  // Live drag-move preview, broadcast from whichever canvas grabbed a notehead so EVERY track
+  // with selected heads shows them shifting (optimistic UI), matching the cross-track commit.
+  const [moveDragPreview, setMoveDragPreview] = useState<{ keys: Set<string>; steps: number } | null>(null)
+  const handleMoveDragActive = useCallback((keys: Set<string> | null, steps: number) => {
+    setMoveDragPreview(keys && keys.size > 0 ? { keys, steps } : null)
+  }, [])
 
   // Remove the red in-place rests and let following notes shift left.
   const collapsePending = () => {
@@ -575,6 +639,13 @@ export function ScoreEditor() {
     transposedView,
     selectedNoteIds,
     onSelectionChange: setSelectedNoteIds,
+    selectionDrag,
+    onSelectDragStart: handleSelectDragStart,
+    onSelectContribute: handleSelectContribute,
+    onMoveSelectionSteps: moveSelectionDiatonic,
+    moveDragKeys: moveDragPreview?.keys,
+    moveDragSteps: moveDragPreview?.steps ?? 0,
+    onMoveDragActive: handleMoveDragActive,
     initialTempo: score.tempo,
     tempoChanges: score.tempoChanges,
     forcedStaveWidths: systemStaveWidths.length ? systemStaveWidths : undefined,
@@ -590,6 +661,20 @@ export function ScoreEditor() {
 
   return (
     <div className="relative min-h-screen text-white flex flex-col">
+      {/* Cross-track rubber band: one box in client coords so it spans every staff seamlessly. */}
+      {selectionDrag && (
+        <div
+          className="fixed pointer-events-none z-50"
+          style={{
+            left: Math.min(selectionDrag.sx, selectionDrag.cx),
+            top: Math.min(selectionDrag.sy, selectionDrag.cy),
+            width: Math.abs(selectionDrag.cx - selectionDrag.sx),
+            height: Math.abs(selectionDrag.cy - selectionDrag.sy),
+            background: 'rgba(139,92,246,0.08)',
+            border: '1.5px dashed rgba(139,92,246,0.8)',
+          }}
+        />
+      )}
       {/* Transient toast (copy confirmation, etc.) — floats at the top, fades in. */}
       {toast && (
         <div
@@ -669,7 +754,7 @@ export function ScoreEditor() {
           })}
         />
 
-        <main className="flex-1 px-6 pt-3 pb-8 space-y-3 overflow-y-auto">
+        <main ref={mainRef} className="flex-1 px-6 pt-3 pb-8 space-y-3 overflow-y-auto">
           {groups.map((group, groupIdx) => {
             const playbackLayoutProps = groupIdx === 0
               ? { onPlaybackLayoutChange: reportLayout }
@@ -722,6 +807,13 @@ export function ScoreEditor() {
           })}
         </main>
       </div>
+
+      <PlaybackComet
+        status={status}
+        getPlaybackVisual={getPlaybackVisual}
+        scrollSync={scrollSync}
+        mainRef={mainRef}
+      />
 
       {/* Playback bar + add instrument, grouped to fit within the left column width */}
       <footer className="sticky bottom-0 px-6 py-4 border-t border-white/10 bg-black/30 backdrop-blur-sm">

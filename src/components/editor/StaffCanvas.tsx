@@ -13,8 +13,8 @@ import { hitGlyphHandle, GLYPH_HANDLE_R, type GlyphEdit } from './accidentalEdit
 import { useDeleteTrail, TRAIL_MS, type PendingRest } from './useDeleteTrail'
 import { renderGhostNote, type GhostRender } from './ghostNote'
 import { normalizeMeasureRests } from '../../lib/rests'
-import { diatonicStep, writtenPitchToConcert, concertPitchToWritten, transposeMeasuresForDisplay, transposeKeySigForDisplay } from '../../lib/transposition/transpose'
-import { selKey, selectionByEvent, isPitchSelected, moveSelectedPitches } from './noteSelection'
+import { writtenPitchToConcert, concertPitchToWritten, transposeMeasuresForDisplay, transposeKeySigForDisplay } from '../../lib/transposition/transpose'
+import { selKey, selectionByEvent, isPitchSelected, type SelectionDrag } from './noteSelection'
 import type { Measure, TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Tie, Clef, Note, NoteEvent, VoiceNumber, Pitch, Annotation } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 import { AnnotationsLayer } from './AnnotationsLayer'
@@ -108,6 +108,17 @@ interface StaffCanvasProps {
   isSelectMode?: boolean
   selectedNoteIds?: Set<string>
   onSelectionChange?: (ids: Set<string>) => void
+  // Cross-track rubber band: the live drag (client coords) is owned by ScoreEditor so it can
+  // span multiple canvases. This canvas starts a drag, then reports its hits for merging.
+  selectionDrag?: SelectionDrag | null
+  onSelectDragStart?: (clientX: number, clientY: number) => void
+  onSelectContribute?: (sourceId: string, keys: Set<string>) => void
+  // Commit a drag-move of the selection across all tracks (handled by ScoreEditor).
+  onMoveSelectionSteps?: (deltaSteps: number, keys: string[]) => void
+  // Live drag-move preview, broadcast from the grabbed canvas so every track previews together.
+  moveDragKeys?: Set<string>
+  moveDragSteps?: number
+  onMoveDragActive?: (keys: Set<string> | null, steps: number) => void
   onNotePlaced?: () => void
   onTieComplete?: () => void
   onFillComplete?: () => void
@@ -194,6 +205,13 @@ export function StaffCanvas({
   isSelectMode = false,
   selectedNoteIds,
   onSelectionChange,
+  selectionDrag,
+  onSelectDragStart,
+  onSelectContribute,
+  onMoveSelectionSteps,
+  moveDragKeys,
+  moveDragSteps,
+  onMoveDragActive,
   onNotePlaced,
   onTieComplete,
   onFillComplete,
@@ -209,12 +227,15 @@ export function StaffCanvas({
   // once with the real engine whenever the selected note params change, then moved
   // under the cursor via SVG translate (no per-frame re-render).
   const [ghost, setGhost] = useState<GhostRender | null>(null)
-  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
-  const isSelectingRef = useRef(false)
   // Drag-move of selected noteheads: started on a notehead in select mode. `keys` are
   // the composite selection keys being moved; `hitKey` is the grabbed head. deltaSteps
   // is the snapped vertical staff-position offset (down = positive) since the press.
   const [moveDrag, setMoveDrag] = useState<{ keys: string[]; hitKey: string; startY: number; deltaSteps: number } | null>(null)
+  // Broadcast this canvas's active drag up so every track previews the move together. Only the
+  // grabbed canvas has a non-null moveDrag, so only it fires; the others keep their stable null.
+  useEffect(() => {
+    onMoveDragActive?.(moveDrag ? new Set(moveDrag.keys) : null, moveDrag ? moveDrag.deltaSteps : 0)
+  }, [moveDrag, onMoveDragActive])
   const [tieDrag, setTieDrag] = useState<TieDrag | null>(null)
   const [slurEdit, setSlurEdit] = useState<SlurEdit | null>(null)
   const [glyphEdit, setGlyphEdit] = useState<GlyphEdit | null>(null)
@@ -917,19 +938,22 @@ export function StaffCanvas({
     dispatch({ type: 'APPLY_MEASURE_NOTES', edits, removedIds })
   }
 
-  const commitSelection = (box: { startX: number; startY: number; endX: number; endY: number }) => {
-    isSelectingRef.current = false
-    setSelectionBox(null)
-    if (!layout) return
-    const minX = Math.min(box.startX, box.endX)
-    const maxX = Math.max(box.startX, box.endX)
-    const minY = Math.min(box.startY, box.endY)
-    const maxY = Math.max(box.startY, box.endY)
-    // Tiny box = click without drag: clear selection
-    if (maxX - minX < 3 && maxY - minY < 3) {
-      onSelectionChange?.(new Set())
+  // Cross-track rubber band: the live drag (client coords) is owned by ScoreEditor. Whenever it
+  // changes, hit-test this canvas's noteheads against the box (converted to local coords via the
+  // container rect) and report the hits up so ScoreEditor can union every track's contribution.
+  useEffect(() => {
+    // Only contribute while a drag is active; otherwise leave the committed selection untouched
+    // (a re-render must not reset it). `selContribRef` is cleared by ScoreEditor on drag start.
+    if (!isSelectMode || !onSelectContribute || !selectionDrag) return
+    if (!layout || !containerRef.current) {
+      onSelectContribute(partId, new Set())
       return
     }
+    const rect = containerRef.current.getBoundingClientRect()
+    const minX = Math.min(selectionDrag.sx, selectionDrag.cx) - rect.left
+    const maxX = Math.max(selectionDrag.sx, selectionDrag.cx) - rect.left
+    const minY = Math.min(selectionDrag.sy, selectionDrag.cy) - rect.top
+    const maxY = Math.max(selectionDrag.sy, selectionDrag.cy) - rect.top
     const ids = new Set<string>()
     for (const n of layout.notes) {
       if (n.type === 'rest') {
@@ -942,30 +966,18 @@ export function StaffCanvas({
         if (hx >= minX && hx <= maxX && y >= minY && y <= maxY) ids.add(selKey(n.id, i))
       })
     }
-    onSelectionChange?.(ids)
-  }
+    onSelectContribute(partId, ids)
+  }, [selectionDrag, isSelectMode, layout, partId, onSelectContribute])
 
   // Snapped vertical staff-position delta (each line/space = one step), down = positive.
   const snapDeltaSteps = (y: number, startY: number) =>
     Math.round((y - startY) / (LINE_SPACING / 2))
 
   // Commit a drag-move: shift every selected notehead diatonically by the snapped delta
-  // (dragging down lowers pitch) in a single undo-able edit. Selection is preserved.
+  // (dragging down lowers pitch) in a single undo-able edit. Routed through ScoreEditor so a
+  // cross-track selection moves in every track, not just the one being dragged.
   const commitMove = (drag: { keys: string[]; deltaSteps: number }) => {
-    if (drag.deltaSteps === 0) return
-    const byEvent = selectionByEvent(new Set(drag.keys))
-    const edits: { partId: string; measureId: string; notes: NoteEvent[] }[] = []
-    const newKeys: string[] = []
-    for (const measure of measures) {
-      if (!measure.notes.some(n => byEvent.has(n.id))) continue
-      const res = moveSelectedPitches(measure.notes, byEvent, p => diatonicStep(p, -drag.deltaSteps))
-      edits.push({ partId, measureId: measure.id, notes: res.notes })
-      newKeys.push(...res.newKeys)
-    }
-    if (edits.length) {
-      dispatch({ type: 'APPLY_MEASURE_NOTES', edits })
-      onSelectionChange?.(new Set(newKeys))  // re-key: heads kept selected at sorted indices
-    }
+    onMoveSelectionSteps?.(drag.deltaSteps, drag.keys)
   }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -978,7 +990,8 @@ export function StaffCanvas({
         if (d !== moveDrag.deltaSteps) setMoveDrag({ ...moveDrag, deltaSteps: d })
         return
       }
-      if (isSelectingRef.current) setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
+      // The rubber band itself is tracked at the window level in ScoreEditor (so it survives
+      // the pointer crossing into another track); nothing to do here.
       return
     }
     if (isDeleteMode) {
@@ -1073,8 +1086,9 @@ export function StaffCanvas({
         setMoveDrag({ keys, hitKey, startY: coords.y, deltaSteps: 0 })
         return
       }
-      isSelectingRef.current = true
-      setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
+      // Empty staff: begin a cross-track rubber band (owned by ScoreEditor, in client coords).
+      e.preventDefault()
+      onSelectDragStart?.(e.clientX, e.clientY)
       return
     }
     if (isDeleteMode) {
@@ -1166,7 +1180,7 @@ export function StaffCanvas({
         setMoveDrag(null)
         return
       }
-      if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
+      // A rubber-band drag is committed at the window level in ScoreEditor.
       return
     }
     if (isDeleteMode) { endErase(); return }
@@ -1549,6 +1563,7 @@ export function StaffCanvas({
     <div className="relative">
     <div
       ref={el => { scrollRef.current = el; scrollSync?.register(el) }}
+      data-staff-card="single"
       onScroll={() => { if (scrollRef.current) { scrollSync?.onScroll(scrollRef.current); setScrollLeft(scrollRef.current.scrollLeft) } }}
       className={
         'relative bg-white rounded-lg px-4 py-8 block w-full select-none overflow-x-auto ' +
@@ -1567,7 +1582,6 @@ export function StaffCanvas({
         endErase()
         if (broomingRef.current) commitBroom()
         if (moveDrag) { commitMove(moveDrag); setMoveDrag(null) }
-        if (isSelectingRef.current && selectionBox) commitSelection(selectionBox)
       }}
     >
       <div className="relative inline-block">
@@ -1619,8 +1633,10 @@ export function StaffCanvas({
         {/* Violet highlights for selected noteheads (per-pitch). */}
         {selectedNoteIds && layout && (() => {
           const byEvent = selectionByEvent(selectedNoteIds)
-          const moveByEvent = moveDrag ? selectionByEvent(new Set(moveDrag.keys)) : null
-          const moveDy = moveDrag ? moveDrag.deltaSteps * (LINE_SPACING / 2) : 0
+          // Drag preview is broadcast from whichever canvas grabbed a head, so this track shifts
+          // its selected heads in sync even when the grabbed note lives in another track.
+          const moveByEvent = moveDragKeys && moveDragKeys.size > 0 ? selectionByEvent(moveDragKeys) : null
+          const moveDy = (moveDragSteps ?? 0) * (LINE_SPACING / 2)
           return layout.notes.flatMap(n => {
             const sel = byEvent.get(n.id)
             if (!sel) return []
@@ -1647,10 +1663,11 @@ export function StaffCanvas({
         })()}
 
         {/* Grey ghost noteheads while dragging selected heads up/down — shows where the
-            heads will land (at their real displaced x) before they're committed. */}
-        {moveDrag && layout && (() => {
-          const byEvent = selectionByEvent(new Set(moveDrag.keys))
-          const dy = moveDrag.deltaSteps * (LINE_SPACING / 2)
+            heads will land (at their real displaced x) before they're committed. Driven by the
+            broadcast drag so every track with selected heads previews, not just the grabbed one. */}
+        {moveDragKeys && moveDragKeys.size > 0 && layout && (() => {
+          const byEvent = selectionByEvent(moveDragKeys)
+          const dy = (moveDragSteps ?? 0) * (LINE_SPACING / 2)
           return (
             <svg
               className="absolute pointer-events-none"
@@ -1675,24 +1692,7 @@ export function StaffCanvas({
           )
         })()}
 
-        {/* Rubber-band selection box */}
-        {isSelectMode && selectionBox && (
-          <svg
-            className="absolute pointer-events-none"
-            style={{ left: 0, top: 0, width: '100%', height: '100%', zIndex: 25, overflow: 'visible' }}
-          >
-            <rect
-              x={Math.min(selectionBox.startX, selectionBox.endX)}
-              y={Math.min(selectionBox.startY, selectionBox.endY)}
-              width={Math.abs(selectionBox.endX - selectionBox.startX)}
-              height={Math.abs(selectionBox.endY - selectionBox.startY)}
-              fill="rgba(139,92,246,0.08)"
-              stroke="rgba(139,92,246,0.8)"
-              strokeWidth={1.5}
-              strokeDasharray="5 3"
-            />
-          </svg>
-        )}
+        {/* The rubber-band box is rendered once by ScoreEditor (client coords) so it spans tracks. */}
 
         {/* Red highlights: marked-for-delete (during drag) and pending rests (after release) */}
         {layout?.notes.map(n => {

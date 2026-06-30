@@ -23,6 +23,12 @@ import { computeCurvePlacement } from './curvePlacement'
 
 const NOTE_NAMES = ['C', 'D', 'E', 'F', 'G', 'A', 'B']
 
+// Violet used to render an AI-proposed (staged, not-yet-accepted) note optimistically — the same
+// hue as the editor's cursor/selection. Applied via StaveNote.setStyle so notehead, stem, flag,
+// accidentals and dots all read as preview; cleared automatically once the edit is accepted/cancelled.
+const PREVIEW_COLOR = 'rgb(139,92,246)'
+const PREVIEW_STYLE = { fillStyle: PREVIEW_COLOR, strokeStyle: PREVIEW_COLOR } as const
+
 // VexFlow's default accidental spacing is extremely tight (1px notehead gap, 3px between
 // columns), so dense chord clusters where every tone carries an accidental collide and
 // "bleed" into each other and the noteheads. Loosen it for legible, well-separated
@@ -669,6 +675,7 @@ function formatDrawCollect(
     glyphGeometry: GlyphGeometry[]
     intraChordConflicts: Array<{ noteId: string; measureIndex: number; pitchIndex: number; headIndex: number; overlapPx: number }>
   },
+  previewIds?: Set<string>,
 ): void {
   const { voices, voiceBeamGroups, voiceNumbers, realNotes, events, tuplets } = built
   if (voices.length === 0) return
@@ -699,8 +706,23 @@ function formatDrawCollect(
     if (ev.type === 'note') applyGlyphOffsets(realNotes[k], ev)
     applyArticulationOffsets(realNotes[k], ev)
   })
+  // Optimistic AI preview: paint staged (not-yet-accepted) events violet. Style is applied to the
+  // StaveNote (notehead/stem/flag/accidentals/dots) and to any beam whose every member is staged.
+  const previewVexNotes = new Set<StaveNote>()
+  if (previewIds && previewIds.size) {
+    events.forEach((ev, k) => {
+      if (!previewIds.has(ev.id)) return
+      const vn = realNotes[k]
+      vn.setStyle(PREVIEW_STYLE)
+      previewVexNotes.add(vn)
+    })
+  }
   voices.forEach(v => v.draw(ctx, stave))
-  beams.forEach(b => b.setContext(ctx).draw())
+  beams.forEach(b => {
+    const bn = b.getNotes()
+    if (previewVexNotes.size && bn.length && bn.every(n => previewVexNotes.has(n as StaveNote))) b.setStyle(PREVIEW_STYLE)
+    b.setContext(ctx).draw()
+  })
   // Tuplet brackets/numbers ride on top of the formatted notes and beams.
   tuplets.forEach(t => t.setContext(ctx).draw())
 
@@ -820,6 +842,8 @@ export interface RenderScoreOptions {
   tempoChanges?: { measureNumber: number; tempo: number }[]
   // Pre-computed stave widths (used for synchronized grand staff columns).
   forcedStaveWidths?: number[]
+  // Event/tie ids the AI proposed this turn (staged): drawn violet as an optimistic preview.
+  previewIds?: Set<string>
 }
 
 export function renderStaff({
@@ -833,6 +857,7 @@ export function renderStaff({
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
+  previewIds,
 }: RenderScoreOptions): StaffLayout {
   container.innerHTML = ''
   const renderer = new Renderer(container as HTMLDivElement, Renderer.Backends.SVG)
@@ -938,14 +963,14 @@ export function renderStaff({
 
     formatDrawCollect(built[idx], stave, ctx, idx, staveY, noteAreaWidths[idx], {
       vexById, noteGeometry, glyphGeometry, intraChordConflicts,
-    })
+    }, previewIds)
 
     geometry.push({ x, width: staveWidth })
     x += staveWidth
   })
 
   // Pass 3 — draw ties/slurs.
-  const tieGeometry = drawTies(ties, measures, vexById, ctx)
+  const tieGeometry = drawTies(ties, measures, vexById, ctx, previewIds)
 
   return {
     width: totalWidth,
@@ -1006,6 +1031,8 @@ export interface RenderGrandStaffOptions {
   tempoChanges?: { measureNumber: number; tempo: number }[]
   // Pre-computed stave widths for system-wide alignment across all parts.
   forcedStaveWidths?: number[]
+  // Event/tie ids the AI proposed this turn (staged): drawn violet as an optimistic preview.
+  previewIds?: Set<string>
 }
 
 export function renderGrandStaff({
@@ -1019,6 +1046,7 @@ export function renderGrandStaff({
   initialTempo,
   tempoChanges = [],
   forcedStaveWidths,
+  previewIds,
 }: RenderGrandStaffOptions): GrandStaffLayout {
   container.innerHTML = ''
   const renderer = new Renderer(container as HTMLDivElement, Renderer.Backends.SVG)
@@ -1158,14 +1186,14 @@ export function renderGrandStaff({
     if (trebleBuilt[idx]) {
       formatDrawCollect(trebleBuilt[idx], trebleStave, ctx, idx, GRAND_TREBLE_Y, noteAreaWidths[idx], {
         vexById: trebleVexById, noteGeometry: trebleNoteGeometry, glyphGeometry: trebleGlyphGeometry, intraChordConflicts: trebleIntraChordConflicts,
-      })
+      }, previewIds)
     }
 
     // Draw bass notes
     if (bassBuilt[idx]) {
       formatDrawCollect(bassBuilt[idx], bassStave, ctx, idx, GRAND_BASS_Y, noteAreaWidths[idx], {
         vexById: bassVexById, noteGeometry: bassNoteGeometry, glyphGeometry: bassGlyphGeometry, intraChordConflicts: bassIntraChordConflicts,
-      })
+      }, previewIds)
     }
 
     measureGeometry.push({ x, width: staveWidth })
@@ -1173,8 +1201,8 @@ export function renderGrandStaff({
   }
 
   // Draw ties for both staves
-  const trebleTieGeometry = drawTies(trebleTies, trebleMeasures, trebleVexById, ctx)
-  const bassTieGeometry   = drawTies(bassTies, bassMeasures, bassVexById, ctx)
+  const trebleTieGeometry = drawTies(trebleTies, trebleMeasures, trebleVexById, ctx, previewIds)
+  const bassTieGeometry   = drawTies(bassTies, bassMeasures, bassVexById, ctx, previewIds)
 
   return {
     width: totalWidth,
@@ -1196,6 +1224,7 @@ function drawTies(
   measures: Measure[],
   vexById: Map<string, StaveNote>,
   ctx: ReturnType<InstanceType<typeof Renderer>['getContext']>,
+  previewIds?: Set<string>,
 ): TieGeometry[] {
   const out: TieGeometry[] = []
   const flatEventIds = measures.flatMap(m => m.notes.map(ev => ev.id))
@@ -1308,6 +1337,10 @@ function drawTies(
 
       const firstY = flatFirstYs[repFirstIdx] ?? 0
       const lastY  = flatLastYs[repLastIdx]   ?? 0
+      // Violet a staged tie/slur (its own id, or one anchored to a staged note) for the AI preview.
+      if (previewIds && (previewIds.has(tie.id) || previewIds.has(tie.from.note) || previewIds.has(tie.to.note))) {
+        staveTie.setStyle(PREVIEW_STYLE)
+      }
       staveTie.setContext(ctx).draw()
 
       out.push({

@@ -106,10 +106,10 @@ export function AiPromptBox({ turns, onSubmit, pending = false, error, onApprove
                   {t.staged && !t.applied && (
                     <div className="mt-1 flex gap-2">
                       <button onClick={() => onApprove?.(t.id)} className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-violet-500 py-1.5 text-[12px] font-medium text-white transition hover:bg-violet-400">
-                        <Check className="h-3.5 w-3.5" /> Approve
+                        <Check className="h-3.5 w-3.5" /> Accept
                       </button>
                       <button onClick={() => onReject?.(t.id)} className="flex-1 rounded-lg border border-white/15 bg-white/5 py-1.5 text-[12px] font-medium text-white/60 transition hover:bg-white/10 hover:text-white">
-                        Reject
+                        Cancel
                       </button>
                     </div>
                   )}

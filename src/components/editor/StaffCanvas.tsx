@@ -76,6 +76,8 @@ interface StaffCanvasProps {
    * written pitches (converted back to concert on entry). Concert pitch otherwise. */
   transposedView?: boolean
   dispatch: (action: ScoreAction) => void
+  /** Event/tie ids the AI proposed this turn (staged, not yet accepted): drawn purple. */
+  previewIds?: Set<string>
   selectedDuration: Duration
   selectedAccidental: Accidental
   selectedArticulation: ArticulationType | null
@@ -179,6 +181,7 @@ export function StaffCanvas({
   clef = 'treble',
   transposedView = false,
   dispatch,
+  previewIds,
   selectedDuration,
   selectedAccidental,
   selectedArticulation,
@@ -352,12 +355,13 @@ export function StaffCanvas({
         initialTempo,
         tempoChanges,
         forcedStaveWidths,
+        previewIds,
       })
       setLayout(result)
     } catch (err) {
       console.error('Staff render failed', err)
     }
-  }, [displayMeasures, timeSig, displayKeySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths])
+  }, [displayMeasures, timeSig, displayKeySig, clef, ties, initialTempo, tempoChanges, forcedStaveWidths, previewIds])
 
   useEffect(() => {
     if (!layout || !onPlaybackLayoutChange) return

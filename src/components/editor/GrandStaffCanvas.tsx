@@ -102,6 +102,8 @@ interface GrandStaffCanvasProps {
   timeSig: TimeSig
   keySig: KeySig
   dispatch: (action: ScoreAction) => void
+  /** Event/tie ids the AI proposed this turn (staged, not yet accepted): drawn purple. */
+  previewIds?: Set<string>
   selectedDuration: Duration
   selectedAccidental: Accidental
   selectedArticulation: ArticulationType | null
@@ -158,6 +160,7 @@ export function GrandStaffCanvas({
   timeSig,
   keySig,
   dispatch,
+  previewIds,
   selectedDuration,
   selectedAccidental,
   selectedArticulation,
@@ -283,12 +286,13 @@ export function GrandStaffCanvas({
         initialTempo,
         tempoChanges,
         forcedStaveWidths,
+        previewIds,
       })
       setLayout(result)
     } catch (err) {
       console.error('Grand staff render failed', err)
     }
-  }, [treblePart, bassPart, timeSig, keySig, initialTempo, tempoChanges, forcedStaveWidths])
+  }, [treblePart, bassPart, timeSig, keySig, initialTempo, tempoChanges, forcedStaveWidths, previewIds])
 
   useEffect(() => {
     if (!layout || !onPlaybackLayoutChange) return

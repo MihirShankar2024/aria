@@ -24,10 +24,36 @@ import { transposeChromatic, diatonicStep } from '../../lib/transposition/transp
 import { selKey, selectionByEvent, moveSelectedPitches, deleteSelectedPitches, parseSelKey, type SelectionDrag } from './noteSelection'
 import { setClipboard } from './clipboard'
 import type { PendingRest } from './useDeleteTrail'
-import type { Part, Duration, Accidental, ArticulationType, NoteEvent, Tie, Annotation, VoiceNumber } from '../../types/score'
+import type { Part, Duration, Accidental, ArticulationType, NoteEvent, Tie, Annotation, VoiceNumber, Score } from '../../types/score'
+import { scoreReducer } from '../../state/scoreReducer'
 
 const EMPTY_TIES: Tie[] = []
 const EMPTY_ANNOTATIONS: Annotation[] = []
+const EMPTY_PREVIEW_IDS: Set<string> = new Set()
+
+/**
+ * Ids (notes, ties, annotations) that are NEW or CHANGED between the live score and a preview score
+ * built by folding the AI's staged actions. Used to paint exactly those glyphs purple. An id absent
+ * from the live score, or whose serialized content differs, counts as a preview id.
+ */
+function computePreviewIds(live: Score, preview: Score): Set<string> {
+  const ids = new Set<string>()
+  const liveJson = new Map<string, string>()
+  const index = (parts: Part[], into: Map<string, string>) => {
+    for (const part of parts) {
+      for (const m of part.measures) for (const n of m.notes) into.set(n.id, JSON.stringify(n))
+      for (const t of part.ties ?? []) into.set(t.id, JSON.stringify(t))
+      for (const a of part.annotations ?? []) into.set(a.id, JSON.stringify(a))
+    }
+  }
+  index(live.parts, liveJson)
+  const previewIndex = new Map<string, string>()
+  index(preview.parts, previewIndex)
+  for (const [id, json] of previewIndex) {
+    if (liveJson.get(id) !== json) ids.add(id)
+  }
+  return ids
+}
 
 type PartGroup =
   | { type: 'single'; part: Part }
@@ -604,18 +630,34 @@ export function ScoreEditor() {
     [pendingRests],
   )
 
-  const groups = groupParts(score.parts)
+  // Optimistic preview: fold the AI's staged (unaccepted) actions onto a throwaway copy of the
+  // score so the editor renders the proposed result. `previewIds` marks the new/changed glyphs so
+  // the renderer paints exactly those purple. Accept dispatches the actions for real (→ black);
+  // cancel clears the staged turn and `previewScore` falls back to the live score.
+  const previewScore = useMemo<Score | null>(
+    () => (ai.previewActions ? ai.previewActions.reduce(scoreReducer, score) : null),
+    [ai.previewActions, score],
+  )
+  const previewIds = useMemo(
+    () => (previewScore ? computePreviewIds(score, previewScore) : EMPTY_PREVIEW_IDS),
+    [score, previewScore],
+  )
+  const displayScore = previewScore ?? score
+  const displayParts = displayScore.parts
+
+  const groups = groupParts(displayParts)
   const measureCount = Math.max(1, ...score.parts.map(p => p.measures.length))
 
   // One shared stave-width per measure index across all parts, so barlines align
   // vertically across every staff (standard system engraving).
   const systemStaveWidths = useMemo(
-    () => computeSystemStaveWidths(score.parts, score.globalTimeSig, score.globalKeySig),
-    [score.parts, score.globalTimeSig, score.globalKeySig],
+    () => computeSystemStaveWidths(displayParts, displayScore.globalTimeSig, displayScore.globalKeySig),
+    [displayParts, displayScore.globalTimeSig, displayScore.globalKeySig],
   )
 
   const commonCanvasProps = {
     dispatch,
+    previewIds,
     selectedDuration,
     selectedAccidental,
     selectedArticulation,
@@ -800,8 +842,8 @@ export function ScoreEditor() {
                     bassPart={group.bass}
                     trebleAnnotations={group.treble.annotations ?? EMPTY_ANNOTATIONS}
                     bassAnnotations={group.bass.annotations ?? EMPTY_ANNOTATIONS}
-                    timeSig={score.globalTimeSig}
-                    keySig={score.globalKeySig}
+                    timeSig={displayScore.globalTimeSig}
+                    keySig={displayScore.globalKeySig}
                     {...playbackLayoutProps}
                     {...commonCanvasProps}
                   />
@@ -821,8 +863,8 @@ export function ScoreEditor() {
                   partId={part.id}
                   instrument={part.instrument}
                   measures={part.measures}
-                  timeSig={score.globalTimeSig}
-                  keySig={score.globalKeySig}
+                  timeSig={displayScore.globalTimeSig}
+                  keySig={displayScore.globalKeySig}
                   clef={part.clef}
                   ties={part.ties ?? EMPTY_TIES}
                   annotations={part.annotations ?? EMPTY_ANNOTATIONS}

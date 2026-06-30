@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react'
+import { useState, useCallback, useRef, useMemo } from 'react'
 import type Anthropic from '@anthropic-ai/sdk'
 import type { Score } from '../types/score'
 import type { ScoreAction } from '../state/actions'
@@ -196,5 +196,15 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
     setTurns(ts => ts.map(t => (t.id === turnId ? { ...t, applied: 'rejected' } : t)))
   }, [])
 
-  return { send, pending, error, turns, cacheHit, approve, reject, answerQuestion, cancel, clearChat }
+  // The staged edits of the latest unresolved turn, surfaced so the editor can render them
+  // optimistically (in purple) on the score until the user accepts/cancels. null = nothing pending.
+  const previewActions = useMemo<ScoreAction[] | null>(() => {
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i]
+      if (t.staged && !t.applied) return t.staged.actions
+    }
+    return null
+  }, [turns])
+
+  return { send, pending, error, turns, cacheHit, approve, reject, answerQuestion, cancel, clearChat, previewActions }
 }

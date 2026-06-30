@@ -1,6 +1,7 @@
-import type { ClaudeRequest, ClaudeResponse } from '../types/api'
+import type { AiRelayRequest, AiRelayResponse } from '../types/api'
 
-export async function fetchClaude(request: ClaudeRequest): Promise<ClaudeResponse> {
+/** POST one turn to the relay. The caller owns the agent loop (tool execution + re-posting). */
+export async function fetchClaude(request: AiRelayRequest): Promise<AiRelayResponse> {
   const res = await fetch('/api/claude', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -10,5 +11,5 @@ export async function fetchClaude(request: ClaudeRequest): Promise<ClaudeRespons
     const text = await res.text()
     throw new Error(`Claude API error ${res.status}: ${text}`)
   }
-  return res.json() as Promise<ClaudeResponse>
+  return res.json() as Promise<AiRelayResponse>
 }

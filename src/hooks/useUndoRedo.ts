@@ -9,7 +9,7 @@ interface UndoRedoState {
   future: Score[]
 }
 
-type UndoRedoAction = ScoreAction | { type: 'UNDO' } | { type: 'REDO' }
+type UndoRedoAction = ScoreAction | { type: 'UNDO' } | { type: 'REDO' } | { type: 'BATCH'; actions: ScoreAction[] }
 
 function undoRedoReducer(state: UndoRedoState, action: UndoRedoAction): UndoRedoState {
   if (action.type === 'UNDO') {
@@ -31,6 +31,18 @@ function undoRedoReducer(state: UndoRedoState, action: UndoRedoAction): UndoRedo
     }
   }
 
+  // A BATCH folds many actions into ONE history entry, so an approved AI multi-edit reverts with a
+  // single undo. Fold through scoreReducer; skip if nothing actually changed.
+  if (action.type === 'BATCH') {
+    const newPresent = action.actions.reduce(scoreReducer, state.present)
+    if (newPresent === state.present) return state
+    return {
+      past: [...state.past, state.present].slice(-50),
+      present: newPresent,
+      future: [],
+    }
+  }
+
   const newPresent = scoreReducer(state.present, action as ScoreAction)
   if (newPresent === state.present) return state
   return {
@@ -49,10 +61,12 @@ export function useUndoRedo(initialScore: Score) {
 
   const undo = useCallback(() => dispatch({ type: 'UNDO' }), [])
   const redo = useCallback(() => dispatch({ type: 'REDO' }), [])
+  const dispatchBatch = useCallback((actions: ScoreAction[]) => dispatch({ type: 'BATCH', actions }), [])
 
   return {
     score: state.present,
     dispatch,
+    dispatchBatch,
     undo,
     redo,
     canUndo: state.past.length > 0,

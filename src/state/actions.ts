@@ -69,6 +69,5 @@ export type ScoreAction =
   | { type: 'SCALE_ANNOTATION'; partId: string; id: string; scaleX: number; scaleY: number }
   | { type: 'UPDATE_TEXT_ANNOTATION'; partId: string; id: string; text?: string; style?: TextAnnotationStyle }
   | { type: 'DELETE_ANNOTATION'; partId: string; id: string }
-  | { type: 'COMMIT_AI_SUGGESTION'; partId: string; measureNumbers: number[]; musicXML: string }
   | { type: 'UNDO' }
   | { type: 'REDO' }

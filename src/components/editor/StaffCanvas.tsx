@@ -1,10 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { renderStaff, type StaffLayout, type NoteGeometry } from '../../lib/vexflow/renderer'
 import { staffYToPitch, staffStepToY, noteHasPitchAtStaffY, STAVE_TOP_OFFSET, LINE_SPACING } from '../../lib/vexflow/hitTest'
-import { measureBeatCount, measureCapacity, isMeasureFull, noteCanFit, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
+import { measureBeatCount, measureCapacity, isMeasureFull, measureRemainingBeats, noteBeatDuration, incompleteVoices, effectiveTimeSigAt } from '../../lib/beats'
 import type { TupletSpec } from './PolyrhythmPicker'
 import { getClipboard, cloneWithFreshIds } from './clipboard'
-import { buildTie } from '../../lib/ties'
 import { InsertStaff } from './InsertStaff'
 import type { ScrollSync } from '../../hooks/useScrollSync'
 import type { PlaybackLayout } from '../../hooks/usePlaybackScroll'
@@ -20,6 +19,8 @@ import type { ScoreAction } from '../../state/actions'
 import { AnnotationsLayer } from './AnnotationsLayer'
 import { annotationBounds, rectHit } from '../../lib/annotations/geometry'
 import { buildAnnotation } from './annotationSpawn'
+import { placeNote, placeRest, addSlurOrTie, addMarking } from '../../lib/editing/commands'
+import type { PartContext, PlacementAnchor } from '../../lib/editing/types'
 import type { CatalogEntry } from '../../lib/annotations/catalog'
 
 const EMPTY_ANNOTATIONS: Annotation[] = []
@@ -124,6 +125,8 @@ interface StaffCanvasProps {
   onFillComplete?: () => void
   onInsertComplete?: () => void
   onPlaceFailed?: () => void
+  /** Reports the keyboard cursor (insertion point) as a semantic location, for the AI's "act here". */
+  onCursorChange?: (cursor: { partId: string; measureNumber: number; eventId?: string } | null) => void
   onRestsCommitted?: (pending: PendingRest[]) => void
   onPlaybackLayoutChange?: (layout: PlaybackLayout) => void
 }
@@ -217,6 +220,7 @@ export function StaffCanvas({
   onFillComplete,
   onInsertComplete,
   onPlaceFailed,
+  onCursorChange,
   onPlaybackLayoutChange,
 }: StaffCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -269,6 +273,15 @@ export function StaffCanvas({
   } | null>(null)
   const keyboardCursorRef = useRef(keyboardCursor)
   keyboardCursorRef.current = keyboardCursor
+
+  // Report the cursor as a semantic location so the AI can resolve "here" with no selection.
+  useEffect(() => {
+    if (!onCursorChange) return
+    if (!keyboardCursor) { onCursorChange(null); return }
+    const m = measures[keyboardCursor.measureIndex]
+    if (!m) { onCursorChange(null); return }
+    onCursorChange({ partId, measureNumber: m.number, eventId: keyboardCursor.anchorId })
+  }, [keyboardCursor, measures, partId, onCursorChange])
 
   const markingRef = useRef(false)
   const markedRef = useRef<Set<string>>(new Set())  // synchronous mirror of markedIds
@@ -1205,9 +1218,9 @@ export function StaffCanvas({
     const target = coords ? nearestHeadAt(coords.x, coords.y) : null
     setTieDrag(null)
     if (!target) return
-    const tie = buildTie(measures, tieDrag.fromId, tieDrag.fromPitchId, target.noteId, target.pitchId)
-    if (!tie) return
-    dispatch({ type: 'ADD_TIES', partId, ties: [tie] })
+    const res = addSlurOrTie({ partId, measures, globalTimeSig: timeSig }, tieDrag.fromId, tieDrag.fromPitchId, target.noteId, target.pitchId)
+    if (!res.ok) return
+    res.actions.forEach(dispatch)
     onTieComplete?.()
   }
 
@@ -1227,7 +1240,8 @@ export function StaffCanvas({
       const g = layoutRef.current?.measures[idx]
       if (!measure || !g) return null
       const { annotation, edit } = buildAnnotation(selectedAnnotation, measure.id, x - g.x, y - STAVE_Y)
-      dispatch({ type: 'ADD_ANNOTATION', partId, annotation })
+      const mr = addMarking({ partId, measures, globalTimeSig: timeSig }, annotation)
+      if (mr.ok) mr.actions.forEach(dispatch)
       onAnnotationSpawned?.(edit ? annotation.id : null)
       return annotation.id
     }
@@ -1279,101 +1293,56 @@ export function StaffCanvas({
         }
       }
     }
-    if (!forceNew && !isRest) {
-      // Proximity is restricted to the target voice: a click near a voice-1 note while
-      // placing into voice 2 must NOT chord onto it — it starts an independent voice-2
-      // stack at that beat instead.
+    // ── Note/rest placement via the shared editing-intent layer (Phase 0) ──
+    // Geometry (which measure, which pitch, which nearby event) is resolved HERE; the
+    // chord-vs-insert-vs-replace-vs-append decision + capacity guard live in `commands.*`,
+    // so the AI executor (Phase 2) produces byte-identical edits to these clicks.
+    //
+    // Anchor resolution mirrors the original branches exactly:
+    //  - note mode: near same-voice NOTE → chord/insert; else near same-voice REST → replace-rest
+    //  - rest mode: near same-voice NOTE → replace-with-rest; a near rest is NOT an anchor (append)
+    // Proximity is restricted to the target voice: a click near a voice-1 note while placing
+    // into voice 2 must NOT chord onto it — it starts an independent voice-2 stack instead.
+    let anchor: PlacementAnchor = { kind: 'append' }
+    let anchoredIndex: number | null = null
+    if (!forceNew) {
       const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X, targetVoice)
       if (nearNote) {
-        const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-        const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
-        const measure = measures[nearNote.measureIndex]
-        const targetEv = measure?.notes.find(n => n.id === nearNote.id)
-        if (measure && targetEv?.type === 'note') {
-          pendingCenterRef.current = nearNote.measureIndex
-          // Same rhythm in the same voice → add this tone to the chord. A different duration
-          // is a distinct rhythmic event within the voice, placed right after the target.
-          if (targetEv.duration === selectedDuration && targetEv.dots === (isDotted ? 1 : 0)) {
-            dispatch({ type: 'ADD_CHORD_NOTE', partId, measureId: measure.id, noteId: nearNote.id, pitch: finalPitch, articulation: selectedArticulation ?? undefined })
-            onNotePlaced?.()
-            return nearNote.id
-          }
-          const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-          if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, nearNote.measureIndex, timeSig), targetVoice)) { onPlaceFailed?.(); return null }
-          const newId = crypto.randomUUID()
-          const insertIdx = measure.notes.findIndex(n => n.id === nearNote.id) + 1
-          dispatch({
-            type: 'INSERT_EVENTS', partId, measureId: measure.id, index: insertIdx,
-            events: [{ id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() }],
-          })
-          onNotePlaced?.()
-          return newId
+        anchor = { kind: 'near', eventId: nearNote.id }
+        anchoredIndex = nearNote.measureIndex
+      } else if (!isRest) {
+        const nearRest = nearestRestAtX(x, CHORD_PROXIMITY_X, targetVoice)
+        if (nearRest) {
+          anchor = { kind: 'near', eventId: nearRest.id }
+          anchoredIndex = nearRest.measureIndex
         }
-        return null
-      }
-      const nearRest = nearestRestAtX(x, CHORD_PROXIMITY_X, targetVoice)
-      if (nearRest) {
-        const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-        const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
-        const measure = measures[nearRest.measureIndex]
-        if (measure) {
-          pendingCenterRef.current = nearRest.measureIndex
-          const newId = crypto.randomUUID()
-          dispatch({
-            type: 'REPLACE_REST',
-            partId,
-            measureId: measure.id,
-            restId: nearRest.id,
-            note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() },
-          })
-          onNotePlaced?.()
-          return newId
-        }
-        return null
-      }
-    } else if (!forceNew) {
-      // Rest mode: clicking an existing note replaces it with a rest — mirror of
-      // replacing a rest with a note above.
-      const nearNote = nearestNoteAtX(x, CHORD_PROXIMITY_X, targetVoice)
-      if (nearNote) {
-        const measure = measures[nearNote.measureIndex]
-        if (measure) {
-          pendingCenterRef.current = nearNote.measureIndex
-          const newId = crypto.randomUUID()
-          dispatch({
-            type: 'REPLACE_EVENT',
-            partId,
-            measureId: measure.id,
-            eventId: nearNote.id,
-            event: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() },
-          })
-          onNotePlaced?.()
-          return newId
-        }
-        return null
       }
     }
-    const idx = getMeasureIndexAtX(x)
+    const idx = anchoredIndex ?? getMeasureIndexAtX(x)
     const measure = measures[idx]
     if (!measure) return null
-    const candidate = { duration: selectedDuration, dots: isDotted ? 1 : 0 }
-    if (!noteCanFit(measure, candidate, effectiveTimeSigAt(measures, idx, timeSig), targetVoice)) {
-      onPlaceFailed?.()
-      return null
-    }
-    placementAppendedRef.current = true
+
+    const ctx: PartContext = { partId, measures, globalTimeSig: timeSig }
+    const dots: 0 | 1 = isDotted ? 1 : 0
+    const result = isRest
+      ? placeRest(ctx, { measureId: measure.id, duration: selectedDuration, dots, voice: targetVoice, anchor, articulations: selArt() })
+      : placeNote(ctx, {
+          measureId: measure.id,
+          pitch: toConcert((() => {
+            const pitch = staffYToPitch(snapY, STAVE_Y, clef)
+            return selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch
+          })()),
+          duration: selectedDuration, dots, voice: targetVoice, anchor, articulations: selArt(),
+        })
+
+    if (!result.ok) { onPlaceFailed?.(); return null }
     pendingCenterRef.current = idx
-    const newId = crypto.randomUUID()
-    if (isRest) {
-      dispatch({ type: 'ADD_REST', partId, measureId: measure.id, rest: { id: newId, type: 'rest', duration: selectedDuration, dots: isDotted ? 1 : 0, voice: targetVoice, articulations: selArt() } })
-      onNotePlaced?.()
-    } else {
-      const pitch = staffYToPitch(snapY, STAVE_Y, clef)
-      const finalPitch = toConcert(selectedAccidental !== null ? { ...pitch, accidental: selectedAccidental } : pitch)
-      dispatch({ type: 'ADD_NOTE', partId, measureId: measure.id, note: { id: newId, type: 'note', pitches: [finalPitch], duration: selectedDuration, dots: isDotted ? 1 : 0, tied: false, voice: targetVoice, articulations: selArt() } })
-      onNotePlaced?.()
-    }
-    return newId
+    // `placementAppendedRef` distinguishes an append (cursor advances past a fresh tail event)
+    // from an in-place edit (chord/insert/replace) — true only on the append path, as before.
+    if (anchor.kind === 'append') placementAppendedRef.current = true
+    for (const a of result.actions) dispatch(a)
+    onNotePlaced?.()
+    return result.placedId ?? null
   }
   // Stable ref so the keydown handler always calls the current closure.
   const placeAtRef = useRef(placeAt)

@@ -740,7 +740,6 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
       // UNDO/REDO handled in useUndoRedo hook — no-op here
       case 'UNDO':
       case 'REDO':
-      case 'COMMIT_AI_SUGGESTION':
         break
     }
   })

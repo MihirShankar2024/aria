@@ -10,6 +10,9 @@ import { DurationToolbar } from './DurationToolbar'
 import type { TupletSpec } from './PolyrhythmPicker'
 import type { CatalogEntry } from '../../lib/annotations/catalog'
 import { PartsSidebar } from './PartsSidebar'
+import { AiPromptBox } from '../ai-panel/AiPromptBox'
+import { useAiAgent } from '../../hooks/useAiAgent'
+import type { AiSelection } from '../../lib/ai/serializeForAi'
 import { AddInstrumentButton } from './AddInstrumentButton'
 import { RemoveTrackDialog, MeasuresDialog } from './TrackDialogs'
 import { PlaybackBar } from '../playback/PlaybackBar'
@@ -53,7 +56,11 @@ function groupParts(parts: Part[]): PartGroup[] {
 }
 
 export function ScoreEditor() {
-  const { score, dispatch, undo, redo } = useScore()
+  const { score, dispatch, dispatchBatch, undo, redo } = useScore()
+  const ai = useAiAgent(dispatchBatch)
+  // Latest keyboard cursor reported by a single-staff canvas, so the AI can resolve "here". Ref to
+  // avoid re-rendering on cursor moves.
+  const aiCursorRef = useRef<{ partId: string; measureNumber: number; eventId?: string } | null>(null)
   const { status, play, pause, reset } = usePlayback()
 
   const [selectedDuration, setSelectedDuration] = useState<Duration>('quarter')
@@ -661,6 +668,25 @@ export function ScoreEditor() {
 
   return (
     <div className="relative min-h-screen text-white flex flex-col">
+      {/* AI prompt box: native Score → Claude tool use → commands.* → staged diff → approve. */}
+      <AiPromptBox
+        onSubmit={(prompt) => {
+          const selection: AiSelection = {
+            partIds: [...new Set(score.parts.filter(p => p.measures.some(m => m.notes.some(n => selectedNoteIds.has(n.id)))).map(p => p.id))],
+            measureNumbers: [...new Set(score.parts.flatMap(p => p.measures.filter(m => m.notes.some(n => selectedNoteIds.has(n.id))).map(m => m.number)))],
+            noteIds: [...selectedNoteIds],
+            cursor: aiCursorRef.current ?? undefined,
+          }
+          return ai.send(prompt, score, selection)
+        }}
+        pending={ai.pending}
+        error={ai.error}
+        explanation={ai.explanation}
+        staged={ai.staged}
+        onApprove={ai.approve}
+        onReject={ai.reject}
+        onClearChat={ai.clearChat}
+      />
       {/* Cross-track rubber band: one box in client coords so it spans every staff seamlessly. */}
       {selectionDrag && (
         <div
@@ -801,6 +827,7 @@ export function ScoreEditor() {
                   annotations={part.annotations ?? EMPTY_ANNOTATIONS}
                   {...playbackLayoutProps}
                   {...commonCanvasProps}
+                  onCursorChange={(c) => { aiCursorRef.current = c }}
                 />
               </div>
             )

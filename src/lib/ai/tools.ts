@@ -91,6 +91,8 @@ export const AI_TOOLS: Anthropic.Messages.Tool[] = [
   tool('addPart', 'Add an instrument part.', { name: { type: 'string' }, instrument: { type: 'string' }, clef: { type: 'string', enum: ['treble', 'bass', 'alto'] } }, ['name', 'instrument', 'clef']),
   tool('addPianoPart', 'Add a grand-staff piano part.', {}, []),
   tool('setPartInstrument', 'Change a part instrument.', { partId: { type: 'string' }, instrument: { type: 'string' } }, ['partId', 'instrument']),
+  // ── interactive ──
+  tool('askUser', 'Ask the user to choose or confirm, shown inline as a clickable question box. Use this instead of asking in prose and waiting for a new message. Provide options for quick answers; set multiSelect for "pick any". The user may also type a custom answer.', { question: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, multiSelect: { type: 'boolean' } }, ['question']),
   // ── read-only ──
   tool('listMarkings', 'List valid marking symbolIds (dynamics/ornaments/symbols/text) for addMarking, so you use a real id instead of guessing.', {}, []),
   tool('getMeasures', 'Read full note detail for a measure-number range (use on large scores to inspect bars outside the focus window before editing them).', { fromMeasure: { type: 'integer' }, toMeasure: { type: 'integer' }, partId: { type: 'string' } }, ['fromMeasure', 'toMeasure']),

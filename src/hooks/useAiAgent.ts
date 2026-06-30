@@ -6,7 +6,7 @@ import { scoreReducer } from '../state/scoreReducer'
 import { fetchClaude } from '../api/claude'
 import { SYSTEM_PROMPT } from '../lib/ai/systemPrompt'
 import { scoreForAi, type AiSelection } from '../lib/ai/serializeForAi'
-import { AI_TOOLS, EDIT_TOOLS } from '../lib/ai/tools'
+import { AI_TOOLS } from '../lib/ai/tools'
 import { executeToolCall } from '../lib/ai/executor'
 
 const MODEL = 'claude-opus-4-8'
@@ -15,13 +15,29 @@ const MODEL = 'claude-opus-4-8'
 // the system prompt) keeps this comfortable.
 const MAX_ITERATIONS = 20
 
+/** A pending in-chat question the model raised via the `askUser` tool. */
+export interface PendingQuestion {
+  text: string
+  options: string[]
+  multiSelect: boolean
+}
+
+/** One entry in the visible chat transcript. */
+export interface UiTurn {
+  id: string
+  role: 'user' | 'assistant'
+  text?: string
+  status?: 'working' | 'done' | 'error'
+  staged?: { actions: ScoreAction[] }       // edits proposed this turn, awaiting approve
+  applied?: 'approved' | 'rejected'
+  question?: PendingQuestion                 // shown as an inline QuestionBox
+}
+
 /**
  * Return a copy of `messages` with a rolling `cache_control` breakpoint on the last content block of
  * the most recent message. Combined with the breakpoint on the system block, this caches the entire
- * prefix (tools + system + score + prior turns) within a prompt's tool loop — each iteration pays full
- * price only for the newly appended tool_results. `messages[0]` (the score) never changes within a
- * prompt, so it's cached from iteration 2 on. Keeps the canonical `messages` array untagged so only
- * two breakpoints exist at a time (≤4 limit).
+ * prefix within a prompt's tool loop — each iteration pays full price only for newly appended
+ * tool_results. Keeps the canonical `messages` untagged so only two breakpoints exist (≤4 limit).
  */
 function withRollingCache(messages: Anthropic.Messages.MessageParam[]): Anthropic.Messages.MessageParam[] {
   if (messages.length === 0) return messages
@@ -38,37 +54,41 @@ function withRollingCache(messages: Anthropic.Messages.MessageParam[]): Anthropi
   return out
 }
 
-export interface StagedEdit {
-  actions: ScoreAction[]      // all edits the agent staged this turn (apply in order)
-  summary: string[]           // human-readable per-tool summary lines
-}
+let uid = 0
+const newTurnId = () => `t${uid++}`
 
 /**
- * Client-orchestrated agent loop. Sends the native Score + prompt to Claude, executes the tool
- * calls locally through `commands.*` (via the executor), and ACCUMULATES edits against a working
- * score copy (folded through the reducer) so multi-step edits and capacity checks stay correct.
- * Nothing touches the live score until the user approves the staged batch.
+ * Client-orchestrated agent loop with a chat surface. Sends the native Score + prompt to Claude,
+ * executes tool calls locally through `commands.*` (via the executor), and ACCUMULATES edits against
+ * a working score copy (folded through the reducer) so multi-step edits + capacity stay correct;
+ * nothing touches the live score until the user approves. The model can pause for a structured
+ * answer via the `askUser` tool (rendered inline as a QuestionBox).
  */
 export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
+  const [turns, setTurns] = useState<UiTurn[]>([])
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [explanation, setExplanation] = useState<string>('')
-  const [staged, setStaged] = useState<StagedEdit | null>(null)
   const [cacheHit, setCacheHit] = useState<number | null>(null)
-  // Where the conversation has been working, so a large-score focus window can default here when
-  // nothing is selected (keeps the model's context near recent edits).
+
   const focusRef = useRef<number[] | undefined>(undefined)
-  // Cross-prompt memory: compact TEXT-only prior turns (prompt + explanation), so follow-ups like
-  // "now make that louder" resolve. We do NOT keep tool_use/tool_result blocks across prompts
-  // (bulky + pairing-sensitive); the current score is re-sent each turn anyway.
+  // Cross-prompt model memory: compact TEXT-only prior turns (prompt + final summary).
   const historyRef = useRef<Anthropic.Messages.MessageParam[]>([])
+  const cancelledRef = useRef(false)
+  // Resolver for the awaited askUser answer (set while a question is open).
+  const answerResolverRef = useRef<((answer: string) => void) | null>(null)
+
+  const patchTurn = useCallback((id: string, patch: Partial<UiTurn>) => {
+    setTurns(ts => ts.map(t => (t.id === id ? { ...t, ...patch } : t)))
+  }, [])
 
   const send = useCallback(async (prompt: string, score: Score, selection: AiSelection) => {
-    setPending(true)
     setError(null)
-    setExplanation('')
-    setStaged(null)
+    setPending(true)
+    cancelledRef.current = false
     if (selection.measureNumbers.length) focusRef.current = selection.measureNumbers
+
+    const asstId = newTurnId()
+    setTurns(ts => [...ts, { id: newTurnId(), role: 'user', text: prompt }, { id: asstId, role: 'assistant', status: 'working' }])
 
     const system: Anthropic.Messages.TextBlockParam[] = [
       { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
@@ -80,33 +100,44 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
 
     let working = score
     const stagedActions: ScoreAction[] = []
-    const summary: string[] = []
-    const texts: string[] = []
+    let finalText = ''
     let lastStop: string | null = null
+
+    // Park a promise the QuestionBox resolves; the loop awaits the user's answer.
+    const ask = (q: PendingQuestion): Promise<string> => {
+      patchTurn(asstId, { question: q, status: 'working' })
+      return new Promise<string>(resolve => { answerResolverRef.current = resolve })
+    }
 
     try {
       for (let i = 0; i < MAX_ITERATIONS; i++) {
+        if (cancelledRef.current) break
         const res = await fetchClaude({ model: MODEL, max_tokens: 8000, system, messages: withRollingCache(messages), tools: AI_TOOLS })
         setCacheHit(res.usage?.cache_read_input_tokens ?? null)
         lastStop = res.stop_reason
         messages.push({ role: 'assistant', content: res.content as Anthropic.Messages.ContentBlockParam[] })
 
+        const iterText = res.content.filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text').map(b => b.text).join('\n').trim()
+        if (iterText) finalText = iterText   // last non-empty text block = the wrap-up summary
+
         const toolResults: Anthropic.Messages.ContentBlockParam[] = []
         for (const block of res.content) {
-          if (block.type === 'text') texts.push(block.text)
-          else if (block.type === 'tool_use') {
-            const outcome = executeToolCall(working, block.name, block.input as Record<string, unknown>)
-            if (!outcome.isError && outcome.actions.length) {
-              for (const a of outcome.actions) { working = scoreReducer(working, a); stagedActions.push(a) }
-              if (EDIT_TOOLS.has(block.name)) summary.push(describeTool(block.name, block.input as Record<string, unknown>))
-            }
-            toolResults.push({
-              type: 'tool_result', tool_use_id: block.id,
-              content: JSON.stringify(outcome.result), is_error: outcome.isError,
-            })
+          if (block.type !== 'tool_use') continue
+          if (block.name === 'askUser') {
+            const input = block.input as { question?: string; options?: string[]; multiSelect?: boolean }
+            const answer = await ask({ text: input.question ?? 'Choose:', options: input.options ?? [], multiSelect: !!input.multiSelect })
+            patchTurn(asstId, { question: undefined })
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: answer })
+            continue
           }
+          const outcome = executeToolCall(working, block.name, block.input as Record<string, unknown>)
+          if (!outcome.isError && outcome.actions.length) {
+            for (const a of outcome.actions) { working = scoreReducer(working, a); stagedActions.push(a) }
+          }
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(outcome.result), is_error: outcome.isError })
         }
 
+        if (cancelledRef.current) break
         if (res.stop_reason === 'tool_use' && toolResults.length) {
           messages.push({ role: 'user', content: toolResults })
           continue
@@ -114,73 +145,56 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
         break
       }
 
-      const explanationText = texts.join('\n').trim()
-      setExplanation(explanationText)
-      setStaged(stagedActions.length ? { actions: stagedActions, summary } : null)
+      const stagedEdit = stagedActions.length ? { actions: stagedActions } : undefined
+      patchTurn(asstId, { status: cancelledRef.current ? 'done' : 'done', text: finalText || (stagedEdit ? 'Made the requested edits.' : ''), staged: stagedEdit, question: undefined })
 
-      // Robust stop reasons: surface refusal / truncation instead of silently showing nothing.
-      // `lastStop === 'tool_use'` after the loop means we hit MAX_ITERATIONS while the model still
-      // wanted to keep calling tools — the work is partial, so say so.
       if (lastStop === 'refusal') setError('Claude declined this request.')
-      else if (lastStop === 'max_tokens') setError('The response was cut off (max tokens). Try a smaller or more specific request.')
-      else if (lastStop === 'tool_use') setError('Stopped early — this request needed more steps than allowed. The edits so far are staged; approve them, then ask me to continue.')
+      else if (lastStop === 'max_tokens') setError('The response was cut off (max tokens). Try a smaller request.')
+      else if (lastStop === 'tool_use' && !cancelledRef.current) setError('Stopped early — needed more steps than allowed. Approve what’s staged, then ask me to continue.')
 
-      // Persist a compact text turn for cross-prompt memory (last ~3 exchanges).
       historyRef.current = [
         ...historyRef.current,
         { role: 'user', content: prompt } as Anthropic.Messages.MessageParam,
-        { role: 'assistant', content: explanationText || '(made edits)' } as Anthropic.Messages.MessageParam,
+        { role: 'assistant', content: finalText || '(made edits)' } as Anthropic.Messages.MessageParam,
       ].slice(-6)
     } catch (err) {
+      patchTurn(asstId, { status: 'error', text: err instanceof Error ? err.message : 'Something went wrong.' })
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
+      answerResolverRef.current = null
       setPending(false)
     }
+  }, [patchTurn])
+
+  /** Resolve the open question (from QuestionBox), continuing the loop. */
+  const answerQuestion = useCallback((answer: string) => {
+    answerResolverRef.current?.(answer)
+    answerResolverRef.current = null
+  }, [])
+
+  const cancel = useCallback(() => {
+    cancelledRef.current = true
+    answerResolverRef.current?.('(cancelled)')   // unblock a parked question
+    answerResolverRef.current = null
   }, [])
 
   const clearChat = useCallback(() => {
     historyRef.current = []
     focusRef.current = undefined
-    setStaged(null); setExplanation(''); setError(null)
+    setTurns([]); setError(null)
   }, [])
 
-  const approve = useCallback(() => {
-    if (!staged) return
-    dispatchBatch(staged.actions)   // one undo entry for the whole AI edit
-    setStaged(null)
-  }, [staged, dispatchBatch])
+  const approve = useCallback((turnId: string) => {
+    setTurns(ts => ts.map(t => {
+      if (t.id !== turnId || !t.staged) return t
+      dispatchBatch(t.staged.actions)
+      return { ...t, applied: 'approved' }
+    }))
+  }, [dispatchBatch])
 
-  const reject = useCallback(() => setStaged(null), [])
+  const reject = useCallback((turnId: string) => {
+    setTurns(ts => ts.map(t => (t.id === turnId ? { ...t, applied: 'rejected' } : t)))
+  }, [])
 
-  return { send, pending, error, explanation, staged, cacheHit, approve, reject, clearChat }
-}
-
-function describeTool(name: string, input: Record<string, unknown>): string {
-  switch (name) {
-    case 'placeNote': { const p = input.pitch as { step: string; octave: number } | undefined; return `add ${input.duration} ${p ? p.step + p.octave : 'note'} (voice ${input.voice})` }
-    case 'placeRest': return `add ${input.duration} rest (voice ${input.voice})`
-    case 'replaceWithRest': return `replace with ${input.duration} rest`
-    case 'addChordNote': { const p = input.pitch as { step: string; octave: number } | undefined; return `add ${p ? p.step + p.octave : 'tone'} to chord` }
-    case 'removeChordNote': return 'remove chord tone'
-    case 'deleteEvent': return 'delete event'
-    case 'setEventVoice': return `move to voice ${input.toVoice}`
-    case 'clearVoice': return `clear voice ${input.voice}`
-    case 'addSlurOrTie': return 'add tie/slur'
-    case 'removeTie': return 'remove tie/slur'
-    case 'setArticulation': return `${input.on ? 'add' : 'remove'} ${input.articulation}`
-    case 'addMarking': return `add marking ${input.symbolId ?? `"${input.text}"`}`
-    case 'createTuplet': return `tuplet ${input.played}:${input.inSpaceOf}`
-    case 'removeTuplet': return 'remove tuplet'
-    case 'addMeasures': return `add ${input.count} measure(s)`
-    case 'insertMeasures': return `insert ${input.count} measure(s) at ${input.at}`
-    case 'removeMeasures': return `remove measures ${input.start}–${input.end}`
-    case 'setTimeSig': return `time signature ${input.beats}/${input.beatType}${input.at ? ` at ${input.at}` : ''}`
-    case 'setKeySig': return `key signature (${input.fifths} fifths, ${input.mode})`
-    case 'setTempo': return `tempo ${input.tempo}`
-    case 'setTitle': return `title "${input.title}"`
-    case 'addPart': return `add part ${input.name}`
-    case 'addPianoPart': return 'add piano part'
-    case 'setPartInstrument': return 'change instrument'
-    default: return name
-  }
+  return { send, pending, error, turns, cacheHit, approve, reject, answerQuestion, cancel, clearChat }
 }

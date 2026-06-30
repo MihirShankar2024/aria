@@ -679,12 +679,13 @@ export function ScoreEditor() {
           }
           return ai.send(prompt, score, selection)
         }}
+        turns={ai.turns}
         pending={ai.pending}
         error={ai.error}
-        explanation={ai.explanation}
-        staged={ai.staged}
         onApprove={ai.approve}
         onReject={ai.reject}
+        onAnswer={ai.answerQuestion}
+        onCancel={ai.cancel}
         onClearChat={ai.clearChat}
       />
       {/* Cross-track rubber band: one box in client coords so it spans every staff seamlessly. */}

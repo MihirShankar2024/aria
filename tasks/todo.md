@@ -1,122 +1,126 @@
-# AI Phase — Plan
+# AI changes — pitch display, meter capacity, marking placement engine
 
-## Decision (locked)
-The AI controls the project **like a user**:
-- **READ:** the full native `Score` JSON (lossless — includes Layer-2 placement: `GlyphOffset`, `TieCurveOverride`, annotation anchors, scales). NOT a lossy MusicXML export.
-- **WRITE:** a high-level **editing-intent vocabulary** (the same one the UI uses), executed through the **same reducer** a user's clicks flow through.
+## 1. AI talks/reads pitch in the user's DISPLAYED space (concert vs transposed view)  [SMALL]
 
-Consequence: MusicXML stops being the AI channel. The Category-A round-trip losses (ties/chords/articulations/tempo/voices dropped in MusicXML) demote from "AI is blind" blockers to **file import/export fidelity bugs** (lower priority).
+`transposedView` (ScoreEditor:120, default true) renders transposing parts as WRITTEN pitch; the AI
+always talks concert → mismatch. Snapshot stays concert (ids/anchors depend on it); only change how the
+AI TALKS + interprets user-named pitches for transposing parts.
 
-## Decisions (locked 2026-06-29)
-- **Edit flow:** propose -> user approves. AI tool calls produce a previewed suggestion/diff; nothing hits the score until accepted. Reuse existing suggestion UI.
-- **Phase 0 scope:** refactor `StaffCanvas.tsx` onto the shared `commands.*` layer (not built alongside) — the only thing that proves the AI layer behaves identically to a human.
-- **Ears scope:** build the FULL analysis suite (Phase 1.5) before enabling AI write (Phase 2). New ordering: 0 -> 1 -> 1.5 -> 2 -> 3.
-- **Models:** Opus 4.8 (`claude-opus-4-8`) for composition/edit reasoning; Haiku (`claude-haiku-4-5`) for the deterministic-tool-driven analysis calls.
+- [ ] `useAiAgent.send(..., transposedView)`; ScoreEditor passes its `transposedView` through AiPromptBox.
+- [ ] `scoreForAi` head gains `pitchDisplay: 'concert' | 'written'` (via ScoreViewOpts).
+- [ ] `systemPrompt.ts`: static "Talking about pitch" rule — when `pitchDisplay:'written'`, for a part
+      with non-zero transposition, name pitches to the user in WRITTEN terms and read user pitches for
+      that part as written (`pitchSpace:'written'`). Non-transposing / concert view unchanged.
 
-## Context & caching strategy (locked — enforce from Phase 1)
-The model is STATELESS — background must be sent every request, but prompt caching makes the repeat ~0.1x.
-Caching is a PREFIX MATCH: any byte change in the prefix invalidates everything after it.
-- **Frozen system block (cached, written once):** `Score` schema + command vocabulary + rules + tool schemas.
-  Author in code (git is our versioning). Must be byte-stable — NO interpolated score, measure numbers,
-  timestamps, IDs, or per-request flags.
-- **Volatile, AFTER the cache point (in `messages`):** the current `Score` JSON, cursor/selection, the user's request.
-- **NOT Managed Agents.** That surface hosts a server-side container loop (bash/file/code in a sandbox); Aria is
-  client-orchestrated tool use over in-browser state with a human approval gate. Wrong fit — all cost, no benefit.
-- Verify caching via `usage.cache_read_input_tokens` > 0 on repeat calls. Put `cache_control` on the last system block.
-- Consequence for Phase 1: current `useAiPanel.ts` interpolates measure numbers + full MusicXML INTO the system
-  prompt every call — that defeats caching. Rewrite so schema/vocab/rules are frozen; score+selection go in the user turn.
+## 2. Never overfill a measure (asked 6/8 → got 12/8)  [SMALL]
 
-## Keystone problem
-"Act like a user" intelligence is split:
-- `StaffCanvas.tsx` owns the intent->action decision tree (chord vs insert vs replace-rest vs append) AND the `noteCanFit` capacity guard for the ADD/INSERT paths.
-- `scoreReducer.ts` guards only `REPLACE_*`, and always runs `normalizeByVoice`/`pruneTuplets`.
+`noteCanFit` already rejects overfill on ENTRY; the bug is order-dependent — note calls folded BEFORE
+the `setTimeSig` in the same turn validate against the old meter.
 
-If the AI emits raw low-level actions it bypasses `noteCanFit` (overfills) and must re-derive the decision tree -> diverges from user behavior. So the editing intent must become one shared headless layer.
+- [ ] `useAiAgent`: within one turn, stage STRUCTURAL/global calls (setTimeSig/Key/add/insert/remove
+      Measures) into `working` BEFORE note-entry calls (results keyed by id, so result order is free).
+- [ ] `systemPrompt.ts`: meter guidance — set time sig before writing; capacity = beats×4/beatType
+      quarter-beats (6/8 = 3 quarter-beats = six eighths; 12 eighths = 12/8).
 
-## Phase 0 — Shared editing-intent layer (the keystone)
-- [ ] Create `src/lib/editing/commands.ts` (pure/headless). Functions mirror user intents and return `ScoreAction[]` or a typed rejection:
-      `placeNote`, `placeRest`, `addChordNote`, `replaceWithRest`, `placeTupletNote`, `addSlurOrTie`, `setArticulation`,
-      `addMarking`, `setTimeSig`, `setKeySig`, `setTempo`, `addMeasures`, `createTuplet`, ...
-- [ ] **Voice-aware entry:** every entry command takes an explicit `voice: VoiceNumber` (default 1).
-      Today the target voice is implicit toolbar/keyboard state (`activeVoice`; Alt -> voice 2 at StaffCanvas:1234)
-      — the AI has no toolbar, so make it a parameter. Move the chord-vs-new-voice proximity rule with it
-      (a note placed near voice-1 while targeting voice 2 starts an INDEPENDENT voice, does NOT chord onto voice 1 —
-      StaffCanvas:1283). New commands: `setEventVoice` (move an event 1<->2), `clearVoice` (drop voice 2 in a measure).
-- [ ] **Generalized markings:** replace `setDynamic`/`addAnnotation` with one `addMarking({kind: 'glyph'|'line'|'text', ...})`
-      covering dynamics (glyph, e.g. symbolId `dyn.sfz`), ornaments, hairpins (line), and text — all -> `ADD_ANNOTATION`.
-      Siblings: `removeMarking` (DELETE_ANNOTATION), `updateText` (UPDATE_TEXT_ANNOTATION).
-      Target may be a measure OR an event (resolved to `measureX + dx` at the event's position).
-      ACCEPTED LIMITATION: annotations anchor to measure+pixel, not beat (score.ts:142) — a marking targeted at an
-      event follows the MEASURE, not that note, if the bar reflows/widens. True beat-anchoring = AnnotationAnchor
-      model change, deferred (NOT Phase 0). AI must still never touch manual-placement fields.
-- [ ] Move `noteCanFit` + the placement decision tree out of `StaffCanvas.tsx` into this module.
-- [ ] Refactor `StaffCanvas.tsx` to call `commands.*` (proves the layer is faithful — manual editor must behave identically).
-- [ ] Verify: manual note entry / chord / rest-replace / capacity-reject / voice-2 placement all still work unchanged.
+## 3. Marking placement engine — routed AFTER the AI, per user spec  [LARGE]
 
-## Phase 1 — AI read path
-- [ ] In `useAiPanel.ts`, replace `scoreToMusicXML(score)` with the full `Score` JSON + a compact cursor/selection context.
-- [ ] System prompt teaches the `Score` schema + the command vocabulary.
-- [ ] Keep `scoreToMusicXML` ONLY for file export.
+Decisions locked with user: anchor marks to an **event id**; **AI-created marks only** (manual drag
+still overrides, like ties); **include grace/tremolo/gliss now** (all already catalog glyph/line
+entries — this is event-anchored placement, not new rhythm entities); **skip rehearsal** for now.
 
-## Phase 1.5 — Musical reasoning substrate (the AI's "ears")
-Music theory is symbolic; the AI reasons better over structure than over audio. Don't make the
-LLM be the music engine — give it resolved pitches + a sounding timeline + analysis tools it can call.
-- [ ] Emit the playback schedule as DATA (refactor playback.ts/timeline.ts core): absolute time +
-      resolved concert MIDI per note. This is the AI's "ears" — the SAME schedule the speakers get.
-- [ ] Feed the AI resolved sounding pitches (`resolvePartAccidentals`), not raw step+accidental.
-- [ ] Analysis tools (deterministic, AI-callable):
-      `getSoundingTimeline(range)` (vertical sonorities + per-voice lines, MIDI+names),
-      `analyzeHarmony(range)` (chords/Roman numerals/non-chord tones vs key),
-      `findDissonances(range)` (m2/M7/tritone with locations),
-      `checkVoiceLeading(range)` (parallel 5ths/8ves, leaps, out-of-key).
-- [ ] Limit on record: objective issues caught reliably; subjective "sounds good/stylish" stays human-in-loop.
+### Placement spec (routing table)
+| symbolId(s) | H anchor | V zone | notes |
+|---|---|---|---|
+| `dyn.*` (p/f/mf/…) | measure start (after sigs) | below lowest note | default below; flip above if below occupied |
+| `dyn.sf*`,`fz`,`sfz*`,`rf*` (sforzando fam.) | applicable beat x (event) | under lowest note of that beat | shift right at bar start (clear sigs) |
+| `text.tempo` | measure start (after sigs) | above staff | stack above |
+| `text.*` (plain/expr/heading) | measure start | above highest note | stack above |
+| `orn.trill/mordent*/turn*` (+ orn.acc*) | centered over the note | above note | trillExt line stretches |
+| `orn.grace/appoggiatura` | left of the note | on note | |
+| `orn.tremolo1-3` | on the note stem | on stem | |
+| `orn.gliss`,`orn.trillExt` (lines) | event head → end event head | between heads | 2-endpoint |
+| `orn.arpeggio` | left of note | spans chord height | existing vertical stretch |
+| `sym.repeatBegin/End` | left of measure, after sigs | vertical staff center | |
+| `sym.segno/coda/pedal*/simile/…` | top-left of measure/effect area | above staff | scale to fit |
+| `measureNumber` | measure start | above staff | existing box |
+Collision flow: within a measure, auto marks group by side (above/below), sort by priority, stack
+OUTWARD so none overlap ("dynamics default below, above if already below" is the general rule).
 
-## Phase 2 — AI write path (tool use)
-- [ ] Define Claude tool-use schemas = the command vocabulary from Phase 0.
-- [ ] Executor: validate each tool call -> run through `commands.*` -> dispatch -> reducer. Surface rejections back to the AI.
-- [ ] Remove dead `COMMIT_AI_SUGGESTION` case + unwired `musicXMLToScore` (or repurpose parser for file import only).
+### Data model — types/score.ts
+- [ ] `AnnotationAnchor`: add optional `eventId?`, `pitchId?` (target note/head), `auto?: boolean`
+      (auto-placed, not yet user-overridden). Line annotations: add optional end `endEventId?/endPitchId?`
+      for gliss/trillExt notehead→notehead.
 
-## Phase 3 — Close playback/export divergences (so AI hears/exports what it writes)
-- [ ] Playback per-part time sig (currently reads `parts[0]` only — playback.ts:73).
-- [ ] Playback honor articulations (staccato/fermata) + dynamics velocity (stretch).
-- [ ] File fidelity (lower pri now): parser `<chord/>` handling; serialize/parse `part.ties` (tie+slur+stop), articulations, annotations, tempo; voices >2.
-- [ ] Parts unequal measure length / measure-number alignment.
+### Placement engine — new `src/lib/annotations/placement.ts`
+- [ ] `placementRuleFor(ann): { h: HAnchor; v: Zone; scaleToFit?; twoEnd? }` — the switch keyed by
+      kind + symbolId category (table above). Pure, unit-testable.
+- [ ] `layoutMeasureMarks(autoMarks, geom)` — resolves each mark's (x,y) from geometry and stacks
+      within zones to avoid overlap (the "flow"). Handles the below→above flip.
 
-## Known accepted limitations (on record before build)
-1. **Frozen tie/slur arch won't re-avoid NEW collisions.** A user-set `cp1` *replaces* the auto
-   collision-avoidance value, so if the AI introduces a tall note poking under a hand-tuned arch,
-   the arch follows positionally but won't re-grow to clear it. Pre-existing (same for manual edits).
-2. **Annotations track their measure, not a beat within it.** Resolved as `measureX + dx` (fixed px
-   from the measure's left edge). Travels with the measure across reflow/line-breaks, but if the AI
-   *widens* a measure a dynamic may no longer sit under its original note. Pre-existing.
-Both are accepted; the AI must NOT touch the manual-placement fields — they auto-follow at render time.
+### Geometry — renderer + StaffCanvas
+- [ ] renderer: add `noteStartX` to `MeasureGeometry` (`stave.getNoteStartX()`); add stem extent to
+      `NoteGeometry` (`stemTopY`,`stemBottomY`) for over-note / under-note / on-stem placement.
+- [ ] StaffCanvas: pass a geometry accessor to AnnotationsLayer (measure x-range + noteStartX + staff
+      top/bottom; per-event x + note top/bottom + stem; per-measure highest/lowest note; resolve
+      eventId→geometry).
+
+### Layer — AnnotationsLayer.tsx
+- [ ] For `anchor.auto` marks, compute (x,y) via `layoutMeasureMarks` instead of `mx+dx / staveY+dy`.
+- [ ] Drag end → dispatch MOVE_ANNOTATION with concrete dx/dy; reducer clears `auto` (manual override,
+      "until adjusted by user, like ties").
+
+### AI path — tools.ts / executor.ts / systemPrompt.ts
+- [ ] `addMarking` tool: drop dx/dy; add optional `eventId`/`pitchId` (+ `toEventId`/`toPitchId` for
+      gliss). Executor sets `anchor.auto=true` + event refs; NO zone stored (derived from symbolId).
+- [ ] System prompt: AI targets a NOTE for note-anchored marks (dynamics beat, ornaments, tremolo,
+      gliss); never sets position. Add a `placeOrnament`/reuse addMarking guidance.
+
+### Reducer — scoreReducer.ts
+- [ ] MOVE_ANNOTATION clears `anchor.auto`. ADD_ANNOTATION unchanged.
+
+## Verify
+- [ ] `pnpm test` green (add `placement.test.ts` for the routing switch + stacking); `pnpm build` clean.
+- [ ] Manual: transposed Bb trumpet → AI names written pitch; "6/8 melody" → six eighths at 6/8;
+      dynamics below / text above / sforzando under beat / trill over note / no overlaps.
 
 ## Review
-### Phase 0 — core keystone landed (2026-06-29)
-DONE & verified (build + typecheck + 16 vitest tests all green; zero new lint):
-- `src/lib/editing/types.ts` — `CommandResult`, typed `Rejection`, `PartContext`, `PlacementAnchor`, param types.
-  Commands take a `PartContext { partId, measures, globalTimeSig }` (NOT the whole Score) — matches how
-  the editor reasons (placement is per-part) and lets StaffCanvas, which never holds the Score, call them.
-- `src/lib/editing/commands.ts` — full vocabulary: placeNote/placeRest/replaceWithRest (decision tree lifted
-  verbatim from `placeAt`), addChordNote/removeChordNote/deleteEvent, setEventVoice/clearVoice,
-  addSlurOrTie/removeTie, setArticulation, addMarking/removeMarking, createTuplet/removeTuplet, and the
-  structure/global wrappers. Cross-voice `near` anchor falls through to append (guards AI from chording
-  across voices; mirrors StaffCanvas voice-filtered geometry).
-- `StaffCanvas.placeAt` placement path refactored to geometry -> PlacementRequest -> placeNote/placeRest ->
-  dispatch. `placementAppendedRef`/`pendingCenterRef`/`onPlaceFailed` side effects preserved exactly.
-  `noteCanFit` import removed from StaffCanvas (now lives only in commands).
-- vitest added (`pnpm test`); `commands.test.ts` covers append/chord/insert-fits/insert-overflow/replace-rest/
-  append-overflow/voice-2-independent/unknown-measure/rest-replace/dup-chord/last-tone/tie-invalid/tie-ok/voice-move.
+All three parts landed. Typecheck + build clean; 36 tests pass (10 new in placement.test.ts).
 
-ROUTING (done 2026-06-29): tie-drag (StaffCanvas ~1210) -> `addSlurOrTie`; annotation drop (~1232) -> `addMarking`.
-`buildTie` import dropped from StaffCanvas (now only inside commands). STILL in StaffCanvas by design:
-tuplet entry (PLACE_TUPLET_NOTE — geometry-heavy, deferred) and modifier-tool glyph/UPDATE_NOTE ops (pixel-UI, out of scope).
+- **Part 1** — `send(...,transposedView)` (ScoreEditor→useAiAgent), `pitchDisplay` in the snapshot head,
+  new "Talking about pitch" prompt rule. Snapshot stays concert; only the AI's wording/interpretation
+  switches to written for transposing parts when the view is transposed.
+- **Part 2** — agent loop now stages STRUCTURE_FIRST calls (setTimeSig/Key/measures) before note entry
+  each turn, so capacity validates at the intended meter; prompt gained explicit meter-capacity guidance.
+- **Part 3** — everything stays in the annotation model. `AnnotationAnchor` gained `auto/eventId/pitchId`
+  (+ line `endEventId/endPitchId`); new `placement.ts` routes each mark type to an H-anchor + V-zone and
+  stacks overlapping marks outward (dynamics flip above when below is taken; gliss connects noteheads).
+  Renderer exposes `noteStartX` + stem extents; StaffCanvas builds `PlacementGeom` and resolves auto marks;
+  AnnotationsLayer renders auto marks from the engine and bakes concrete dx/dy on drag (reducer clears
+  `auto` → manual override, like ties). `addMarking` tool dropped dx/dy, added event targeting.
 
-AI PROMPT BOX (done 2026-06-29): `src/components/ai-panel/AiPromptBox.tsx` — floating bottom-right glass popup
-(collapsed "Ask Aria" pill -> expanding textarea + send arrow; framer-motion + lucide; style from 21st.dev
-"AI prompt Box"). Mounted in ScoreEditor with a stub `onSubmit` (echoes prompt + logs). This is the Phase 1–2
-hook: the executor (native Score read -> Claude tool use -> commands.* -> dispatch) plugs into `onSubmit`.
+### Follow-ups / accepted limitations
+- Grand-staff (piano) auto-placement uses single-staff Y constants — fine for the treble path; revisit if
+  AI marks target the bass staff.
+- Gliss/tremolo/grace use existing catalog glyphs/lines (not real rhythmic grace notes) — matches "place
+  the mark," per the include-all-now decision.
+- Overlap test is a horizontal-span heuristic (fixed widths), not exact glyph metrics.
+- Manual browser QA still pending (needs `vercel dev` + ANTHROPIC_API_KEY for the live AI path).
 
-REMAINING for full Phase 0:
-- [ ] Manual browser parity check (needs user to click): note/chord/insert/rest-replace/capacity-flash/Alt-voice-2/
-      tuplet entry/dynamic drop must match `main` exactly; confirm the prompt box opens/sends/collapses.
+## Fix: AI cloning notes / overflowing measures (2026-07-02)
+**Symptom:** "compose a 4-bar melody" placed notes twice, spilled past bar 4, second pass placed only one.
+**Root cause:** the score snapshot was sent to the model only once (first user message) and never
+refreshed; edit tool results returned only `{ok, placedId}`. Across a multi-turn edit (place notes, then
+add tremolo/dynamics/articulations referencing those ids next turn) the model still saw the ORIGINAL
+empty-measure snapshot, so it re-emitted the placements → notes cloned; on the second pass the bars were
+already full in the working copy → most appends rejected, spilling into fresh measures.
+**Fix:** each successful per-part edit now echoes the touched bar's updated content
+(`projectMeasureById`) in its tool result, so the model sees its own edits + the ids to anchor later
+marks. System prompt updated to trust the echo over the stale snapshot and never re-place. Typecheck clean.
+
+## Fix #2: Accept clones the edit (2026-07-02)
+**Symptom:** optimistic preview correct, but pressing Accept applied the notes twice.
+**Root cause:** `approve` called `dispatchBatch(...)` INSIDE the `setTurns` updater. Updater fns must be
+pure; React StrictMode double-invokes them, so the BATCH dispatched twice — the second pass re-appended
+the same notes (same ids) → visible clone. Preview folds the actions once, so it looked fine.
+**Fix:** read staged actions from a new `turnsRef`, dispatch once in the handler body (not double-invoked),
+then mark the turn approved in a pure updater. Guarded against re-approve. Typecheck clean.

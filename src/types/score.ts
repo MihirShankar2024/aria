@@ -146,6 +146,14 @@ export interface AnnotationAnchor {
   measureId: string   // measure the mark is pinned to (resolved to current x via layout)
   dx: number          // px from the measure's left edge (layout.measures[i].x)
   dy: number          // px from the staff top (staveY) — vertical position
+  // AI/auto placement: when `auto` is true the (dx, dy) are IGNORED and the position is computed at
+  // render time by the placement engine (src/lib/annotations/placement.ts) from the mark's type +
+  // note geometry. `eventId`/`pitchId` optionally target a specific note/head (for per-beat dynamics,
+  // ornaments over a note, tremolo on a stem, gliss endpoints). Dragging the mark clears `auto` and
+  // bakes concrete dx/dy — a manual override that then behaves like any hand-placed mark (like ties).
+  auto?: boolean
+  eventId?: string    // note/rest this mark attaches to (its x + note extent drive placement)
+  pitchId?: string    // specific notehead within a chord (e.g. a gliss start head)
 }
 
 /** A glyph mark drawn with one or more Bravura/SMuFL codepoints (dynamics, ornaments, single symbols). */
@@ -172,6 +180,10 @@ export interface LineAnnotation {
   anchor: AnnotationAnchor  // start endpoint (measure-anchored)
   endDX: number             // end endpoint, px from the SAME measure's left edge
   endDY: number             // end endpoint, px from the staff top
+  // For auto-placed two-endpoint marks (gliss, trill extension): the note/head the END attaches to.
+  // When set alongside anchor.auto, both endpoints are resolved from note geometry at render time.
+  endEventId?: string
+  endPitchId?: string
 }
 
 export interface TextAnnotationStyle {
@@ -188,6 +200,7 @@ export interface TextAnnotation {
   text: string
   anchor: AnnotationAnchor
   style: TextAnnotationStyle
+  symbolId?: string   // catalog key (e.g. 'text.tempo', 'sym.ds') — drives auto-placement routing
 }
 
 /** A measure-number box. Carries no number of its own — it renders the `number` of whichever

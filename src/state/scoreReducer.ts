@@ -294,12 +294,17 @@ export function scoreReducer(score: Score, action: ScoreAction): Score {
       }
       case 'MOVE_ANNOTATION': {
         const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
-        if (ann) ann.anchor = action.anchor
+        // A user drag bakes a concrete position → drop auto-placement + event anchors so the mark
+        // becomes a normal manual mark (it no longer follows note geometry).
+        if (ann) ann.anchor = { measureId: action.anchor.measureId, dx: action.anchor.dx, dy: action.anchor.dy }
         break
       }
       case 'STRETCH_ANNOTATION': {
         const ann = draft.parts.find(p => p.id === action.partId)?.annotations?.find(a => a.id === action.id)
-        if (ann && ann.kind === 'line') { ann.endDX = action.endDX; ann.endDY = action.endDY }
+        if (ann && ann.kind === 'line') {
+          ann.endDX = action.endDX; ann.endDY = action.endDY
+          ann.anchor.auto = false; ann.endEventId = undefined; ann.endPitchId = undefined
+        }
         break
       }
       case 'SCALE_ANNOTATION': {

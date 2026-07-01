@@ -71,6 +71,9 @@ const FOCUS_PAD = 2         // bars of context on each side of the focus region.
 export interface ScoreViewOpts {
   /** When nothing is selected, focus here (e.g. the last-edited region). 1-based measure numbers. */
   focusMeasures?: number[]
+  /** Which pitch space the user is LOOKING at. 'written' = transposed view is on, so the AI should
+   *  talk to the user in written pitch for transposing parts (the snapshot itself stays concert). */
+  pitchDisplay?: 'concert' | 'written'
 }
 
 /**
@@ -81,7 +84,7 @@ export interface ScoreViewOpts {
  */
 export function scoreForAi(score: Score, selection: AiSelection, opts?: ScoreViewOpts): string {
   const measureCount = Math.max(0, ...score.parts.map(p => p.measures.length))
-  const head = { title: score.title, tempo: score.tempo, globalTimeSig: score.globalTimeSig, globalKeySig: score.globalKeySig, tempoChanges: score.tempoChanges }
+  const head = { title: score.title, tempo: score.tempo, globalTimeSig: score.globalTimeSig, globalKeySig: score.globalKeySig, tempoChanges: score.tempoChanges, pitchDisplay: opts?.pitchDisplay ?? 'concert' }
 
   if (measureCount <= FULL_THRESHOLD) {
     return JSON.stringify({
@@ -121,6 +124,18 @@ export function scoreForAi(score: Score, selection: AiSelection, opts?: ScoreVie
     })),
     selection,
   })
+}
+
+/**
+ * Project a single measure by id from the (working) score, so an edit tool can echo the bar's
+ * resulting content back to the model. Without this, the model only sees the original snapshot plus
+ * terse {ok, placedId} results across a multi-turn edit — so it can't tell a bar it already wrote is
+ * now full, and re-places into it (notes get cloned; the second pass overflows). Returns null if the
+ * part/measure is gone.
+ */
+export function projectMeasureById(score: Score, partId: string, measureId: string) {
+  const measure = score.parts.find(p => p.id === partId)?.measures.find(m => m.id === measureId)
+  return measure ? projectMeasure(measure) : null
 }
 
 /** Full detail for a measure-number range (the `getMeasures` read tool). */

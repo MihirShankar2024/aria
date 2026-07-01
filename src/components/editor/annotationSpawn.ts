@@ -30,7 +30,7 @@ export function buildAnnotation(
   if (entry.spawn === 'text') {
     return {
       annotation: {
-        id, kind: 'text', text: entry.text ?? 'text', anchor,
+        id, kind: 'text', text: entry.text ?? 'text', anchor, symbolId: entry.symbolId,
         style: entry.textStyle ?? { fontFamily: 'serif', fontSize: 16, bold: false, italic: false },
       },
       edit: true,

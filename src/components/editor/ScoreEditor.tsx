@@ -719,7 +719,7 @@ export function ScoreEditor() {
             noteIds: [...selectedNoteIds],
             cursor: aiCursorRef.current ?? undefined,
           }
-          return ai.send(prompt, score, selection)
+          return ai.send(prompt, score, selection, transposedView)
         }}
         turns={ai.turns}
         pending={ai.pending}

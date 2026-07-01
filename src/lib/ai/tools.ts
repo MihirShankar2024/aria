@@ -67,8 +67,8 @@ export const AI_TOOLS: Anthropic.Messages.Tool[] = [
   tool('setArticulation', 'Add or remove an articulation on an event.',
     { partId: { type: 'string' }, measureId: { type: 'string' }, noteId: { type: 'string' }, articulation: ARTICULATION, on: { type: 'boolean' } },
     ['partId', 'measureId', 'noteId', 'articulation', 'on']),
-  tool('addMarking', "Add a marking to a measure: a dynamic/ornament by symbolId (e.g. 'dyn.mf', 'orn.trill'), or free text. Anchors to the measure.",
-    { partId: { type: 'string' }, measureId: { type: 'string' }, symbolId: { type: 'string' }, text: { type: 'string' }, dx: { type: 'number' }, dy: { type: 'number' } },
+  tool('addMarking', "Add a marking: a dynamic/ornament/symbol by symbolId (e.g. 'dyn.mf', 'orn.trill', 'sym.coda') or free text. You NEVER set its position — the editor places it automatically by type (dynamics below the notes, text above, ornaments over the note, etc.). For a mark that belongs to a specific note (a sforzando on a beat, an ornament/tremolo on a note, a glissando), pass eventId (and toEventId for a glissando's destination) so it attaches to that note; otherwise it anchors to the measure.",
+    { partId: { type: 'string' }, measureId: { type: 'string' }, symbolId: { type: 'string' }, text: { type: 'string' }, eventId: { type: 'string' }, pitchId: { type: 'string' }, toEventId: { type: 'string' }, toPitchId: { type: 'string' } },
     ['partId', 'measureId']),
   // ── tuplets ──
   tool('createTuplet', 'Group contiguous same-voice events into a tuplet (e.g. played 3 in space of 2).',

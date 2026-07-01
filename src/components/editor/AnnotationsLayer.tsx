@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Bold, Italic } from 'lucide-react'
 import type { Annotation, TextAnnotationStyle } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
+import type { ResolvedPlacement } from '../../lib/annotations/placement'
 import { buildLineShape } from '../../lib/annotations/lineShapes'
 
 /** Which sharpshooter scale handle (if any) a glyph mark exposes, keyed by catalog symbolId. */
@@ -23,6 +24,9 @@ interface AnnotationsLayerProps {
   measureAtX: (x: number) => { measureId: string; measureX: number } | null
   /** Staff-top y the annotation dy offsets are measured from. */
   staveY: number
+  /** Absolute (x,y) for AI/auto-placed marks (anchor.auto), resolved from note geometry. Marks not in
+   *  this map use their stored dx/dy. */
+  autoPlacements?: Map<string, ResolvedPlacement>
   isSharpshooterMode: boolean
   editingId: string | null
   setEditingId: (id: string | null) => void
@@ -56,8 +60,11 @@ const FONT_OPTIONS = ['serif', 'sans-serif', 'monospace']
  * stretch behaviour (reusing the same model as tie handles).
  */
 export function AnnotationsLayer({
-  partId, annotations, measureX, measureNumber, measureAtX, staveY, isSharpshooterMode, editingId, setEditingId, dispatch,
+  partId, annotations, measureX, measureNumber, measureAtX, staveY, autoPlacements, isSharpshooterMode, editingId, setEditingId, dispatch,
 }: AnnotationsLayerProps) {
+  // Absolute placement of an auto mark (or null if it's manual / has no resolved geometry).
+  const autoOf = (ann: Annotation): ResolvedPlacement | null =>
+    (ann.anchor.auto && autoPlacements?.get(ann.id)) || null
   const [drag, setDrag] = useState<DragState | null>(null)
   // Live cursor delta while dragging, applied on top of the base position for smooth feedback.
   const [delta, setDelta] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 })
@@ -116,15 +123,20 @@ export function AnnotationsLayer({
     if (!isSharpshooterMode) return
     e.preventDefault()
     e.stopPropagation()
+    // For an auto-placed mark, seed the drag from its rendered geometry so the release bakes a
+    // concrete dx/dy (relative to measure/stave) — the reducer then clears `auto`, converting it to a
+    // normal manual mark (behaves "until adjusted by the user, like ties").
+    const auto = autoOf(ann)
+    const mx0 = measureX(ann.anchor.measureId) ?? 0
     setDrag({
       id: ann.id,
       kind,
       startClientX: e.clientX,
       startClientY: e.clientY,
-      baseDx: ann.anchor.dx,
-      baseDy: ann.anchor.dy,
-      baseEndDX: ann.kind === 'line' ? ann.endDX : 0,
-      baseEndDY: ann.kind === 'line' ? ann.endDY : 0,
+      baseDx: auto ? auto.x - mx0 : ann.anchor.dx,
+      baseDy: auto ? auto.y - staveY : ann.anchor.dy,
+      baseEndDX: ann.kind === 'line' ? (auto?.x2 != null ? auto.x2 - mx0 : ann.endDX) : 0,
+      baseEndDY: ann.kind === 'line' ? (auto?.y2 != null ? auto.y2 - staveY : ann.endDY) : 0,
       baseScaleX: ann.kind === 'glyph' ? (ann.scaleX ?? 1) : 1,
       baseScaleY: ann.kind === 'glyph' ? (ann.scaleY ?? 1) : 1,
       scaleMode: ann.kind === 'glyph' ? glyphScaleMode(ann.symbolId) : null,
@@ -142,11 +154,13 @@ export function AnnotationsLayer({
         const mx = measureX(ann.anchor.measureId)
         if (mx === null) return null
 
-        // start point (anchor) with live body/start drag offset
+        // start point (anchor) with live body/start drag offset. Auto-placed (AI) marks take their
+        // absolute (x,y) from the placement engine; manual marks use their stored dx/dy.
+        const auto = autoOf(ann)
         const bodyOff = liveOffset(ann.id, 'body')
         const startOff = drag?.id === ann.id && (drag.kind === 'body' || drag.kind === 'start') ? delta : { dx: 0, dy: 0 }
-        const x = mx + ann.anchor.dx + startOff.dx
-        const y = staveY + ann.anchor.dy + startOff.dy
+        const x = (auto ? auto.x : mx + ann.anchor.dx) + startOff.dx
+        const y = (auto ? auto.y : staveY + ann.anchor.dy) + startOff.dy
 
         const interactive = isSharpshooterMode || editingId === ann.id
 
@@ -237,8 +251,8 @@ export function AnnotationsLayer({
         const endOff = liveOffset(ann.id, 'end')
         const x1 = x
         const y1 = y
-        const x2 = mx + ann.endDX + bodyOff.dx + endOff.dx
-        const y2 = staveY + ann.endDY + bodyOff.dy + endOff.dy
+        const x2 = (auto ? (auto.x2 ?? auto.x) : mx + ann.endDX) + bodyOff.dx + endOff.dx
+        const y2 = (auto ? (auto.y2 ?? auto.y) : staveY + ann.endDY) + bodyOff.dy + endOff.dy
         const shape = buildLineShape(ann.lineType, x1, y1, x2, y2)
         return (
           <svg key={ann.id} className="absolute" style={{ left: 0, top: 0, width: '100%', height: '100%', pointerEvents: 'none', overflow: 'visible' }}>

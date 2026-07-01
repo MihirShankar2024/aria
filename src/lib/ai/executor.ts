@@ -1,4 +1,4 @@
-import type { Score, VoiceNumber } from '../../types/score'
+import type { Score, VoiceNumber, Annotation } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 import type { PartContext, CommandResult } from '../editing/types'
 import * as cmd from '../editing/commands'
@@ -122,18 +122,27 @@ export function executeToolCall(score: Score, name: string, input: In): ExecOutc
           pitch: input.pitch ? toConcertPitch(input.pitch) : null, atIndex: n(input.atIndex), targetRestId: input.targetRestId as string | undefined,
         }))
       case 'addMarking': {
-        const dx = (input.dx as number | undefined) ?? 16
-        const dy = (input.dy as number | undefined) ?? 56
+        // The AI never sets position. Mark the annotation auto-placed (the placement engine decides
+        // its zone from type + note geometry) and attach any target note/head so beat/note-anchored
+        // marks (sforzando, ornaments, tremolo, gliss) can read that note's x + extent. dx/dy are a
+        // fallback used only if geometry is unavailable at render.
+        const withAuto = (annotation: Annotation): Annotation => {
+          const anchor = { ...annotation.anchor, auto: true, eventId: input.eventId as string | undefined, pitchId: input.pitchId as string | undefined }
+          if (annotation.kind === 'line') {
+            return { ...annotation, anchor, endEventId: input.toEventId as string | undefined, endPitchId: input.toPitchId as string | undefined }
+          }
+          return { ...annotation, anchor } as Annotation
+        }
         if (input.symbolId) {
           const entry = findCatalogEntry(s(input.symbolId))
           if (!entry) return { isError: true, result: { ok: false, reason: 'invalid_arg', detail: `unknown symbolId ${input.symbolId}` }, actions: [] }
-          const { annotation } = buildAnnotation(entry, s(input.measureId), dx, dy)
-          return fromCommand(cmd.addMarking(ctx, annotation))
+          const { annotation } = buildAnnotation(entry, s(input.measureId), 8, 40)
+          return fromCommand(cmd.addMarking(ctx, withAuto(annotation)))
         }
         if (input.text != null) {
           const entry = { symbolId: 'text.custom', label: 'text', spawn: 'text' as const, text: s(input.text), previewFont: 'text' as const }
-          const { annotation } = buildAnnotation(entry, s(input.measureId), dx, dy)
-          return fromCommand(cmd.addMarking(ctx, annotation))
+          const { annotation } = buildAnnotation(entry, s(input.measureId), 8, 40)
+          return fromCommand(cmd.addMarking(ctx, withAuto(annotation)))
         }
         return { isError: true, result: { ok: false, reason: 'invalid_arg', detail: 'addMarking needs symbolId or text' }, actions: [] }
       }

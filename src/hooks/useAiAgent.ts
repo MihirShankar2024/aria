@@ -5,7 +5,7 @@ import type { ScoreAction } from '../state/actions'
 import { scoreReducer } from '../state/scoreReducer'
 import { fetchClaude } from '../api/claude'
 import { SYSTEM_PROMPT } from '../lib/ai/systemPrompt'
-import { scoreForAi, type AiSelection } from '../lib/ai/serializeForAi'
+import { scoreForAi, projectMeasureById, type AiSelection } from '../lib/ai/serializeForAi'
 import { AI_TOOLS } from '../lib/ai/tools'
 import { executeToolCall } from '../lib/ai/executor'
 
@@ -14,6 +14,10 @@ const MODEL = 'claude-opus-4-8'
 // too low silently truncates the work. Batching independent edits as parallel tool calls (taught in
 // the system prompt) keeps this comfortable.
 const MAX_ITERATIONS = 20
+
+// Tool calls that change measure structure or meter. Executed before note-entry calls within a turn
+// so capacity checks see the intended time signature / measure set (see the loop below).
+const STRUCTURE_FIRST = new Set(['setTimeSig', 'setKeySig', 'addMeasures', 'insertMeasures', 'removeMeasures', 'addPart', 'addPianoPart'])
 
 /** A pending in-chat question the model raised via the `askUser` tool. */
 export interface PendingQuestion {
@@ -66,6 +70,10 @@ const newTurnId = () => `t${uid++}`
  */
 export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
   const [turns, setTurns] = useState<UiTurn[]>([])
+  // Mirror of `turns` for event handlers that must READ current turns without putting side effects
+  // inside a setTurns updater (StrictMode double-invokes updaters → a dispatch there would fire twice).
+  const turnsRef = useRef<UiTurn[]>([])
+  turnsRef.current = turns
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [cacheHit, setCacheHit] = useState<number | null>(null)
@@ -81,7 +89,7 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
     setTurns(ts => ts.map(t => (t.id === id ? { ...t, ...patch } : t)))
   }, [])
 
-  const send = useCallback(async (prompt: string, score: Score, selection: AiSelection) => {
+  const send = useCallback(async (prompt: string, score: Score, selection: AiSelection, transposedView = false) => {
     setError(null)
     setPending(true)
     cancelledRef.current = false
@@ -95,7 +103,7 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
     ]
     const messages: Anthropic.Messages.MessageParam[] = [
       ...historyRef.current,
-      { role: 'user', content: `Current score (JSON):\n${scoreForAi(score, selection, { focusMeasures: focusRef.current })}\n\nRequest: ${prompt}` },
+      { role: 'user', content: `Current score (JSON):\n${scoreForAi(score, selection, { focusMeasures: focusRef.current, pitchDisplay: transposedView ? 'written' : 'concert' })}\n\nRequest: ${prompt}` },
     ]
 
     let working = score
@@ -121,8 +129,17 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
         if (iterText) finalText = iterText   // last non-empty text block = the wrap-up summary
 
         const toolResults: Anthropic.Messages.ContentBlockParam[] = []
-        for (const block of res.content) {
-          if (block.type !== 'tool_use') continue
+        let stagedThisIter = false
+        // Stage STRUCTURAL/meter calls before note-entry calls within a turn, so capacity is always
+        // validated against the intended time signature (e.g. "setTimeSig(6,8) then fill" stays 6/8
+        // even if the model emits the placeNote calls first). tool_results are keyed by id, so
+        // reordering execution doesn't affect how results map back. Array.sort is stable, so same-rank
+        // calls keep the model's original order. askUser stays last (it pauses the loop).
+        const rank = (name: string) => (STRUCTURE_FIRST.has(name) ? 0 : name === 'askUser' ? 2 : 1)
+        const orderedBlocks = res.content
+          .filter((b): b is Anthropic.Messages.ToolUseBlock => b.type === 'tool_use')
+          .sort((a, b) => rank(a.name) - rank(b.name))
+        for (const block of orderedBlocks) {
           if (block.name === 'askUser') {
             const input = block.input as { question?: string; options?: string[]; multiSelect?: boolean }
             const answer = await ask({ text: input.question ?? 'Choose:', options: input.options ?? [], multiSelect: !!input.multiSelect })
@@ -131,10 +148,29 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
             continue
           }
           const outcome = executeToolCall(working, block.name, block.input as Record<string, unknown>)
+          let resultForModel = outcome.result
           if (!outcome.isError && outcome.actions.length) {
             for (const a of outcome.actions) { working = scoreReducer(working, a); stagedActions.push(a) }
+            stagedThisIter = true
+            // Echo the touched bar's resulting content so the model SEES its own edit. The score
+            // snapshot is sent only once (first user message); without this, a multi-turn edit sees
+            // only terse {ok, placedId} results and re-places into bars it already filled (notes get
+            // cloned, the second pass overflows into fresh measures). Note ids in the echo also let
+            // later turns anchor markings/articulations/ties without re-reading.
+            const inp = block.input as { partId?: string; measureId?: string }
+            if (inp.partId && inp.measureId) {
+              const measure = projectMeasureById(working, inp.partId, inp.measureId)
+              if (measure) resultForModel = { ...(outcome.result as object), measure }
+            }
           }
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(outcome.result), is_error: outcome.isError })
+          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(resultForModel), is_error: outcome.isError })
+        }
+
+        // Stream progress into the turn as the model works: a fresh snapshot of the edits so far
+        // (new identity → previewActions memo recomputes → the score repaints purple live) plus the
+        // latest narration. Stays 'working' so the Accept/Cancel buttons don't show until we finish.
+        if (stagedThisIter || iterText) {
+          patchTurn(asstId, { staged: stagedActions.length ? { actions: [...stagedActions] } : undefined, text: finalText || undefined })
         }
 
         if (cancelledRef.current) break
@@ -185,11 +221,14 @@ export function useAiAgent(dispatchBatch: (actions: ScoreAction[]) => void) {
   }, [])
 
   const approve = useCallback((turnId: string) => {
-    setTurns(ts => ts.map(t => {
-      if (t.id !== turnId || !t.staged) return t
-      dispatchBatch(t.staged.actions)
-      return { ...t, applied: 'approved' }
-    }))
+    // Apply the batch HERE, in the handler body — never inside a setTurns updater. Updater fns must
+    // be pure, and StrictMode double-invokes them, so a dispatchBatch there fires twice and the edits
+    // land twice (same notes re-appended → clones). Read from turnsRef, guard against re-approve, then
+    // mark the turn approved in a pure updater.
+    const turn = turnsRef.current.find(t => t.id === turnId)
+    if (!turn?.staged || turn.applied) return
+    dispatchBatch(turn.staged.actions)
+    setTurns(ts => ts.map(t => (t.id === turnId ? { ...t, applied: 'approved' } : t)))
   }, [dispatchBatch])
 
   const reject = useCallback((turnId: string) => {

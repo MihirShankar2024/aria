@@ -103,7 +103,7 @@ export function AiPromptBox({ turns, onSubmit, pending = false, error, onApprove
 
                   {t.question && onAnswer && <QuestionBox question={t.question} onAnswer={onAnswer} />}
 
-                  {t.staged && !t.applied && (
+                  {t.staged && !t.applied && t.status !== 'working' && (
                     <div className="mt-1 flex gap-2">
                       <button onClick={() => onApprove?.(t.id)} className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-violet-500 py-1.5 text-[12px] font-medium text-white transition hover:bg-violet-400">
                         <Check className="h-3.5 w-3.5" /> Accept

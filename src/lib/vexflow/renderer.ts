@@ -732,6 +732,10 @@ function formatDrawCollect(
     const ys = vn.getYs()
     const ax = vn.getAbsoluteX()
     const ext = noteExtents(vn)
+    // Stem extent (topY/baseY are unordered by stem direction); normalise to top/bottom for placement.
+    const stemExt = ev.type === 'note' ? vn.getStemExtents() : null
+    const stemTopY = stemExt ? Math.min(stemExt.topY, stemExt.baseY) : (ys[0] ?? staveY)
+    const stemBottomY = stemExt ? Math.max(stemExt.topY, stemExt.baseY) : (ys[ys.length - 1] ?? staveY)
     out.noteGeometry.push({
       id: ev.id,
       type: ev.type,
@@ -743,6 +747,8 @@ function formatDrawCollect(
       y: ys[0] ?? staveY,
       ys: ys.length ? [...ys] : [staveY],
       xs: noteHeadXs(vn, ax),
+      stemTopY,
+      stemBottomY,
       measureIndex: idx,
     })
     if (ev.type === 'note') {
@@ -763,6 +769,7 @@ function effectiveKeySigAt(measures: Measure[], idx: number, global: KeySig): Ke
 export interface MeasureGeometry {
   x: number
   width: number
+  noteStartX: number   // x where notes begin (after clef/key/time sig) — for measure-start mark placement
 }
 
 export interface NoteGeometry {
@@ -776,6 +783,8 @@ export interface NoteGeometry {
   y: number            // notehead y in SVG px (primary/lowest pitch for chords)
   ys: number[]         // every notehead y (all pitches of a chord) for hit testing
   xs: number[]         // every notehead x (incl. displaced 2nds), aligned 1:1 with ys
+  stemTopY: number     // top of the stem (above the heads for a stem-up note) — for mark placement
+  stemBottomY: number  // bottom of the stem
   measureIndex: number
 }
 
@@ -965,7 +974,7 @@ export function renderStaff({
       vexById, noteGeometry, glyphGeometry, intraChordConflicts,
     }, previewIds)
 
-    geometry.push({ x, width: staveWidth })
+    geometry.push({ x, width: staveWidth, noteStartX: stave.getNoteStartX() })
     x += staveWidth
   })
 
@@ -1196,7 +1205,7 @@ export function renderGrandStaff({
       }, previewIds)
     }
 
-    measureGeometry.push({ x, width: staveWidth })
+    measureGeometry.push({ x, width: staveWidth, noteStartX: trebleStave.getNoteStartX() })
     x += staveWidth
   }
 

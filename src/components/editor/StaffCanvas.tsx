@@ -17,6 +17,7 @@ import { selKey, selectionByEvent, isPitchSelected, type SelectionDrag } from '.
 import type { Measure, TimeSig, KeySig, Duration, Accidental, ArticulationType, NoteArticulation, Tie, Clef, Note, NoteEvent, VoiceNumber, Pitch, Annotation } from '../../types/score'
 import type { ScoreAction } from '../../state/actions'
 import { AnnotationsLayer } from './AnnotationsLayer'
+import { layoutMeasureMarks, type MeasureGeom, type EventGeom, type ResolvedPlacement } from '../../lib/annotations/placement'
 import { annotationBounds, rectHit } from '../../lib/annotations/geometry'
 import { buildAnnotation } from './annotationSpawn'
 import { placeNote, placeRest, addSlurOrTie, addMarking } from '../../lib/editing/commands'
@@ -1532,6 +1533,29 @@ export function StaffCanvas({
     )
   })
 
+  // Resolve auto-placed (AI-created) marks against real note geometry. The engine decides zone from
+  // each mark's type and stacks overlapping marks outward; manual marks (no anchor.auto) are ignored
+  // here and keep their stored dx/dy. Recomputed when the layout or annotations change.
+  const autoPlacements = useMemo<Map<string, ResolvedPlacement>>(() => {
+    if (!layout) return new Map()
+    const measuresMap = new Map<string, MeasureGeom>()
+    measures.forEach((m, i) => {
+      const g = layout.measures[i]
+      if (!g) return
+      const noteYs = layout.notes.filter(n => n.measureIndex === i && n.type === 'note').flatMap(n => n.ys)
+      measuresMap.set(m.id, {
+        measureId: m.id, leftX: g.x, noteStartX: g.noteStartX, rightX: g.x + g.width,
+        topNoteY: noteYs.length ? Math.min(...noteYs) : null,
+        bottomNoteY: noteYs.length ? Math.max(...noteYs) : null,
+      })
+    })
+    const eventsMap = new Map<string, EventGeom>()
+    for (const n of layout.notes) {
+      eventsMap.set(n.id, { x: n.cx, topY: Math.min(...n.ys), bottomY: Math.max(...n.ys), stemTopY: n.stemTopY, stemBottomY: n.stemBottomY })
+    }
+    return layoutMeasureMarks(annotations, { staff: { topY: STAVE_TOP_Y, bottomY: STAVE_BOTTOM_Y }, measures: measuresMap, events: eventsMap })
+  }, [layout, measures, annotations])
+
   return (
     <div className="relative">
     <div
@@ -1576,6 +1600,7 @@ export function StaffCanvas({
               return m && g ? { measureId: m.id, measureX: g.x } : null
             }}
             staveY={STAVE_Y}
+            autoPlacements={autoPlacements}
             isSharpshooterMode={isSharpshooterMode}
             editingId={editingAnnotationId}
             setEditingId={id => onAnnotationSpawned?.(id)}
